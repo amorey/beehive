@@ -58,7 +58,7 @@ own reconcile is what cascades to the level below it, so one parked child stalls
 the whole subtree. The sweeper's route through `deletionAdvance` is absorbed the
 same way, so this is a stall the pull path never beat either.
 
-`DeletionRequestsCreateByName` returns the id it marked, since a name delete has
+`DeletionRequests().CreateByName` returns the id it marked, since a name delete has
 no id to push. `markForDeletion` already scanned it for the write-log entry.
 
 ## Consequences

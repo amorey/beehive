@@ -82,7 +82,7 @@ switched off means "no floor" rather than "no waker".
 
 ### The stale-dependents pass re-derives what the waker may have missed
 
-`DependentsListStaleSince(kinds, pos, through, limit)`, paged to exhaustion on each
+`Dependencies().ListStaleSince(kinds, pos, through, limit)`, paged to exhaustion on each
 step, over the `depends_on` edges of registered kinds: a dependent is stale when a
 target sits above the watermark its last successful reconcile recorded. It is the
 correctness backstop the waker is an optimisation over, so unlike the waker it
@@ -102,7 +102,7 @@ That is what keeps "recovers a wake lost by any means" true. See
 
 ### The owed pass drains what the store records as owed
 
-`enqueueOwedPass` = `ObjectsListUnsettledIDs` + `ReconcileOwedListIDs`. Its cost is
+`enqueueOwedPass` = `Objects().ListUnsettledIDs` + `ReconcileOwed().ListIDs`. Its cost is
 bounded by what is actually outstanding, so both listings return nothing in a
 converged system. They stay separate rather than unioned in SQL so one failing
 still lets the other through, and `enqueueFrom`'s log names which lost its pass.
@@ -122,7 +122,7 @@ pass already covers that ground once per process.
 because it spans kinds that have no controller at all.
 
 `deletionPendingSweep` **routes**: a registered kind is enqueued, a client-only
-kind is collected directly. That is why `DeletionRequestsList` returns
+kind is collected directly. That is why `DeletionRequests().List` returns
 `[]ObjectRef` rather than ids. The routing is load-bearing, not an optimization —
 `gcCollect` cannot clear a finalizer (it cascades to owned children and returns
 while any remain, because releasing one is the controller's decision), so an object
@@ -134,8 +134,8 @@ sweeper's goroutine and ctx rather than on whichever caller requested the delete
 
 ### The dependency waker scans a watermark, store-wide
 
-`ObjectWritesListSince(afterRV, limit)`, paged and version-ordered. The waker seeds
-its cursor from `ObjectWritesMaxVersion` at startup — so the first scan reports
+`ObjectWrites().ListSince(afterRV, limit)`, paged and version-ordered. The waker seeds
+its cursor from `ObjectWrites().MaxVersion` at startup — so the first scan reports
 changes from startup, and everything below the seed is the startup pass's ground —
 then pages everything above it through the wake path, advancing per page. A page is
 complete up to its own last row, so the cursor advances by that row; a failed scan
@@ -170,7 +170,7 @@ needs no help from the scan: `dependentsWake` enqueues each dependent by the
 dependent's own kind.
 
 Two costs come with that and are accepted. A page resolves its dependents in one
-`EdgesGroupIncomingByID` rather than a lookup per change, because the store is
+`Edges().GroupIncomingByID` rather than a lookup per change, because the store is
 single-connection and the waker's reads serialize against every writer. And the
 single waker goroutine is a process-wide head-of-line block: a slow edges query
 delays wakes for every kind, where per-kind wakers would delay only their own. Per-
@@ -191,8 +191,8 @@ cannot reach. → [ADR](2026-08-03-watch-shared-tail.md).
 The other watches share nothing with it, so read the paragraph
 above as being about the object watches alone. `EventsWatch` also compares
 `resource_version`, but per run rather than per object, and its gate is **one number
-and no second read**: `EventsMaxVersion(ctx, id)`, the high-water mark of that one
-object's log, with the blob-bearing `EventsList` paid only when it moves. That number
+and no second read**: `Events().MaxVersion(ctx, id)`, the high-water mark of that one
+object's log, with the blob-bearing `Events().List` paid only when it moves. That number
 is cheaper than the listing rather than free — on SQLite it still reads one table row
 per run, because no index carries `events.resource_version` under `object_id` — so
 this quiet tick is the least indexed of the gated three. There is no
@@ -215,7 +215,7 @@ rows with no recourse, each `owned_by` edge RESTRICT-blocking its owner's delete
 That invariant is load-bearing *inside* the sweeper too: every failure there is
 logged and swallowed on the promise of a next tick, which is only true while a
 cadence is guaranteed. A guaranteed cadence is what lets the sweeper treat a failed
-`DeletionRequestsList` as latency rather than as a row stranded for the life of the
+`DeletionRequests().List` as latency rather than as a row stranded for the life of the
 process.
 
 `gcSweeperRun` still returns early on a non-positive interval — unreachable through

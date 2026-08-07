@@ -12,10 +12,10 @@ inside [the edges ADR](2026-07-26-edges-without-rowid.md), which pointed at
 `docs/TODO.md` for the record — and `docs/TODO.md` no longer held one.
 
 `docs/TODO.md` then held a change that made the question real. `idx_events_rv` served
-no query: nothing ordered or filtered on `events.resource_version` alone. `EventsList`
-sorts by `(last_at DESC, id DESC)`, `EventsSweep` ranks within `(object_id, category)`
+no query: nothing ordered or filtered on `events.resource_version` alone. `Events().List`
+sorts by `(last_at DESC, id DESC)`, `Events().Sweep` ranks within `(object_id, category)`
 and deletes by `last_at`, and `EventsWatch` compares versions row by row from a
-listing it already holds. Meanwhile `EventsMaxVersion` — the gate `EventsWatch` reads
+listing it already holds. Meanwhile `Events().MaxVersion` — the gate `EventsWatch` reads
 on every quiet tick — wanted an index that did not exist, `(object_id,
 resource_version)`, and fell back to `idx_events_object_cat`, which does not carry the
 column. One index to drop and one to add, deferred on this question rather than on
@@ -31,7 +31,7 @@ to upgrade from. `0001_init.sql` now creates `idx_events_object_rv ON events(obj
 resource_version)` where it created `idx_events_rv`, and the comment says what the
 index is for rather than what it mirrors.
 
-`EventsMaxVersion` plans as `SEARCH events USING COVERING INDEX idx_events_object_rv
+`Events().MaxVersion` plans as `SEARCH events USING COVERING INDEX idx_events_object_rv
 (object_id=?)` — the equality prefix selects the object's runs and the maximum sits at
 the tail of that range, so a quiet watch tick reads the index and never the table.
 

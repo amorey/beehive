@@ -54,7 +54,7 @@ func benchEventsSweep(b *testing.B, timelines, overCap int) {
 	const perTimeline = 4
 	ids := make([]storeapi.ObjectID, timelines)
 	for i := range ids {
-		obj, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: fmt.Sprintf("bench-%d", i),
 			Spec: []byte(`{}`),
 		})
@@ -63,20 +63,20 @@ func benchEventsSweep(b *testing.B, timelines, overCap int) {
 
 		// A distinct reason per event, or the run extends instead of appending.
 		for r := range perTimeline {
-			require.NoError(b, store.EventsAdd(ctx, testGK, obj.ID, storeapi.EventsAddInput{
+			require.NoError(b, store.Events().Add(ctx, testGK, obj.ID, storeapi.EventsAddInput{
 				Category: "c", Type: "Normal", Reason: fmt.Sprintf("R%d", r),
 			}))
 		}
 	}
 	for i := range overCap {
-		require.NoError(b, store.EventsAdd(ctx, testGK, ids[i], storeapi.EventsAddInput{
+		require.NoError(b, store.Events().Add(ctx, testGK, ids[i], storeapi.EventsAddInput{
 			Category: "c", Type: "Normal", Reason: "Extra",
 		}))
 	}
 
 	b.ResetTimer()
 	for range b.N {
-		_, err := store.EventsSweep(ctx, perTimeline, 0, 0)
+		_, err := store.Events().Sweep(ctx, perTimeline, 0, 0)
 		require.NoError(b, err)
 	}
 }
@@ -115,18 +115,18 @@ func benchDeletionCascade(b *testing.B, children int, deleting bool) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	owner, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+	owner, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 		Name: "owner",
 		Spec: []byte(`{}`),
 	})
 	require.NoError(b, err)
 	for i := range children {
-		child, err := store.ObjectsCreate(ctx, testGK, beehive.ObjectsCreateInput{
+		child, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
 			Name: fmt.Sprintf("child-%d", i),
 			Spec: []byte(`{}`),
 		})
 		require.NoError(b, err)
-		_, err = store.EdgesAdd(ctx, child.ID, owner.ID, storeapi.RelationOwnedBy)
+		_, err = store.Edges().Add(ctx, child.ID, owner.ID, storeapi.RelationOwnedBy)
 		require.NoError(b, err)
 	}
 
@@ -134,7 +134,7 @@ func benchDeletionCascade(b *testing.B, children int, deleting bool) {
 	// the pass it claims to, so a cascade that silently stopped marking would show
 	// up as a speedup rather than a bug. The loop below revives before its first
 	// timed cascade, so this leaves the subtree marked for either variant.
-	res, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID)
+	res, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID)
 	require.NoError(b, err)
 	require.Len(b, res.Children, children)
 	for _, ch := range res.Children {
@@ -148,7 +148,7 @@ func benchDeletionCascade(b *testing.B, children int, deleting bool) {
 			reviveChildren(b, store)
 			b.StartTimer()
 		}
-		if _, err := store.DeletionRequestsCreateFromOwner(ctx, owner.ID); err != nil {
+		if _, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID); err != nil {
 			b.Fatal(err)
 		}
 	}

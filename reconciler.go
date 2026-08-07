@@ -66,7 +66,7 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, bool, error) {
 	log := t.log().With("id", id)
 
-	load, err := t.bh.store.ObjectsGetForReconcile(ctx, id)
+	load, err := t.bh.store.Objects().GetForReconcile(ctx, id)
 	if errors.Is(err, ErrNotFound) {
 		// Already collected between enqueue and now: a no-op success.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
@@ -110,7 +110,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// the pass sit above the observed count and survive. A failed subtraction is
 	// left to the backstop rather than retried under backoff.
 	if reconcileErr == nil && raw.ReconcileOwed != 0 {
-		if err := t.bh.store.ReconcileOwedDecrement(ctx, t.gk, id, raw.ReconcileOwed); err != nil {
+		if err := t.bh.store.ReconcileOwed().Decrement(ctx, t.gk, id, raw.ReconcileOwed); err != nil {
 			log.WarnContext(ctx, "failed to decrement the reconcile-owed count; backstop will retry", "err", err)
 		}
 	}
@@ -126,7 +126,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// See docs/adr/2026-08-03-stale-dependents-cursor.md.
 	if reconcileErr == nil && load.HasDependencies {
 		// A cancelled write is shutdown, not a lost pass.
-		if err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor); err != nil && ctx.Err() == nil {
+		if err := t.bh.store.Dependencies().WatermarkSet(ctx, id, load.Cursor); err != nil && ctx.Err() == nil {
 			log.WarnContext(ctx, "failed to record the dependency watermark; the next target change re-derives it", "err", err)
 		}
 	}
@@ -185,7 +185,7 @@ func (r *reconciler) enqueueUnsettled(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "unsettled", r.store.ObjectsListUnsettledIDs)
+	r.enqueueFrom(ctx, "unsettled", r.store.Objects().ListUnsettledIDs)
 }
 
 // enqueueReconcileOwed enqueues objects owed a durable dependency wake. Run
@@ -196,7 +196,7 @@ func (r *reconciler) enqueueReconcileOwed(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "reconcile-owed", r.store.ReconcileOwedListIDs)
+	r.enqueueFrom(ctx, "reconcile-owed", r.store.ReconcileOwed().ListIDs)
 }
 
 // enqueueOwedPass drains what the store records as owed: unconverged specs and
@@ -214,7 +214,7 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 	if r.store == nil {
 		return
 	}
-	r.enqueueFrom(ctx, "all", r.store.ObjectsListIDs)
+	r.enqueueFrom(ctx, "all", r.store.Objects().ListIDs)
 }
 
 // log guards reconcilers built outside Register (e.g. minimal ones in tests).

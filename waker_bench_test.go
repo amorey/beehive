@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"github.com/amorey/beehive/internal/storeapi"
 	"strconv"
 	"testing"
 
@@ -80,10 +81,10 @@ func BenchmarkStaleDependentsSweep(b *testing.B) {
 					// above the cursor and the sweep has exactly one target in
 					// scope. Its dependents stay stale afterwards, but every
 					// later iteration's cursor sits above them.
-					from, err := store.ResourceVersionsMaxIssued(ctx)
+					from, err := store.GetLatestResourceVersion(ctx)
 					require.NoError(b, err)
 					target := ids[i%len(ids)]
-					_, _, err = store.ObjectsUpdateSpec(ctx, clientTestGK, target, benchSpec(), 0)
+					_, _, err = store.Objects().UpdateSpec(ctx, clientTestGK, target, benchSpec(), 0)
 					require.NoError(b, err)
 					sd.cursor = from
 					b.StartTimer()
@@ -95,7 +96,7 @@ func BenchmarkStaleDependentsSweep(b *testing.B) {
 			b.Run("quiet", func(b *testing.B) {
 				store, _ := benchStaleGraph(b, objects)
 				sd := sweeperOver(store)
-				mark, err := store.ResourceVersionsMaxIssued(ctx)
+				mark, err := store.GetLatestResourceVersion(ctx)
 				require.NoError(b, err)
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
@@ -168,33 +169,42 @@ func BenchmarkWakerScanRateUnderSustainedWrites(b *testing.B) {
 func benchWakeLog(b *testing.B, rows int) *wakeCountingStore {
 	b.Helper()
 	store, _ := benchStaleGraph(b, max(rows, 1))
-	cursors, ok := store.(DriverCursorer)
-	require.True(b, ok, "the waker's cursor path needs a store that can persist one")
-	return &wakeCountingStore{Store: store, DriverCursorer: cursors}
+	return &wakeCountingStore{Store: store}
 }
 
 // wakeCountingStore counts what one pass costs the store, split the way the
 // waker's two kinds of query are paid for.
 type wakeCountingStore struct {
 	Store
-	DriverCursorer
 	reads        int
 	cursorWrites int
 }
 
-func (s *wakeCountingStore) ObjectWritesListSinceAll(ctx context.Context, after int64, limit int) ([]ObjectWrite, int64, error) {
-	s.reads++
-	return s.Store.ObjectWritesListSinceAll(ctx, after, limit)
+func (s *wakeCountingStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSinceAll: s.listSinceAllObjectWrites}
 }
 
-func (s *wakeCountingStore) EdgesGroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *wakeCountingStore) listSinceAllObjectWrites(ctx context.Context, after int64, limit int) ([]ObjectWrite, int64, error) {
 	s.reads++
-	return s.Store.EdgesGroupIncomingByID(ctx, ids, rel)
+	return s.Store.ObjectWrites().ListSinceAll(ctx, after, limit)
 }
 
-func (s *wakeCountingStore) DriverCursorsSet(ctx context.Context, name string, at int64) error {
+func (s *wakeCountingStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupIncomingByID: s.groupIncomingByIDEdges}
+}
+
+func (s *wakeCountingStore) groupIncomingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+	s.reads++
+	return s.Store.Edges().GroupIncomingByID(ctx, ids, rel)
+}
+
+func (s *wakeCountingStore) DriverCursors() storeapi.DriverCursors {
+	return cursorsOverride{DriverCursors: s.Store.DriverCursors(), set: s.setDriverCursor}
+}
+
+func (s *wakeCountingStore) setDriverCursor(ctx context.Context, name string, at int64) error {
 	s.cursorWrites++
-	return s.DriverCursorer.DriverCursorsSet(ctx, name, at)
+	return s.Store.DriverCursors().Set(ctx, name, at)
 }
 
 // benchSpec returns a spec no row has held. A byte-identical write is a no-op
@@ -220,7 +230,7 @@ func benchStaleGraph(b *testing.B, objects int) (Store, []ObjectID) {
 	ids := make([]ObjectID, objects)
 	err = store.Within(ctx, func(ctx context.Context) error {
 		for i := range objects {
-			obj, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+			obj, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 				Name: uniqueName(),
 				Spec: []byte(`{"Val":"0"}`),
 			})
@@ -232,7 +242,7 @@ func benchStaleGraph(b *testing.B, objects int) (Store, []ObjectID) {
 		for i, from := range ids {
 			for n := 1; n <= benchStaleEdgesPerObject; n++ {
 				to := ids[(i+n)%objects]
-				if _, err := store.EdgesAdd(ctx, from, to, RelationDependsOn); err != nil {
+				if _, err := store.Edges().Add(ctx, from, to, RelationDependsOn); err != nil {
 					return err
 				}
 			}
@@ -243,11 +253,11 @@ func benchStaleGraph(b *testing.B, objects int) (Store, []ObjectID) {
 
 	// After the edges: EdgesAdd clears the watermark it finds, and the mark has
 	// to cover the versions the creates issued.
-	mark, err := store.ResourceVersionsMaxIssued(ctx)
+	mark, err := store.GetLatestResourceVersion(ctx)
 	require.NoError(b, err)
 	err = store.Within(ctx, func(ctx context.Context) error {
 		for _, id := range ids {
-			if err := store.DependencyWatermarksSet(ctx, id, mark); err != nil {
+			if err := store.Dependencies().WatermarkSet(ctx, id, mark); err != nil {
 				return err
 			}
 		}

@@ -6,7 +6,7 @@
 
 ## Context
 
-A collect is blocked while finalizers are pending, or while `EdgesHasIncoming`
+A collect is blocked while finalizers are pending, or while `Edges().HasIncoming`
 reports a referrer under RESTRICT. Every block is temporary, and nothing
 signalled a route out of one: an object freed by its controller clearing the last
 finalizer sat deletion-pending until the next sweep, up to a GC interval later.
@@ -32,11 +32,11 @@ deletion-pending row.
 
 **It routes like every other push**, through `signalRequeueNow`, which resolves
 the reconciler in the hook. No exception to the delete-request ADR was needed:
-`FinalizersDelete` is folded to `c.gk` and a `ControllerClient` is built only by
+`Objects().DeleteFinalizer` is folded to `c.gk` and a `ControllerClient` is built only by
 `Register`, so the kind is registered by construction and `deletionAdvance` —
 whose client-only arm runs `gcCollect` inline — is never on this path.
 
-**The store reports the gate.** `FinalizersDelete` returns `clearedLast`,
+**The store reports the gate.** `Objects().DeleteFinalizer` returns `clearedLast`,
 computed from the row the write already loaded. It is named for what the write
 changed rather than for `unblocked`, because the store cannot say whether the
 collect is free: RESTRICT may still hold the row, and `gcCollect` re-checks. The

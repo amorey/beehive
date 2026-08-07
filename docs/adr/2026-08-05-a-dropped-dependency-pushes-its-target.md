@@ -5,7 +5,7 @@
 
 ## Context
 
-`gcCollect` refuses to remove a deletion-pending row while `EdgesHasIncoming`
+`gcCollect` refuses to remove a deletion-pending row while `Edges().HasIncoming`
 reports a referrer under RESTRICT. Four routes lead out of that block. Two push
 at commit: a cleared finalizer, and the physical delete of the last child. The
 third is `ControllerClient.DependenciesDelete` dropping the last live
@@ -14,8 +14,8 @@ itself, in Consequences below.
 
 Nothing could signal it. An edge write bumps no `resource_version` and appends no
 `object_writes` entry — a ref is not a field of the object — so no cursor in the
-system can see one. `EdgesAdd` covers itself with a deliberate `reconcile_owed`
-stamp; `EdgesDelete` covered nothing, and the target waited out a GC tick.
+system can see one. `Edges().Add` covers itself with a deliberate `reconcile_owed`
+stamp; `Edges().Delete` covered nothing, and the target waited out a GC tick.
 
 The deferred fix on record was a monotonic edge epoch. It does not work: a
 counter is read on a driver's own schedule, so it can let a tick skip work, but
@@ -24,7 +24,7 @@ here is latency, and latency needs a wake.
 
 ## Decision
 
-`EdgesDelete` returns an `EdgesDeleteResult`, and `DependenciesDelete` pushes the
+`Edges().Delete` returns an `EdgesDeleteResult`, and `DependenciesDelete` pushes the
 target with `signalRequeueNow` when it reports `Unblocked`.
 
 **`Unblocked` is three facts, one field**: an edge was really removed, the target
@@ -32,15 +32,15 @@ is deletion-pending, and the source is not. Only the conjunction is read, so onl
 the conjunction is returned — see the
 [write-shapes ADR](2026-07-30-store-write-shapes.md). It is reported for
 `depends_on` and nothing else: the source-side fact below is the discount
-`EdgesHasIncoming` gives that relation alone, so the same verdict over `owned_by`
+`Edges().HasIncoming` gives that relation alone, so the same verdict over `owned_by`
 would be answering a question nobody asked with a rule that does not hold there.
 
 - *An edge was removed*, from `RowsAffected`, bounds the push to once per edge
-  ever created, matching `EdgesAdd`'s edge-new gate. A controller may call
+  ever created, matching `Edges().Add`'s edge-new gate. A controller may call
   `DependenciesDelete` on every pass.
 - *The target is deletion-pending*: a live target was never blocked, and
   `requeueNow` bypasses the re-enqueue floor.
-- *The source is not*: `EdgesHasIncoming` discounts a `depends_on` edge from a
+- *The source is not*: `Edges().HasIncoming` discounts a `depends_on` edge from a
   deletion-pending source, so dropping one lifts nothing. The natural caller is a
   finalizing dependent releasing its refs during cleanup — the shape that would
   otherwise push on every pass for nothing. Route 2 already treats the symmetric
@@ -48,7 +48,7 @@ would be answering a question nobody asked with a rule that does not hold there.
 
 Within those gates the push stays a probe: it does not check that this was the
 target's *last* referrer, and `gcCollect` re-checks the block. Buying that check
-would cost an `EdgesHasIncoming` on every drop to save a dispatch — and a
+would cost an `Edges().HasIncoming` on every drop to save a dispatch — and a
 dispatch runs the controller's `Reconcile` in full, which is what makes the three
 gates above worth their one query.
 
@@ -95,7 +95,7 @@ atomic already has it.
 
 ## Consequences
 
-`EdgesDelete`'s signature changes, which is a break in the exported `Store`.
+`Edges().Delete`'s signature changes, which is a break in the exported `Store`.
 
 The fan-out is 1→1 and the gates bound it to once per edge, so there is no
 teardown burst to coalesce — unlike the physical delete's N→1. The one loop left
@@ -123,10 +123,10 @@ pushes too — see
   object whose spec, status and conditions are identical, and whose refs are
   not even in the delivered object unless the caller asked for them. Retention
   is bounded and the horizon moves, so an entry could never replace
-  `EdgesAdd`'s `reconcile_owed` stamp — it would be a second, weaker record of
+  `Edges().Add`'s `reconcile_owed` stamp — it would be a second, weaker record of
   the same fact. And it would cost a `resource_version` and an append for each
   edge write, on a path that is free today, which a controller re-declaring
   its edge set every pass pays per pass.
-- **Gating on `EdgesHasIncoming`** so the push fires only for the genuinely last
+- **Gating on `Edges().HasIncoming`** so the push fires only for the genuinely last
   referrer. Rejected: a query on every drop to save a dispatch the collect
   already re-derives.

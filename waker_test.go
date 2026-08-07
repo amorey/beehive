@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,9 +50,9 @@ func TestStartWithNoControllersSkipsWaker(t *testing.T) {
 // wakerOver builds a waker over a scripted write log, plus reconcilers for the
 // given kinds so a wake has somewhere to land. The Beehive is assembled by hand
 // rather than through New: these tests drive seed and scan directly, so nothing
-// should be running concurrently with the assertions. It mirrors New's own
-// type-assertion, so a store double opts into the durable-cursor path exactly by
-// implementing DriverCursorer — nothing here has to say which.
+// should be running concurrently with the assertions. Every store persists a
+// cursor now, so a double opts out by reporting ok=false rather than by omitting
+// the methods.
 func wakerOver(store Store, kinds ...GroupKind) (*waker, map[GroupKind]*reconciler) {
 	rs := make(map[GroupKind]*reconciler, len(kinds))
 	order := make([]*reconciler, 0, len(kinds))
@@ -87,8 +88,8 @@ func seededWaker(store Store, kinds ...GroupKind) (*waker, *fakeClock, map[Group
 // avoid — to wake dependents for changes that happened before the process began,
 // which the startup pass already covers.
 //
-// *replayStore alone implements no DriverCursorer, so this is also the
-// no-capability fallback: it pins that a store which cannot persist a cursor
+// *replayStore persists nothing — its DriverCursorsGet always reports ok=false —
+// so this is also the no-persistence fallback: a store that cannot keep a cursor
 // seeds exactly as it always did.
 func TestWakerSeedsFromTheWriteLogMax(t *testing.T) {
 	store := &replayStore{seed: 500, rows: replayRows(3)}
@@ -507,9 +508,9 @@ func TestWakerPassPacesTheLoop(t *testing.T) {
 	})
 }
 
-// A store that implements DriverCursorer but has never persisted a cursor for
-// this waker seeds the same way a store with no capability at all does: there is
-// nothing stored to prefer over the write log's max.
+// A store that persists cursors but has never stored one for this waker seeds
+// the same way a store that persists nothing does: there is nothing stored to
+// prefer over the write log's max.
 func TestWakerSeedsFromMaxWithoutAStoredCursor(t *testing.T) {
 	store := &cursorStore{replayStore: replayStore{seed: 500, rows: replayRows(3)}}
 	dw, _ := wakerOver(store, GroupKind{Kind: "Widget"})
@@ -1389,7 +1390,11 @@ type slowMarkStore struct {
 	markReads int
 }
 
-func (s *slowMarkStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+func (s *slowMarkStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.cursorStore.ObjectWrites(), maxVersionAll: s.maxVersionAll}
+}
+
+func (s *slowMarkStore) maxVersionAll(context.Context) (int64, int64, error) {
 	s.markReads++
 	s.clk.advance(s.hold)
 	return 0, 0, errBoom
@@ -1578,22 +1583,16 @@ func TestWakerBacksOffAFailingPersist(t *testing.T) {
 }
 
 // Every waker test above drives a double, so all of them would stay green if the
-// real store stopped satisfying DriverCursorer — New's type assertion discards
-// its failure, leaving cursors nil and the waker silently back on
-// reseed-from-max. The static assertions in sqlite/store.go are the primary
-// guard; this pins the other half, that New actually hands the capability to the
-// waker rather than dropping it somewhere in between.
-func TestNewGivesTheWakerTheStoresCursorCapability(t *testing.T) {
+// waker stopped writing through to a real database at all. This pins the wiring
+// end to end: a seed over the sqlite store lands in driver_cursors.
+func TestTheWakerSeedReachesTheDatabase(t *testing.T) {
 	store, err := sqlite.OpenMemory()
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
 	bh := newTestBeehive(t, store)
-	require.NotNil(t, bh.waker.cursors, "the sqlite store persists cursors, so the waker must have them")
-
-	// And the wiring carries all the way through a real seed and back.
 	require.NotEqual(t, scanFailed, bh.waker.seed(context.Background()))
-	cursor, ok, err := store.DriverCursorsGet(context.Background(), cursorNameWaker)
+	cursor, ok, err := store.DriverCursors().Get(context.Background(), cursorNameWaker)
 	require.NoError(t, err)
 	require.True(t, ok, "the seed point reached the database")
 	assert.Equal(t, bh.waker.watermark, cursor)
@@ -1668,7 +1667,7 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 
 	// One object, so a version has been issued: the sweep skips a store where
 	// nothing has ever been written, and would never reach the listing.
-	_, err = probe.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+	_, err = probe.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1683,18 +1682,22 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 }
 
 // staleListErrorStore fails the staleness listing, for the sweep's failure arm.
-// It is a DriverCursorer so a test can watch the cursor it must not move.
+// It persists a cursor so a test can watch the one it must not move.
 type staleListErrorStore struct {
 	fakeStore
 	calls  atomic.Int64
 	issued int64
 }
 
-func (s *staleListErrorStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+func (s *staleListErrorStore) GetLatestResourceVersion(context.Context) (int64, error) {
 	return s.issued, nil
 }
 
-func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]ObjectRef, StalePos, error) {
+func (s *staleListErrorStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{Dependencies: s.fakeStore.Dependencies(), listStaleSince: s.listStaleSince}
+}
+
+func (s *staleListErrorStore) listStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]ObjectRef, StalePos, error) {
 	s.calls.Add(1)
 	return nil, after, errBoom
 }
@@ -1712,11 +1715,15 @@ type staleSweepStore struct {
 	stamped   [][]ObjectRef
 }
 
-func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+func (s *staleSweepStore) GetLatestResourceVersion(context.Context) (int64, error) {
 	return s.issued, s.issuedErr
 }
 
-func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, through int64, _ int) ([]ObjectRef, StalePos, error) {
+func (s *staleSweepStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{Dependencies: s.fakeStore.Dependencies(), listStaleSince: s.listStaleSince}
+}
+
+func (s *staleSweepStore) listStaleSince(_ context.Context, _ []GroupKind, after StalePos, through int64, _ int) ([]ObjectRef, StalePos, error) {
 	s.asked = append(s.asked, after)
 	s.throughs = append(s.throughs, through)
 	if len(s.pages) == 0 {
@@ -1727,7 +1734,11 @@ func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupK
 	return page, StalePos{TargetVersion: after.TargetVersion + 1}, nil
 }
 
-func (s *staleSweepStore) ReconcileOwedStamp(_ context.Context, refs []ObjectRef) error {
+func (s *staleSweepStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.fakeStore.ReconcileOwed(), stamp: s.stamp}
+}
+
+func (s *staleSweepStore) stamp(_ context.Context, refs []ObjectRef) error {
 	if s.stampErr != nil {
 		return s.stampErr
 	}
@@ -1820,25 +1831,25 @@ func TestStaleDependentsSweepDoesNotRestampAConsumedVersion(t *testing.T) {
 	spec := []byte(`{}`)
 
 	// The target is written last, so it sits at exactly the mark sweep one ends on.
-	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	dep, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
-	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	target, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	sd.sweep(ctx)
-	raw, err := store.ObjectsGet(ctx, dep.ID)
+	raw, err := store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, raw.ReconcileOwed, "the dependent has no watermark, so one pass is owed")
 
 	// An unrelated write moves the mark, so the next tick sweeps. The target
 	// itself has not moved, and the dependent is still stale.
-	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	_, err = store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 
 	sd.sweep(ctx)
 
-	raw, err = store.ObjectsGet(ctx, dep.ID)
+	raw, err = store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, raw.ReconcileOwed, "the target did not move, so nothing more is owed")
 }
@@ -1854,15 +1865,15 @@ func TestStaleDependentsSweepLeavesADurableFinding(t *testing.T) {
 	sd := sweeperOver(store)
 
 	spec := []byte(`{}`)
-	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	target, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
-	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	dep, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	sd.sweep(ctx)
 
-	owed, err := store.ReconcileOwedListIDs(ctx, clientTestGK)
+	owed, err := store.ReconcileOwed().ListIDs(ctx, clientTestGK)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "the finding outlives the queue it was also put on")
 }
@@ -1910,26 +1921,26 @@ func TestStaleDependentsSweepRepairsALostFindingAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	spec := []byte(`{}`)
-	dep, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	dep, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
-	target, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
+	target, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, RelationDependsOn))
 
 	sweeperOver(store).sweep(ctx)
-	owed, err := store.ObjectsGet(ctx, dep.ID)
+	owed, err := store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, owed.ReconcileOwed, "the sweep recorded the finding")
 
 	// Drained, then lost: the reconcile it dispatched never ran.
-	require.NoError(t, store.ReconcileOwedDecrement(ctx, clientTestGK, dep.ID, 1))
-	owed, err = store.ObjectsGet(ctx, dep.ID)
+	require.NoError(t, store.ReconcileOwed().Decrement(ctx, clientTestGK, dep.ID, 1))
+	owed, err = store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	require.Zero(t, owed.ReconcileOwed, "nothing durable names the dependent now")
 
 	sweeperOver(store).sweep(ctx)
 
-	owed, err = store.ObjectsGet(ctx, dep.ID)
+	owed, err = store.Objects().Get(ctx, dep.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, owed.ReconcileOwed, "the new process re-derives and finds it again")
 }

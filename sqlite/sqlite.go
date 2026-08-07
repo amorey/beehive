@@ -40,7 +40,7 @@ func Open(path string) (*sqliteStore, error) {
 // data is lost when the store is closed.
 //
 // auto_vacuum matches OpenPool: it cannot change after the first table exists,
-// so a test database on another mode would silently skip FreePagesRelease.
+// so a test database on another mode would silently skip ReclaimSpace.
 func OpenMemory() (*sqliteStore, error) {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)&_pragma=auto_vacuum(incremental)")

@@ -3,6 +3,14 @@
 - **Status:** Accepted — implemented across `internal/storeapi`, `client.go`, `controller.go`, `types.go`, and the internals.
 - **Date:** 2026-07-27
 
+> **Amended 2026-08-07.** This record still governs `Client` and
+> `ControllerClient`, and its names below are left as they were written — several
+> of its arguments are *about* those names. It no longer governs `Store`, where
+> the noun moved from the method name onto a type and each family is reached
+> through an accessor (`store.Edges().Add`). That drops the two costs recorded in
+> *Consequences* — the verb in the middle, and the verb slot reading as a verb
+> only by habit — and lets `Edges().HasIncoming` read as the predicate it is.
+
 ## Context
 
 The `Store` interface had grown to forty methods named verb-first: `CreateObject`,
@@ -32,7 +40,10 @@ its secondary nouns (events, schedule, relations) take one. See the amendment be
 the object watches were listed here as a secondary noun until 2026-08-02. On `ControllerClient` the
 line falls between a **column on the object's row** and a **table of its own**:
 `UpdateStatus` stays bare, while conditions, finalizers, events and edges — each its
-own table — are prefixed.
+own table — are prefixed. (Amended: `finalizers` is in fact a **column** on
+`objects`, not a table. The `ControllerClient` name stands, but the distinction it
+was drawn from does not reach it — which is why the store side is
+`Objects().DeleteFinalizer`.)
 
 `Object`'s relation accessors are the degenerate case: noun-first with no verb left is
 Go's accessor idiom, so `GetOwner`/`ListDependencies` became `Owner()`/`Dependencies()`.

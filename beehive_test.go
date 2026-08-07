@@ -36,10 +36,10 @@ func TestSweepEventRetention(t *testing.T) {
 	ctx := context.Background()
 
 	gk := GroupKind{Kind: "Widget"}
-	obj, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+	obj, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 	require.NoError(t, err)
 	for _, r := range []string{"R1", "R2", "R3", "R4"} {
-		err := store.EventsAdd(ctx, gk, obj.ID, EventsAddInput{Category: "c", Type: "Normal", Reason: r})
+		err := store.Events().Add(ctx, gk, obj.ID, EventsAddInput{Category: "c", Type: "Normal", Reason: r})
 		require.NoError(t, err)
 	}
 
@@ -47,7 +47,7 @@ func TestSweepEventRetention(t *testing.T) {
 		bh, err := New(store)
 		require.NoError(t, err)
 		bh.eventRetentionSweep(ctx)
-		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
+		got, err := store.Events().List(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 4)
 	})
@@ -62,7 +62,7 @@ func TestSweepEventRetention(t *testing.T) {
 		bh, err := New(store, WithEventRetention(2, 0))
 		require.NoError(t, err)
 		bh.eventRetentionSweep(ctx)
-		got, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
+		got, err := store.Events().List(ctx, obj.ID, storeapi.EventQuery{})
 		require.NoError(t, err)
 		assert.Len(t, got, 2)
 	})
@@ -75,7 +75,7 @@ type freePagesStore struct {
 	err    error
 }
 
-func (s *freePagesStore) FreePagesRelease(_ context.Context, maxPages int) (int, error) {
+func (s *freePagesStore) ReclaimSpace(_ context.Context, maxPages int) (int, error) {
 	select {
 	case s.called <- maxPages:
 	default:
@@ -103,10 +103,10 @@ func TestSweepFreePages(t *testing.T) {
 			"the sweeper should pass its own cap, not a store-chosen one")
 	})
 
-	t.Run("a store without the capability is skipped", func(t *testing.T) {
+	t.Run("a store that reclaims nothing is a no-op", func(t *testing.T) {
 		bh, err := New(&fakeStore{})
 		require.NoError(t, err)
-		bh.freePagesSweep(ctx) // must not panic: fakeStore has no FreePagesRelease
+		bh.freePagesSweep(ctx) // fakeStore reclaims 0; nothing to log, nothing to fail
 	})
 
 	t.Run("a failed drain is logged, not fatal", func(t *testing.T) {
@@ -124,7 +124,11 @@ type eventSweepStore struct {
 	budget chan int
 }
 
-func (s *eventSweepStore) EventsSweep(_ context.Context, _ int, _ time.Duration, capBudget int) (int, error) {
+func (s *eventSweepStore) Events() storeapi.Events {
+	return eventsOverride{Events: s.Store.Events(), sweep: s.sweep}
+}
+
+func (s *eventSweepStore) sweep(_ context.Context, _ int, _ time.Duration, capBudget int) (int, error) {
 	select {
 	case s.budget <- capBudget:
 	default:
@@ -174,7 +178,11 @@ type owedClearStore struct {
 	err  error
 }
 
-func (s *owedClearStore) ReconcileOwedSweep(_ context.Context, keep []GroupKind) (int, error) {
+func (s *owedClearStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.Store.ReconcileOwed(), sweep: s.sweep}
+}
+
+func (s *owedClearStore) sweep(_ context.Context, keep []GroupKind) (int, error) {
 	select {
 	case s.kept <- keep:
 	default:
@@ -224,7 +232,7 @@ func TestSweepReconcileOwedEmitsNothing(t *testing.T) {
 	target := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "target"})
 	// The production stamp: a new depends_on edge owes swept a reconcile no loop
 	// will ever run.
-	_, err := bh.store.EdgesAdd(ctx, swept.ID, target.ID, RelationDependsOn)
+	_, err := bh.store.Edges().Add(ctx, swept.ID, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 
 	_, ch, err := loose.WatchList(ctx)
@@ -246,13 +254,13 @@ func TestSweepReconcileOwedWithNoControllers(t *testing.T) {
 	loose := NewClient[cSpec, cStatus](bh, clientOnlyGK)
 	from := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "from"})
 	to := mustCreate(t, ctx, loose, uniqueName(), cSpec{Val: "to"})
-	res, err := bh.store.EdgesAdd(ctx, from.ID, to.ID, RelationDependsOn)
+	res, err := bh.store.Edges().Add(ctx, from.ID, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.True(t, res.ReconcileOwedStamped, "the edge must owe a reconcile to begin with")
 
 	bh.reconcileOwedSweep(ctx)
 
-	raw, err := store.ObjectsGet(ctx, from.ID)
+	raw, err := store.Objects().Get(ctx, from.ID)
 	require.NoError(t, err)
 	assert.Zero(t, raw.ReconcileOwed, "no reconcile loop can drain it, so the sweep does")
 }
@@ -585,13 +593,13 @@ func TestSweepWriteLogRetention(t *testing.T) {
 		require.NoError(t, err)
 		gk := GroupKind{Kind: "Widget"}
 		for range 3 {
-			_, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+			_, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 			require.NoError(t, err)
 		}
 
 		bh.writeLogRetentionSweep(ctx)
 
-		page, _, err := store.ObjectWritesListSince(ctx, gk, 0, 10)
+		page, _, err := store.ObjectWrites().ListSince(ctx, gk, 0, 10)
 		require.NoError(t, err)
 		assert.Len(t, page, 3)
 	})
@@ -602,13 +610,13 @@ func TestSweepWriteLogRetention(t *testing.T) {
 		require.NoError(t, err)
 		gk := GroupKind{Kind: "Widget"}
 		for range 3 {
-			_, err := store.ObjectsCreate(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+			_, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 			require.NoError(t, err)
 		}
 
 		bh.writeLogRetentionSweep(ctx)
 
-		page, _, err := store.ObjectWritesListSince(ctx, gk, 0, 10)
+		page, _, err := store.ObjectWrites().ListSince(ctx, gk, 0, 10)
 		require.NoError(t, err)
 		assert.Len(t, page, 2)
 	})

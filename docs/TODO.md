@@ -44,7 +44,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   closed the scheduling half. `prime` cannot fail startup, so a failed read leaves
   the waker unseeded and `run` retries on the backoff (100ms, doubling). With a
   stored cursor the retry resumes there and nothing is skipped; **without one — a
-  fresh store, or a store with no `DriverCursorer` — it reads
+  fresh store, or a store that persists no cursor — it reads
   `ObjectWritesMaxVersionAll` as of *then*, and a write committed in between is
   below it.** `backingOff` is why a commit cannot shorten the window: an unseeded
   waker drops wakes until its retry fires.
@@ -150,7 +150,9 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   `OwnedObjectsList` → `OwnedObjects`, `OwnedObjectsListWatch` →
   `OwnedObjectsWatch`, `EventsList` → `Events`, `EdgesListIncoming` →
   `EdgesIncoming`: twenty distinct method names across `Client`,
-  `ControllerClient` and `Store`.
+  `ControllerClient` and `Store`. The `Store` half is reshaped since the families
+  moved onto types — there the question is now `Edges().ListIncoming` →
+  `Edges().Incoming`.
 
   **The argument is already in the naming ADR, applied to a different surface.**
   `Object`'s relation accessors dropped their verbs — `GetOwner`/`ListDependencies`

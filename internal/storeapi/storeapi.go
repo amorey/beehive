@@ -64,11 +64,11 @@ var ErrStaleTxContext = errors.New("beehive: transaction context is not the live
 // same-goroutine frames unwind before fn returns.
 var ErrConcurrentNestedTx = errors.New("beehive: nested transaction frame still open at commit")
 
-// ErrObservedGenerationFuture is returned by ObjectsUpdateStatus when
+// ErrObservedGenerationFuture is returned by Objects().UpdateStatus when
 // observedGeneration exceeds the object's current generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
-// ErrSchemaVersionDowngrade is returned by ObjectsUpdateSpec/ObjectsUpdateStatus when the
+// ErrSchemaVersionDowngrade is returned by Objects().UpdateSpec/Objects().UpdateStatus when the
 // caller's schema version is non-zero and lower than the row's. Zero means "no
 // opinion" and keeps the stored tag.
 var ErrSchemaVersionDowngrade = errors.New("beehive: stored schema version is newer than this build's")
@@ -141,7 +141,7 @@ type Event struct {
 	ResourceVersion int64
 }
 
-// EventsAddInput is everything EventsAdd accepts. Deliberately not Event: the
+// EventsAddInput is everything Events().Add accepts. Deliberately not Event: the
 // rest of a run is store-assigned (identity, Count, window, ResourceVersion).
 // See docs/adr/2026-07-30-store-write-shapes.md.
 type EventsAddInput struct {
@@ -152,7 +152,7 @@ type EventsAddInput struct {
 	Type     string
 }
 
-// EventQuery filters and bounds a EventsList read. The zero value selects every
+// EventQuery filters and bounds a Events().List read. The zero value selects every
 // run for the object, newest first (by LastAt, then id).
 type EventQuery struct {
 	// Category, when non-nil, restricts to that exact timeline ("" included).
@@ -210,14 +210,14 @@ type RawObject struct {
 	ResourceVersion     int64      `json:"resourceVersion"`
 	DeletionRequestedAt *time.Time `json:"deletionRequestedAt,omitempty"`
 	// ReconcileOwed is the objects.reconcile_owed count; 0 means none. Store-
-	// owned: moved only by EdgesAdd's stamp, ReconcileOwedStamp,
-	// ReconcileOwedDecrement and ReconcileOwedSweep.
+	// owned: moved only by Edges().Add's stamp, ReconcileOwed().Stamp,
+	// ReconcileOwed().Decrement and ReconcileOwed().Sweep.
 	ReconcileOwed int64       `json:"reconcileOwed"`
 	Finalizers    []string    `json:"finalizers"`
 	Conditions    []Condition `json:"conditions"` // assembled on reads; nil when the object has none
 	// Owner is set only on a delete entry's row image, where the owned_by edge
 	// has already cascaded away. Nil on a row read from objects, which resolves
-	// its owner through EdgesListOutgoingByRelation like any other relation.
+	// its owner through Edges().ListOutgoingByRelation like any other relation.
 	Owner     *ObjectRef `json:"owner,omitempty"`
 	CreatedAt time.Time  `json:"createdAt"`
 	UpdatedAt time.Time  `json:"updatedAt"`
@@ -230,7 +230,7 @@ type ReconcileLoad struct {
 	// Object — the value to record on success.
 	Cursor int64
 	// HasDependencies reports whether Object had an outgoing depends_on edge at
-	// load, letting a dependency-free reconcile skip DependencyWatermarksSet.
+	// load, letting a dependency-free reconcile skip Dependencies().WatermarkSet.
 	HasDependencies bool
 }
 
@@ -245,7 +245,7 @@ const (
 	RelationDependsOn Relation = "depends_on"
 )
 
-// ObjectsCreateInput is everything ObjectsCreate accepts. Deliberately not
+// ObjectsCreateInput is everything Objects().Create accepts. Deliberately not
 // RawObject: the rest of a new row is store-assigned or fixed (Generation 1,
 // ReconcileOwed 0, Status NULL). See docs/adr/2026-07-30-store-write-shapes.md.
 type ObjectsCreateInput struct {
@@ -286,7 +286,7 @@ type DeletionRequestResult struct {
 	// Marked reports whether this call stamped the row; a repeat reports false.
 	Marked bool
 	// Unblocked are the deletion-pending objects this row points at through
-	// depends_on: EdgesHasIncoming discounts an edge from a deletion-pending
+	// depends_on: Edges().HasIncoming discounts an edge from a deletion-pending
 	// source, so the mark lifted their RESTRICT. A probe, not a verdict — it
 	// does not check that this row was the target's last referrer. Empty
 	// unless Marked.
@@ -294,7 +294,7 @@ type DeletionRequestResult struct {
 }
 
 // EdgesAddResult is what a caller needs to follow up on an edge it declared;
-// all of it falls out of work EdgesAdd already does.
+// all of it falls out of work Edges().Add already does.
 type EdgesAddResult struct {
 	// From is the source object's GroupKind. Edges are cross-kind, so a caller
 	// routing a requeue to fromID cannot assume its own kind.
@@ -351,17 +351,48 @@ func (r ObjectRef) GroupKind() GroupKind {
 }
 
 // Store is the durable-store contract beehive depends on internally. Non-
-// generic; it deals only in raw rows.
+// generic; it deals only in raw rows. Each family is reached through an
+// accessor: store.Edges().Add.
 //
 // A mutator returns a row exactly where a public Client write returns that
-// object to the user — today ObjectsCreate and ObjectsUpdateSpec only. Where a row is
-// returned, a nil error guarantees it is non-nil (including ObjectsUpdateSpec's
+// object to the user — today Objects().Create and Objects().UpdateSpec only. Where a row is
+// returned, a nil error guarantees it is non-nil (including Objects().UpdateSpec's
 // no-op). Every other mutator returns only an error, plus a bool where the
 // outcome is not otherwise derivable and a caller reads it; those writes
 // should answer from metadata alone, with no blob or conditions query.
 // See docs/adr/2026-07-30-store-write-shapes.md.
 type Store interface {
 	io.Closer
+
+	// Conditions is the conditions table.
+	Conditions() Conditions
+
+	// DeletionRequests is the deletion-request lifecycle over
+	// objects.deletion_requested_at.
+	DeletionRequests() DeletionRequests
+
+	// Dependencies is the dependency-watermark table and the staleness scan
+	// derived from it.
+	Dependencies() Dependencies
+
+	// DriverCursors is the per-driver scan-position table.
+	DriverCursors() DriverCursors
+
+	// Edges is the owned_by and depends_on edge table.
+	Edges() Edges
+
+	// Events is the per-object event log, aggregated into runs.
+	Events() Events
+
+	// ObjectWrites is the append-only object write log.
+	ObjectWrites() ObjectWrites
+
+	// Objects is the objects table.
+	Objects() Objects
+
+	// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that
+	// an object is owed a pass.
+	ReconcileOwed() ReconcileOwed
 
 	// Within runs fn inside a single transaction, committing on nil error and
 	// rolling back otherwise. Store calls made with the ctx passed to fn join
@@ -392,78 +423,123 @@ type Store interface {
 	// sequence and nothing recovers.
 	AfterCommit(ctx context.Context, fn func(ctx context.Context))
 
-	// ConditionsDelete removes the condition of type condType from id. A real
-	// removal bumps ResourceVersion; a missing condition does nothing. Scoped
-	// to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
-	ConditionsDelete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error
+	// GetLatestResourceVersion returns the highest resource version issued. It
+	// reads the sequence, not a table, so retention cannot lower it. It moves
+	// for an event write too, so it is a "did anything change" answer, not a
+	// log position to scan from.
+	GetLatestResourceVersion(ctx context.Context) (int64, error)
 
-	// ConditionsSet inserts or updates the condition keyed by (id, cond.Type).
-	// A real change bumps ResourceVersion; an identical write does nothing.
-	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// Returns no row; read conditions back with ObjectsGet.
-	ConditionsSet(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
+	// ReclaimSpace returns up to maxPages of space freed by deleted rows to the
+	// OS and reports how many it released — a report, not a guarantee; a
+	// backend may release fewer, including none, and one that reclaims nothing
+	// returns 0. Non-positive maxPages releases nothing.
+	ReclaimSpace(ctx context.Context, maxPages int) (int, error)
+}
 
-	// DeletionRequestsCreate sets DeletionRequestedAt; the row stays until finalizers
-	// clear (ObjectsDelete removes it). changed is true only when this call set
+// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that an
+// object is owed a pass.
+type ReconcileOwed interface {
+	// Decrement subtracts observed from id's reconcile_owed,
+	// floored at 0. Callers pass the count they loaded, not 1: one pass
+	// answers every wake outstanding at its load, and increments landing after
+	// the load survive the subtraction. Bumps no resource_version. Scoped to
+	// gk: wrong kind → ErrWrongKind; a row that is simply gone is not an error.
+	Decrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error
+
+	// ListIDs returns the ids of objects of kind gk with
+	// reconcile_owed != 0, so a wake recorded before a crash is serviced on
+	// restart. Separate from Objects().ListUnsettledIDs: a settled object can still owe
+	// a wake.
+	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// Stamp increments reconcile_owed once for each DISTINCT ref, so
+	// a finding outlives the in-memory queue. Repeats inside one call fold into
+	// that single increment: a caller owed two wakes for one object must make two
+	// calls. Sound for the pass, whose listing returns a row per (target,
+	// dependent) pair, because one reconcile answers every wake outstanding at its
+	// load and ReconcileOwed().Decrement subtracts the whole count it observed.
+	//
+	// An id that is gone is skipped, not reported. Empty refs writes nothing.
+	// Bumps no resource_version.
+	//
+	// Not kind-scoped, unlike ReconcileOwed().Decrement: the refs come from the
+	// store's own listing, which spans every registered kind in one page.
+	Stamp(ctx context.Context, refs []ObjectRef) error
+
+	// Sweep zeroes reconcile_owed for every object whose kind is not
+	// in keep, and returns how many rows it cleared. An empty keep clears every
+	// nonzero row. Bumps no resource_version and appends no write-log entry.
+	// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
+	Sweep(ctx context.Context, keep []GroupKind) (int, error)
+}
+
+// DeletionRequests is the deletion-request lifecycle over
+// objects.deletion_requested_at.
+type DeletionRequests interface {
+	// Create sets DeletionRequestedAt; the row stays until finalizers
+	// clear (Objects().Delete removes it). changed is true only when this call set
 	// the flag; repeats return false. Scoped to gk: wrong kind → ErrWrongKind,
 	// missing id → ErrNotFound.
-	DeletionRequestsCreate(ctx context.Context, gk GroupKind, id ObjectID) (DeletionRequestResult, error)
+	Create(ctx context.Context, gk GroupKind, id ObjectID) (DeletionRequestResult, error)
 
-	// DeletionRequestsCreateByName is DeletionRequestsCreate keyed by name within gk, with
+	// CreateByName is Create keyed by name within gk, with
 	// resolve and mark in one statement. ErrNotFound if no object of gk holds
 	// the name (no ErrWrongKind: names are per-kind).
-	DeletionRequestsCreateByName(ctx context.Context, gk GroupKind, name string) (DeletionRequestResult, error)
+	CreateByName(ctx context.Context, gk GroupKind, name string) (DeletionRequestResult, error)
 
-	// DeletionRequestsCreateFromOwner requests deletion of every object owned by
+	// CreateFromOwner requests deletion of every object owned by
 	// ownerID and returns them all. Writes only to children not already
 	// deletion-pending, so repeating over a deleting subtree costs one read.
-	DeletionRequestsCreateFromOwner(ctx context.Context, ownerID ObjectID) (DeletionCascadeResult, error)
+	CreateFromOwner(ctx context.Context, ownerID ObjectID) (DeletionCascadeResult, error)
 
-	// DeletionRequestsList returns every deletion-pending object of every
+	// List returns every deletion-pending object of every
 	// kind, each with its GroupKind, so the global GC sweeper can route
 	// registered kinds to their controller and collect client-only kinds
 	// directly.
-	DeletionRequestsList(ctx context.Context) ([]ObjectRef, error)
+	List(ctx context.Context) ([]ObjectRef, error)
+}
 
-	// EventsAdd records an observation in the (id, in.Category) timeline. If
+// Events is the per-object event log, aggregated into runs.
+type Events interface {
+	// Add records an observation in the (id, in.Category) timeline. If
 	// the latest run there has the same (Type, Reason) it is extended (Count
 	// up, LastAt moved, Message/Detail re-sampled); otherwise a new run is
 	// appended with Count 1. Scoped to gk: wrong kind → ErrWrongKind, missing
 	// id → ErrNotFound.
-	EventsAdd(ctx context.Context, gk GroupKind, id ObjectID, in EventsAddInput) error
+	Add(ctx context.Context, gk GroupKind, id ObjectID, in EventsAddInput) error
 
-	// EventsGetLatest returns the most recent run in id's category timeline, or
+	// GetLatest returns the most recent run in id's category timeline, or
 	// nil if none. Reads by id only (not kind-scoped).
-	EventsGetLatest(ctx context.Context, id ObjectID, category string) (*Event, error)
+	GetLatest(ctx context.Context, id ObjectID, category string) (*Event, error)
 
-	// EventsList returns id's event runs matching q, newest first (by LastAt,
+	// List returns id's event runs matching q, newest first (by LastAt,
 	// then id). The zero EventQuery returns every run. Not kind-scoped.
-	EventsList(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
+	List(ctx context.Context, id ObjectID, q EventQuery) ([]Event, error)
 
-	// EventsListSince returns id's runs above afterRV, oldest first, at most
+	// ListSince returns id's runs above afterRV, oldest first, at most
 	// limit of them, with the retention horizon (0 when nothing was trimmed). An
 	// extend re-samples ResourceVersion, so the page is exactly what changed. The
 	// page is unfiltered and spans every category; category selects only which
 	// horizon is reported, nil meaning the max across the object's timelines.
 	// ErrNotFound when id holds no object: its log cascaded away with it, so an
 	// empty page there is not "no events".
-	EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) (
+	ListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) (
 		[]Event, int64, error)
 
-	// EventsSnapshot returns id's runs matching q and the log position the
-	// listing is complete as of, read in one transaction so no write falls
-	// between them. The position is what EventsMaxVersion reports — the object's
-	// whole log, not the query's — so a filtered watch resumes above what it
-	// could not see. Not kind-scoped; an unknown id reads as no runs at 0.
-	EventsSnapshot(ctx context.Context, id ObjectID, q EventQuery) ([]Event, int64, error)
-
-	// EventsMaxVersion returns the highest ResourceVersion over id's event
+	// MaxVersion returns the highest ResourceVersion over id's event
 	// runs, 0 when there are none (unknown id included). Spans every category
 	// and ignores filters. Not monotonic — retention can lower it — so
 	// consumers compare for inequality, not greater-than.
-	EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error)
+	MaxVersion(ctx context.Context, id ObjectID) (int64, error)
 
-	// EventsSweep trims the event log to the retention bounds and returns how
+	// Snapshot returns id's runs matching q and the log position the
+	// listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what Events().MaxVersion reports — the object's
+	// whole log, not the query's — so a filtered watch resumes above what it
+	// could not see. Not kind-scoped; an unknown id reads as no runs at 0.
+	Snapshot(ctx context.Context, id ObjectID, q EventQuery) ([]Event, int64, error)
+
+	// Sweep trims the event log to the retention bounds and returns how
 	// many runs it deleted. perTimeline > 0 caps each (object, category)
 	// timeline to its newest perTimeline runs; maxAge > 0 drops runs with
 	// LastAt older than that. A zero bound is skipped. Global, not per-kind.
@@ -472,94 +548,12 @@ type Store interface {
 	// for at most that many timelines trimmed by the perTimeline cap, so a
 	// caller sweeping rarely can ask for proportionally more; <= 0 leaves the
 	// bound to the implementation.
-	EventsSweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error)
+	Sweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error)
+}
 
-	// FinalizersDelete removes finalizer from id's list. A real removal bumps
-	// ResourceVersion; a missing one does nothing. clearedLast reports that this
-	// call removed the last finalizer from a deletion-pending row. Scoped to gk:
-	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
-	FinalizersDelete(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (clearedLast bool, err error)
-
-	// ObjectsCreate inserts a new object of kind gk. The store assigns ID and
-	// ResourceVersion and sets Generation to 1.
-	ObjectsCreate(ctx context.Context, gk GroupKind, in ObjectsCreateInput) (*RawObject, error)
-
-	// ObjectsDelete removes the row outright — the physical delete the GC path
-	// performs. Callers must ensure finalizers are empty first.
-	ObjectsDelete(ctx context.Context, id ObjectID) error
-
-	// ObjectsGet loads an object by id, or returns ErrNotFound.
-	ObjectsGet(ctx context.Context, id ObjectID) (*RawObject, error)
-
-	// ObjectsGetByName loads the object with the given name within gk, or
-	// returns ErrNotFound.
-	ObjectsGetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
-
-	// ObjectsGetForReconcile is the reconcile loop's opening read: the object
-	// with conditions, the store-wide write cursor as of the same statement,
-	// and whether it has dependencies. ErrNotFound if the row is gone.
-	ObjectsGetForReconcile(ctx context.Context, id ObjectID) (ReconcileLoad, error)
-
-	// ObjectsGetMeta is ObjectsGet without the conditions query (Conditions is
-	// always nil). ErrNotFound if no object matches.
-	ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawObject, error)
-
-	// ObjectsList returns every object of kind gk, ordered by id.
-	ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error)
-
-	// ObjectsListByIncomingEdge returns the full objects of kind gk that point
-	// at toID through relation, ordered by id, with conditions — edges and
-	// rows in one query. Other kinds are filtered out; no matching edge reads
-	// empty, not ErrNotFound.
-	ObjectsListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
-
-	// ObjectsListByIDs returns the objects of kind gk whose ids are in ids,
-	// ordered by id — creation order, not the caller's order and not
-	// resource_version order. An id naming no object, or one of another kind, is
-	// absent: a short result is normal, not an error. Callers keep ids to a
-	// batch a backend can bind in one statement; the watch tail bounds it by its
-	// page cap.
-	ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error)
-
-	// ObjectsListIDs returns the ids of every object of kind gk, ordered by id.
-	ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// ObjectsListUnsettledIDs returns the IDs of objects of kind gk whose
-	// observed_generation doesn't match generation (not yet converged).
-	ObjectsListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// ObjectsUpdateSpec replaces an object's spec, bumping Generation and
-	// ResourceVersion, and stamps specVersion. Spec bytes identical to the
-	// stored ones at the row's own schema version are a no-op: no bump, and
-	// changed reports false (bytes at a different schema version always take
-	// the write path). changed=true is what callers enqueue a reconcile on.
-	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	ObjectsUpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
-
-	// ObjectsUpdateSpecByName is ObjectsUpdateSpec keyed by name within gk, ErrNotFound if
-	// the name is not held (no ErrWrongKind). Same no-op and changed
-	// semantics. An implementation MUST resolve and write in one transaction:
-	// the no-op comparison needs the stored bytes, and a split would let a
-	// concurrent collect hand the name to a replacement in between.
-	ObjectsUpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
-
-	// ObjectsUpdateStatus replaces an object's status, records observedGeneration and
-	// stamps statusVersion. Changed bytes bump ObservedAt, ResourceVersion and
-	// UpdatedAt. Bytes identical at the row's own schema version write no
-	// status — but ObservedGeneration/ObservedAt (and ResourceVersion) still
-	// advance if this reconcile settled a new generation, at most once per
-	// generation; a call identical in both respects writes nothing at all.
-	//
-	// A stale observedGeneration (at or below the recorded value) is ignored
-	// on the no-op path but written as given on the content-changed path,
-	// rolling the object back to unsettled so a later pass re-derives it.
-	//
-	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// observedGeneration above the row's generation → ErrObservedGenerationFuture.
-	// Returns no row.
-	ObjectsUpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
-
-	// EdgesAdd inserts a directed (fromID -> toID) edge with the given
+// Edges is the owned_by and depends_on edge table.
+type Edges interface {
+	// Add inserts a directed (fromID -> toID) edge with the given
 	// relation. Idempotent; both endpoints must exist or ErrNotFound. Bumps no
 	// version.
 	//
@@ -575,101 +569,208 @@ type Store interface {
 	//
 	// The result also reports both endpoints' GroupKinds and whether toID was
 	// deletion-pending, all read by the endpoint check inside that same unit.
-	EdgesAdd(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
+	Add(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesAddResult, error)
 
-	// EdgesDelete removes the (fromID, toID, relation) edge; removing a missing
+	// Delete removes the (fromID, toID, relation) edge; removing a missing
 	// one does nothing. Bumps no version. For a depends_on edge it reports
 	// whether the removal lifted a RESTRICT block, so a caller can push the
 	// target's collect; Unblocked is never set for any other relation, because
-	// the source-side condition behind it is the discount EdgesHasIncoming
+	// the source-side condition behind it is the discount Edges().HasIncoming
 	// gives depends_on alone.
-	EdgesDelete(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesDeleteResult, error)
+	Delete(ctx context.Context, fromID, toID ObjectID, relation Relation) (EdgesDeleteResult, error)
 
-	// EdgesDeleteFinalizingDependsOn removes the depends_on edges pointing at toID
+	// DeleteFinalizingDependsOn removes the depends_on edges pointing at toID
 	// whose source is itself marked for deletion, so mutually dependent
 	// finalizing objects don't RESTRICT-block each other forever. owned_by
 	// edges are left alone.
-	EdgesDeleteFinalizingDependsOn(ctx context.Context, toID ObjectID) error
+	DeleteFinalizingDependsOn(ctx context.Context, toID ObjectID) error
 
-	// EdgesGroupIncomingByID is the batched form of EdgesListIncoming: sources
+	// GroupIncomingByID is the batched form of Edges().ListIncoming: sources
 	// pointing at many targets through relation, grouped by target id. A
 	// target with no sources is absent from the map.
-	EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
+	GroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
 
-	// EdgesGroupOutgoingByID is the batched form of EdgesListOutgoingByRelation: the
+	// GroupOutgoingByID is the batched form of Edges().ListOutgoingByRelation: the
 	// relation's targets for many sources, grouped by source id. A source with
 	// no matching edge is absent from the map. An implementation may split a
 	// large id list across queries.
-	EdgesGroupOutgoingByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
+	GroupOutgoingByID(ctx context.Context, fromIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error)
 
-	// EdgesHasIncoming reports whether anything with a live claim points at
+	// HasIncoming reports whether anything with a live claim points at
 	// id: an owned_by edge, or a depends_on edge from a source that is not
 	// itself finalizing (a deletion-pending dependent no longer counts, or
 	// mutually dependent finalizing objects would deadlock). GC pairs this
-	// with EdgesDeleteFinalizingDependsOn before ObjectsDelete.
-	EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error)
+	// with Edges().DeleteFinalizingDependsOn before Objects().Delete.
+	HasIncoming(ctx context.Context, id ObjectID) (bool, error)
 
-	// EdgesListIncoming returns every object pointing at toID through
+	// ListIncoming returns every object pointing at toID through
 	// relation, ordered by id.
-	EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error)
+	ListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error)
 
-	// EdgesListOutgoingByRelation returns the objects fromID points at through relation,
-	// ordered by id — the inverse of EdgesListIncoming.
-	EdgesListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
+	// ListOutgoingByRelation returns the objects fromID points at through relation,
+	// ordered by id — the inverse of Edges().ListIncoming.
+	ListOutgoingByRelation(ctx context.Context, fromID ObjectID, relation Relation) ([]ObjectRef, error)
+}
 
-	// ReconcileOwedDecrement subtracts observed from id's reconcile_owed,
-	// floored at 0. Callers pass the count they loaded, not 1: one pass
-	// answers every wake outstanding at its load, and increments landing after
-	// the load survive the subtraction. Bumps no resource_version. Scoped to
-	// gk: wrong kind → ErrWrongKind; a row that is simply gone is not an error.
-	ReconcileOwedDecrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error
-
-	// ReconcileOwedListIDs returns the ids of objects of kind gk with
-	// reconcile_owed != 0, so a wake recorded before a crash is serviced on
-	// restart. Separate from ObjectsListUnsettledIDs: a settled object can still owe
-	// a wake.
-	ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
-
-	// ReconcileOwedStamp increments reconcile_owed once for each DISTINCT ref, so
-	// a finding outlives the in-memory queue. Repeats inside one call fold into
-	// that single increment: a caller owed two wakes for one object must make two
-	// calls. Sound for the pass, whose listing returns a row per (target,
-	// dependent) pair, because one reconcile answers every wake outstanding at its
-	// load and ReconcileOwedDecrement subtracts the whole count it observed.
+// ObjectWrites is the append-only object write log.
+type ObjectWrites interface {
+	// ListSince returns gk's log entries above afterRV in cursor
+	// order, at most limit. afterRV < trimmedThrough means entries were trimmed
+	// unread and the caller must resync; equality is fine, since the next unread
+	// entry is trimmedThrough + 1.
 	//
-	// An id that is gone is skipped, not reported. Empty refs writes nothing.
-	// Bumps no resource_version.
+	// An implementation MUST read the page, the horizon and the delete entries'
+	// row images atomically — they describe one instant or they are wrong. Read
+	// apart, a retention sweep landing between them can report a horizon above
+	// entries the page already captured, which reads as unrecoverable loss for a
+	// stream that lost nothing, or delete a captured entry's image, leaving a
+	// WriteDelete with a nil Final that has no state to report.
 	//
-	// Not kind-scoped, unlike ReconcileOwedDecrement: the refs come from the
-	// store's own listing, which spans every registered kind in one page.
-	ReconcileOwedStamp(ctx context.Context, refs []ObjectRef) error
+	// Every WriteDelete entry returned MUST carry a non-nil Final.
+	ListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
-	// ReconcileOwedSweep zeroes reconcile_owed for every object whose kind is not
-	// in keep, and returns how many rows it cleared. An empty keep clears every
-	// nonzero row. Bumps no resource_version and appends no write-log entry.
-	// See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
-	ReconcileOwedSweep(ctx context.Context, keep []GroupKind) (int, error)
-
-	// ResourceVersionsMaxIssued returns the highest resource version issued. It
-	// reads the sequence, not a table, so retention cannot lower it. It moves
-	// for an event write too, so it is a "did anything change" answer, not a
-	// log position to scan from.
-	ResourceVersionsMaxIssued(ctx context.Context) (int64, error)
-
-	// DependencyWatermarksSet records cursor as the store-wide write cursor
-	// id's reconcile observed. Upserts; the stored cursor never decreases, and
-	// a non-advancing value writes nothing. Bumps no resource_version (it
-	// writes no objects row). Also sets a reconciled-at timestamp under the
-	// same predicate — observability only.
+	// ListSinceAll is ListSince across every kind, for
+	// the dependency waker: an edge can point at a kind with no controller.
+	// trimmedThrough is the horizon as of the page, over every kind, so afterRV <
+	// trimmedThrough means entries were trimmed unread; equality is fine, since
+	// the next unread entry is trimmedThrough + 1. An empty page reports 0: the
+	// horizon rides the rows, and ObjectWrites().MaxVersionAll answers it alone.
 	//
-	// The write gates in SQL on id having at least one outgoing depends_on
-	// edge: a dependency-free object can never be found stale, and the gate
-	// closes safely when the object is collected mid-pass. EdgesAdd is the
-	// row's other writer and only clears it.
-	// See docs/adr/2026-07-29-dependency-watermarks.md.
-	DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
+	// Unlike ObjectWrites().ListSince the page and the horizon need not be read
+	// atomically: a horizon that rose in between means entries really were trimmed
+	// unread.
+	ListSinceAll(ctx context.Context, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
 
-	// DependentsListStaleSince returns objects of the given kinds with a
+	// MaxVersion returns gk's log position: every entry for gk is at
+	// or below it, and ObjectWrites().ListSince returns nothing above it.
+	MaxVersion(ctx context.Context, gk GroupKind) (int64, error)
+
+	// MaxVersionAll is MaxVersion across every kind, with
+	// the horizon reported beside it rather than folded in. at is the log's bare
+	// maximum, so it is not monotonic — a delete or a retention sweep lowers it —
+	// and consumers compare for inequality. trimmedThrough is the highest version
+	// retention has removed from any kind, 0 when nothing has been: at ==
+	// trimmedThrough == 0 is an empty log, and a cursor below trimmedThrough lost
+	// entries it never read.
+	MaxVersionAll(ctx context.Context) (at int64, trimmedThrough int64, err error)
+
+	// Snapshot returns every object of kind gk and the log position
+	// the listing is complete as of, read in one transaction so no write falls
+	// between them. The position is what ObjectWrites().MaxVersion reports.
+	Snapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error)
+
+	// SnapshotByID is Snapshot for one object: the row,
+	// or no rows when id does not exist or belongs to another kind, and gk's log
+	// position — the kind's, because the stream that follows tails the kind.
+	SnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
+
+	// SnapshotByOwner is Snapshot for one owner's
+	// children: the objects of kind gk with an owned_by edge to ownerID, and gk's
+	// log position. ownerID is not existence-checked and is typically another
+	// kind; no children reads empty.
+	SnapshotByOwner(ctx context.Context, gk GroupKind, ownerID ObjectID) ([]*RawObject, int64, error)
+
+	// Sweep trims the write log to the retention bounds and returns
+	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
+	// its newest perKind entries; maxAge > 0 drops entries written more than
+	// maxAge ago. A zero bound is skipped. It raises each affected kind's
+	// horizon in the same transaction that deletes that kind's entries, so a
+	// resume is never accepted against a log with a hole in it.
+	Sweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
+}
+
+// Objects is the objects table.
+type Objects interface {
+	// Create inserts a new object of kind gk. The store assigns ID and
+	// ResourceVersion and sets Generation to 1.
+	Create(ctx context.Context, gk GroupKind, in ObjectsCreateInput) (*RawObject, error)
+
+	// Delete removes the row outright — the physical delete the GC path
+	// performs. Callers must ensure finalizers are empty first.
+	Delete(ctx context.Context, id ObjectID) error
+
+	// DeleteFinalizer removes finalizer from id's list. A real removal bumps
+	// ResourceVersion; a missing one does nothing. clearedLast reports that this
+	// call removed the last finalizer from a deletion-pending row. Scoped to gk:
+	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
+	DeleteFinalizer(ctx context.Context, gk GroupKind, id ObjectID, finalizer string) (clearedLast bool, err error)
+
+	// Get loads an object by id, or returns ErrNotFound.
+	Get(ctx context.Context, id ObjectID) (*RawObject, error)
+
+	// GetByName loads the object with the given name within gk, or
+	// returns ErrNotFound.
+	GetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
+
+	// GetForReconcile is the reconcile loop's opening read: the object
+	// with conditions, the store-wide write cursor as of the same statement,
+	// and whether it has dependencies. ErrNotFound if the row is gone.
+	GetForReconcile(ctx context.Context, id ObjectID) (ReconcileLoad, error)
+
+	// GetMeta is Get without the conditions query (Conditions is
+	// always nil). ErrNotFound if no object matches.
+	GetMeta(ctx context.Context, id ObjectID) (*RawObject, error)
+
+	// List returns every object of kind gk, ordered by id.
+	List(ctx context.Context, gk GroupKind) ([]*RawObject, error)
+
+	// ListByIDs returns the objects of kind gk whose ids are in ids,
+	// ordered by id — creation order, not the caller's order and not
+	// resource_version order. An id naming no object, or one of another kind, is
+	// absent: a short result is normal, not an error. Callers keep ids to a
+	// batch a backend can bind in one statement; the watch tail bounds it by its
+	// page cap.
+	ListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error)
+
+	// ListByIncomingEdge returns the full objects of kind gk that point
+	// at toID through relation, ordered by id, with conditions — edges and
+	// rows in one query. Other kinds are filtered out; no matching edge reads
+	// empty, not ErrNotFound.
+	ListByIncomingEdge(ctx context.Context, gk GroupKind, toID ObjectID, relation Relation) ([]*RawObject, error)
+
+	// ListIDs returns the ids of every object of kind gk, ordered by id.
+	ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// ListUnsettledIDs returns the IDs of objects of kind gk whose
+	// observed_generation doesn't match generation (not yet converged).
+	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
+
+	// UpdateSpec replaces an object's spec, bumping Generation and
+	// ResourceVersion, and stamps specVersion. Spec bytes identical to the
+	// stored ones at the row's own schema version are a no-op: no bump, and
+	// changed reports false (bytes at a different schema version always take
+	// the write path). changed=true is what callers enqueue a reconcile on.
+	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
+	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
+
+	// UpdateSpecByName is UpdateSpec keyed by name within gk, ErrNotFound if
+	// the name is not held (no ErrWrongKind). Same no-op and changed
+	// semantics. An implementation MUST resolve and write in one transaction:
+	// the no-op comparison needs the stored bytes, and a split would let a
+	// concurrent collect hand the name to a replacement in between.
+	UpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
+
+	// UpdateStatus replaces an object's status, records observedGeneration and
+	// stamps statusVersion. Changed bytes bump ObservedAt, ResourceVersion and
+	// UpdatedAt. Bytes identical at the row's own schema version write no
+	// status — but ObservedGeneration/ObservedAt (and ResourceVersion) still
+	// advance if this reconcile settled a new generation, at most once per
+	// generation; a call identical in both respects writes nothing at all.
+	//
+	// A stale observedGeneration (at or below the recorded value) is ignored
+	// on the no-op path but written as given on the content-changed path,
+	// rolling the object back to unsettled so a later pass re-derives it.
+	//
+	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
+	// observedGeneration above the row's generation → ErrObservedGenerationFuture.
+	// Returns no row.
+	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
+}
+
+// Dependencies is the dependency-watermark table: what each dependent was last
+// reconciled against, and the scan that finds the ones a target has moved past.
+type Dependencies interface {
+	// ListStaleSince returns objects of the given kinds with a
 	// depends_on edge to a target whose resource_version is above their
 	// dependency watermark, bounded to targets written above after and no higher
 	// than through. Ordered by StalePos, at most limit rows, plus the position of
@@ -688,97 +789,49 @@ type Store interface {
 	//
 	// A dependent appears once per moved target it depends on; stamping and
 	// enqueuing are idempotent, so a duplicate costs a pass, not correctness.
-	DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]ObjectRef, StalePos, error)
+	ListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]ObjectRef, StalePos, error)
 
-	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
-	// order, at most limit. afterRV < trimmedThrough means entries were trimmed
-	// unread and the caller must resync; equality is fine, since the next unread
-	// entry is trimmedThrough + 1.
+	// WatermarkSet records cursor as the store-wide write cursor
+	// id's reconcile observed. Upserts; the stored cursor never decreases, and
+	// a non-advancing value writes nothing. Bumps no resource_version (it
+	// writes no objects row). Also sets a reconciled-at timestamp under the
+	// same predicate — observability only.
 	//
-	// An implementation MUST read the page, the horizon and the delete entries'
-	// row images atomically — they describe one instant or they are wrong. Read
-	// apart, a retention sweep landing between them can report a horizon above
-	// entries the page already captured, which reads as unrecoverable loss for a
-	// stream that lost nothing, or delete a captured entry's image, leaving a
-	// WriteDelete with a nil Final that has no state to report.
-	//
-	// Every WriteDelete entry returned MUST carry a non-nil Final.
-	ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
-
-	// ObjectWritesListSinceAll is ObjectWritesListSince across every kind, for
-	// the dependency waker: an edge can point at a kind with no controller.
-	// trimmedThrough is the horizon as of the page, over every kind, so afterRV <
-	// trimmedThrough means entries were trimmed unread; equality is fine, since
-	// the next unread entry is trimmedThrough + 1. An empty page reports 0: the
-	// horizon rides the rows, and ObjectWritesMaxVersionAll answers it alone.
-	//
-	// Unlike ObjectWritesListSince the page and the horizon need not be read
-	// atomically: a horizon that rose in between means entries really were trimmed
-	// unread.
-	ObjectWritesListSinceAll(ctx context.Context, afterRV int64, limit int) (page []ObjectWrite, trimmedThrough int64, err error)
-
-	// ObjectWritesMaxVersion returns gk's log position: every entry for gk is at
-	// or below it, and ObjectWritesListSince returns nothing above it.
-	ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error)
-
-	// ObjectWritesMaxVersionAll is ObjectWritesMaxVersion across every kind, with
-	// the horizon reported beside it rather than folded in. at is the log's bare
-	// maximum, so it is not monotonic — a delete or a retention sweep lowers it —
-	// and consumers compare for inequality. trimmedThrough is the highest version
-	// retention has removed from any kind, 0 when nothing has been: at ==
-	// trimmedThrough == 0 is an empty log, and a cursor below trimmedThrough lost
-	// entries it never read.
-	ObjectWritesMaxVersionAll(ctx context.Context) (at int64, trimmedThrough int64, err error)
-
-	// ObjectWritesSnapshot returns every object of kind gk and the log position
-	// the listing is complete as of, read in one transaction so no write falls
-	// between them. The position is what ObjectWritesMaxVersion reports.
-	ObjectWritesSnapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error)
-
-	// ObjectWritesSnapshotByID is ObjectWritesSnapshot for one object: the row,
-	// or no rows when id does not exist or belongs to another kind, and gk's log
-	// position — the kind's, because the stream that follows tails the kind.
-	ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error)
-
-	// ObjectWritesSnapshotByOwner is ObjectWritesSnapshot for one owner's
-	// children: the objects of kind gk with an owned_by edge to ownerID, and gk's
-	// log position. ownerID is not existence-checked and is typically another
-	// kind; no children reads empty.
-	ObjectWritesSnapshotByOwner(ctx context.Context, gk GroupKind, ownerID ObjectID) ([]*RawObject, int64, error)
-
-	// ObjectWritesSweep trims the write log to the retention bounds and returns
-	// how many entries it deleted. perKind > 0 caps each (group, kind) log to
-	// its newest perKind entries; maxAge > 0 drops entries written more than
-	// maxAge ago. A zero bound is skipped. It raises each affected kind's
-	// horizon in the same transaction that deletes that kind's entries, so a
-	// resume is never accepted against a log with a hole in it.
-	ObjectWritesSweep(ctx context.Context, perKind int, maxAge time.Duration) (int, error)
+	// The write gates in SQL on id having at least one outgoing depends_on
+	// edge: a dependency-free object can never be found stale, and the gate
+	// closes safely when the object is collected mid-pass. Edges().Add is the
+	// row's other writer and only clears it.
+	// See docs/adr/2026-07-29-dependency-watermarks.md.
+	WatermarkSet(ctx context.Context, id ObjectID, cursor int64) error
 }
 
-// FreePagesReleaser is an optional Store capability: a backend that can hand
-// space freed by deleted rows back to the OS implements it, and the GC sweeper
-// calls it after collecting. Deliberately not a member of Store — a backend
-// without it is simply not drained.
-type FreePagesReleaser interface {
-	// FreePagesRelease releases up to maxPages of reclaimable space and
-	// returns how many were actually released — a report, not a guarantee; a
-	// backend may release fewer, including none. Non-positive maxPages
-	// releases nothing.
-	FreePagesRelease(ctx context.Context, maxPages int) (int, error)
+// DriverCursors persists a periodic driver's scan position, so a restart
+// resumes rather than reseeding from "now".
+type DriverCursors interface {
+	// Get returns the cursor last persisted for name, or ok=false if none has
+	// been yet. Absence is normal, not an error; zero is a legitimate cursor
+	// value, so it cannot double as "no cursor". A backend that persists
+	// nothing always reports ok=false, which costs latency after a restart and
+	// nothing else — the stale-dependents pass guarantees the wake.
+	Get(ctx context.Context, name string) (cursor int64, ok bool, err error)
+
+	// Set persists cursor for name if it is greater than what is stored, and
+	// otherwise writes nothing — a non-advancing call must cost no write, since
+	// a driver may call this every tick. A backend that persists nothing
+	// discards it.
+	Set(ctx context.Context, name string, cursor int64) error
 }
 
-// DriverCursorer is an optional Store capability: persistence for a periodic
-// driver's scan position, so a restart resumes rather than reseeding from
-// "now". Deliberately not a member of Store — it is a latency optimisation
-// over the stale-dependents pass, which already guarantees the wake.
-type DriverCursorer interface {
-	// DriverCursorsGet returns the cursor last persisted for name, or ok=false
-	// if none has been yet. Absence is normal, not an error; zero is a
-	// legitimate cursor value, so it cannot double as "no cursor".
-	DriverCursorsGet(ctx context.Context, name string) (cursor int64, ok bool, err error)
+// Conditions is the per-object condition table.
+type Conditions interface {
+	// Delete removes the condition of type condType from id. A real removal
+	// bumps ResourceVersion; a missing condition does nothing. Scoped to gk:
+	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
+	Delete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error
 
-	// DriverCursorsSet persists cursor for name if it is greater than what is
-	// stored, and otherwise writes nothing — a non-advancing call must cost no
-	// write, since a driver may call this every tick.
-	DriverCursorsSet(ctx context.Context, name string, cursor int64) error
+	// Set inserts or updates the condition keyed by (id, cond.Type). A real
+	// change bumps ResourceVersion; an identical write does nothing. Scoped to
+	// gk: wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row;
+	// read conditions back with Objects().Get.
+	Set(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
 }

@@ -65,21 +65,21 @@ helpers (`appendWriteLog`, `recordObjectWrite`, `appendWriteLogDelete`), never
 from the public verbs, and `TestKindWriteHubPublishesOnEveryWrite` is the guard. A
 table derived from the verbs would miss two rows:
 
-- `bumpObject`, reached by `ConditionsSet` and `ConditionsDelete`. Controllers
+- `bumpObject`, reached by `Conditions().Set` and `Conditions().Delete`. Controllers
   write conditions constantly.
-- The owner cascade. `DeletionRequestsCreateFromOwner` marks children across
+- The owner cascade. `DeletionRequests().CreateFromOwner` marks children across
   several kinds in one call, so the wake is routed by the refs it returns —
   the same way the new-edge enqueue routes by `EdgesAddResult.From` — and
   deduped by kind, so a wide cascade queues one commit hook per kind rather
   than per row.
 
 A deeper alternative exists: an optional `ObjectWritesNotifier` on `Store`,
-probed the way `DriverCursorer` and `FreePagesReleaser` are, called from the
+probed the way the optional capabilities once were, called from the
 three helpers themselves. The bundled store could then never forget to publish,
 and the floor tick already degrades correctly for a store that does not
 implement it. It is not taken here for two reasons: it puts a watch concern
 into the store contract for a guarantee the floor tick already provides, and
-`ObjectsDelete(ctx, id)` carries no `GroupKind`, so one site would stay manual
+`Objects().Delete(ctx, id)` carries no `GroupKind`, so one site would stay manual
 either way. Revisit if the table test ever fails to catch a new verb.
 
 ### Why the tick stays, at 30s

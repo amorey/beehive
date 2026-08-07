@@ -266,7 +266,7 @@ func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 	if bh.eventRetentionPerTimeline <= 0 && bh.eventRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerTimeline, bh.eventRetentionMaxAge, bh.gcBudget(eventCapPerSweep)); err != nil {
+	if _, err := bh.store.Events().Sweep(ctx, bh.eventRetentionPerTimeline, bh.eventRetentionMaxAge, bh.gcBudget(eventCapPerSweep)); err != nil {
 		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
 	}
 }
@@ -277,7 +277,7 @@ func (bh *Beehive) writeLogRetentionSweep(ctx context.Context) {
 	if bh.writeLogRetentionPerKind <= 0 && bh.writeLogRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.ObjectWritesSweep(ctx, bh.writeLogRetentionPerKind, bh.writeLogRetentionMaxAge); err != nil {
+	if _, err := bh.store.ObjectWrites().Sweep(ctx, bh.writeLogRetentionPerKind, bh.writeLogRetentionMaxAge); err != nil {
 		bh.log().Warn("write log retention sweep failed; retry next sweep", "err", err)
 	}
 }
@@ -286,7 +286,7 @@ func (bh *Beehive) writeLogRetentionSweep(ctx context.Context) {
 // loop, which nothing else drains.
 // See docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md.
 func (bh *Beehive) reconcileOwedSweep(ctx context.Context) {
-	cleared, err := bh.store.ReconcileOwedSweep(ctx, bh.registeredKinds())
+	cleared, err := bh.store.ReconcileOwed().Sweep(ctx, bh.registeredKinds())
 	if err != nil {
 		bh.log().Warn("reconcile-owed reclaim failed; retry next sweep", "err", err)
 		return
@@ -296,15 +296,11 @@ func (bh *Beehive) reconcileOwedSweep(ctx context.Context) {
 	}
 }
 
-// freePagesSweep hands space freed by the sweeps above back to the OS, for
-// a store that implements FreePagesReleaser. Best-effort: nothing is incorrect
-// while the space is unreclaimed.
+// freePagesSweep hands space freed by the sweeps above back to the OS.
+// Best-effort: nothing is incorrect while the space is unreclaimed, and a store
+// that reclaims nothing reports 0.
 func (bh *Beehive) freePagesSweep(ctx context.Context) {
-	releaser, ok := bh.store.(FreePagesReleaser)
-	if !ok {
-		return
-	}
-	released, err := releaser.FreePagesRelease(ctx, bh.gcBudget(freePagesPerSweep))
+	released, err := bh.store.ReclaimSpace(ctx, bh.gcBudget(freePagesPerSweep))
 	if err != nil {
 		bh.log().Warn("free-page release failed; retry next sweep", "err", err)
 		return
@@ -317,7 +313,7 @@ func (bh *Beehive) freePagesSweep(ctx context.Context) {
 // deletionPendingSweep drives every deletion-pending object one step closer to
 // removal.
 func (bh *Beehive) deletionPendingSweep(ctx context.Context) {
-	rows, err := bh.store.DeletionRequestsList(ctx)
+	rows, err := bh.store.DeletionRequests().List(ctx)
 	if err != nil {
 		bh.log().Warn("gc sweep: listing deletion-pending objects failed; retry next sweep", "err", err)
 		return

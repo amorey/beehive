@@ -158,14 +158,14 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
 		// Spec write (Create) stamped the spec version; status untouched (still 0).
-		raw, err := store.ObjectsGet(ctx, obj.ID)
+		raw, err := store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 4, raw.SpecVersion, "Create stamps the migrator's spec version")
 		assert.Equal(t, 0, raw.StatusVersion, "no status written yet")
 
 		// Controller status write stamps the status version, spec unchanged.
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
-		raw, err = store.ObjectsGet(ctx, obj.ID)
+		raw, err = store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 4, raw.SpecVersion, "status write must not touch spec version")
 		assert.Equal(t, 9, raw.StatusVersion, "UpdateStatus stamps the migrator's status version")
@@ -183,7 +183,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-		raw, err := store.ObjectsGet(ctx, obj.ID)
+		raw, err := store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Zero(t, raw.SpecVersion, "no migrator => spec version stays 0")
 		assert.Zero(t, raw.StatusVersion, "no migrator => status version stays 0")
@@ -316,7 +316,7 @@ func TestControllerClientAddEvent(t *testing.T) {
 		Message: "i/o timeout", Detail: probeDetail{Endpoint: "h:443", LatencyMs: 5000},
 	}))
 
-	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "connection")
+	run, err := bh.store.Events().GetLatest(ctx, obj.ID, "connection")
 	require.NoError(t, err)
 	require.NotNil(t, run)
 	assert.Equal(t, "Warning", run.Type)
@@ -372,7 +372,7 @@ func TestControllerClientAddEventWithinRollback(t *testing.T) {
 	})
 	require.ErrorIs(t, err, sentinel)
 
-	run, err := bh.store.EventsGetLatest(ctx, obj.ID, "c")
+	run, err := bh.store.Events().GetLatest(ctx, obj.ID, "c")
 	require.NoError(t, err)
 	assert.Nil(t, run, "an EventsAdd inside a rolled-back Within must not persist")
 }
@@ -418,12 +418,12 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	to := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "to"})
 
 	require.NoError(t, cc.DependenciesAdd(ctx, from.ID, to.ID))
-	deps, err := bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
+	deps, err := bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectRef{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
 
 	require.NoError(t, cc.DependenciesDelete(ctx, from.ID, to.ID))
-	deps, err = bh.store.EdgesListIncoming(ctx, to.ID, RelationDependsOn)
+	deps, err = bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Empty(t, deps, "edge removed via ControllerClient")
 }
@@ -515,7 +515,7 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 // of it predates the change.
 func (f *declareFixture) moveTarget(t *testing.T) {
 	t.Helper()
-	err := f.store.ConditionsSet(context.Background(), f.targetGK, f.target.ID,
+	err := f.store.Conditions().Set(context.Background(), f.targetGK, f.target.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
 }
@@ -524,7 +524,7 @@ func (f *declareFixture) moveTarget(t *testing.T) {
 // would drain.
 func (f *declareFixture) owed(t *testing.T) []ObjectID {
 	t.Helper()
-	ids, err := f.store.ReconcileOwedListIDs(context.Background(), f.depGK)
+	ids, err := f.store.ReconcileOwed().ListIDs(context.Background(), f.depGK)
 	require.NoError(t, err)
 	return ids
 }
@@ -540,7 +540,7 @@ func (f *declareFixture) requireOwed(t *testing.T) {
 // "stamped again on every pass".
 func (f *declareFixture) owedCount(t *testing.T) int64 {
 	t.Helper()
-	meta, err := f.store.ObjectsGetMeta(context.Background(), f.dep.ID)
+	meta, err := f.store.Objects().GetMeta(context.Background(), f.dep.ID)
 	require.NoError(t, err)
 	return meta.ReconcileOwed
 }
@@ -661,11 +661,11 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID))
 
-	refs, err := real.EdgesListIncoming(ctx, target.ID, RelationDependsOn)
+	refs, err := real.Edges().ListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, objectRefIDs(refs), "the edge landed")
 
-	owed, err := real.ReconcileOwedListIDs(ctx, gk)
+	owed, err := real.ReconcileOwed().ListIDs(ctx, gk)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "and the stamp landed with it, inside EdgesAdd")
 }
@@ -790,7 +790,7 @@ func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 
 	require.NoError(t, cc.DependenciesAdd(ctx, dep.ID, target.ID), "an unroutable enqueue is not an error")
 
-	owed, err := store.ReconcileOwedListIDs(ctx, clientOnly)
+	owed, err := store.ReconcileOwed().ListIDs(ctx, clientOnly)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{dep.ID}, owed, "the durable stamp still lands")
 }
@@ -906,7 +906,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	})
 	require.ErrorIs(t, err, errBoom)
 
-	refs, err := f.store.EdgesListIncoming(ctx, f.target.ID, RelationDependsOn)
+	refs, err := f.store.Edges().ListIncoming(ctx, f.target.ID, RelationDependsOn)
 	require.NoError(t, err)
 	require.Equal(t, []ObjectID{f.witness.ID}, objectRefIDs(refs), "the rolled-back declaration left no edge")
 	f.requireNotOwed(t)
@@ -980,7 +980,11 @@ type failEdgesHasIncomingStore struct {
 	fakeStore
 }
 
-func (s *failEdgesHasIncomingStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
+func (s *failEdgesHasIncomingStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), hasIncoming: s.hasIncomingEdges}
+}
+
+func (s *failEdgesHasIncomingStore) hasIncomingEdges(context.Context, ObjectID) (bool, error) {
 	return false, errBoom
 }
 
@@ -996,7 +1000,11 @@ type failEdgesAddStore struct {
 	fakeStore
 }
 
-func (s *failEdgesAddStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
+func (s *failEdgesAddStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), add: s.addEdges}
+}
+
+func (s *failEdgesAddStore) addEdges(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
 	return storeapi.EdgesAddResult{}, errBoom
 }
 
@@ -1017,7 +1025,11 @@ type kindTStore struct {
 func (s *kindTStore) Within(ctx context.Context, fn func(context.Context) error) error {
 	return fn(ctx)
 }
-func (s *kindTStore) ObjectsGet(_ context.Context, id ObjectID) (*RawObject, error) {
+func (s *kindTStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), get: s.getObjects}
+}
+
+func (s *kindTStore) getObjects(_ context.Context, id ObjectID) (*RawObject, error) {
 	return &RawObject{ID: id, Kind: "T"}, nil
 }
 
@@ -1026,7 +1038,11 @@ type failUpdateStatusStore struct {
 	kindTStore
 }
 
-func (s *failUpdateStatusStore) ObjectsUpdateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) error {
+func (s *failUpdateStatusStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.kindTStore.Objects(), updateStatus: s.updateStatus}
+}
+
+func (s *failUpdateStatusStore) updateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) error {
 	return errBoom
 }
 
@@ -1054,7 +1070,11 @@ type failEdgesDeleteStore struct {
 	fakeStore
 }
 
-func (s *failEdgesDeleteStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
+func (s *failEdgesDeleteStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), delete: s.deleteEdges}
+}
+
+func (s *failEdgesDeleteStore) deleteEdges(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
 	return storeapi.EdgesDeleteResult{}, errBoom
 }
 

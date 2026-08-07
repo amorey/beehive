@@ -60,10 +60,10 @@ bookkeeping, no stamp/advance transaction, no ordering constraint between an
 enqueue and a commit, no count to drain. The watermark is monotonic and idempotent;
 writing it twice is writing it once.
 
-`reconcile_owed` stays, carrying `EdgesAdd`'s stamp (since broadened to
+`reconcile_owed` stays, carrying `Edges().Add`'s stamp (since broadened to
 [every new `depends_on` edge](2026-07-29-stamp-every-new-dependency-edge.md)).
 The two are complementary: it is the durable record for the declare-time cases,
-riding a write `EdgesAdd` was making anyway; the watermark is the backstop for a
+riding a write `Edges().Add` was making anyway; the watermark is the backstop for a
 wake lost after the edge exists. This decision adds **no** new producer of
 `reconcile_owed`, so the "there is deliberately no standalone increment here" block
 in `storeapi.go` stays true — the scan-watermark design would have invalidated it.
@@ -72,7 +72,7 @@ in `storeapi.go` stays true — the scan-watermark design would have invalidated
 
 One narrow-row upsert per successful reconcile of an object that has dependencies,
 and nothing at all for any other reconcile. Both extra values the reconciler needs
-ride `ObjectsGetForReconcile`'s existing statement as correlated subqueries, so the
+ride `Objects().GetForReconcile`'s existing statement as correlated subqueries, so the
 load costs no extra round trip.
 
 Three parts of it are load-bearing:
@@ -95,12 +95,12 @@ Three parts of it are load-bearing:
   true the gated statement runs unchanged.
 
 **The cursor comes from the load, never from the end of the pass.** Every read the
-controller makes happens after `ObjectsGetForReconcile` returns, so the recorded
+controller makes happens after `Objects().GetForReconcile` returns, so the recorded
 cursor is at or below the true one when it read its dependencies. A target that
 moves during the pass is counted as still-owed and reconciled once more — wasted
 work, never lost work. A cursor sampled after the controller's reads inverts that:
 it lands above a change the pass did not observe, and D is stale with nothing left
-to find it. Same shape as `ReconcileOwedDecrement`'s subtract-the-*observed*-count
+to find it. Same shape as `ReconcileOwed().Decrement`'s subtract-the-*observed*-count
 rule.
 
 A failed reconcile, a quarantined undecodable row, and a failed watermark write all
@@ -116,7 +116,7 @@ silent, because the scan compares that target's `resource_version` against a
 watermark recorded later than it. A target that has simply been sitting there reads
 as converged.
 
-So `EdgesAdd` deletes `fromID`'s row when it creates a new `depends_on` edge, gated
+So `Edges().Add` deletes `fromID`'s row when it creates a new `depends_on` edge, gated
 on the same `NOT EXISTS` as the wake stamp and on the same side of the insert. An
 absent row already means stale, so the staleness pass would reconcile the dependent
 against its new target even if nothing else did.
@@ -134,12 +134,12 @@ nothing after the first declare, because of the edge-new gate. A controller
 declaring from inside its own `Reconcile` mostly pays nothing either: that pass
 rewrites the watermark when it succeeds, from the cursor it loaded at — which is
 sound for exactly the reason above, since the controller's read of the new target
-happened after the load. Self-edges are skipped, matching `DependentsListStaleSince`,
+happened after the load. Self-edges are skipped, matching `Dependencies().ListStaleSince`,
 which excludes them.
 
 One case does cost a pass, and it is not this change's doing: an object's **first**
 `depends_on` edge. `ReconcileLoad.HasDependencies` is sampled at load, before that
-edge existed, so the reconciler skips `DependencyWatermarksSet` and leaves no row —
+edge existed, so the reconciler skips `Dependencies().WatermarkSet` and leaves no row —
 and an absent row means stale. The object is reconciled once more and settles. It is
 bounded at once per object ever, self-extinguishing, and in the over-reconcile
 direction; the alternative is issuing the gated write on every successful reconcile
@@ -174,7 +174,7 @@ on a small table, paid per pass rather than per reconcile.
 
 ### The kind filter is on the dependent, never the target
 
-`DependentsListStaleSince` filters by kind for the same reason `ReconcileOwedListIDs`
+`Dependencies().ListStaleSince` filters by kind for the same reason `ReconcileOwed().ListIDs`
 does: only a registered kind has a reconcile loop to enqueue into. A client-only
 dependent never gets a watermark written and is therefore stale forever, so
 filtering is what makes it cost zero rather than a permanent addition to every
@@ -185,7 +185,7 @@ on the next pass.
 Extending that filter to the *target* would be silently wrong. A registered object
 may depend on a client-only one — the whole reason the waker's scan is store-wide —
 so a target's kind is irrelevant to whether its dependents are owed a pass.
-`TestDependentsListStaleSinceFindsDependentsOfUnregisteredTargets` is the tripwire.
+`TestDependencies().ListStaleSinceFindsDependentsOfUnregisteredTargets` is the tripwire.
 
 ## Consequences
 
@@ -241,7 +241,7 @@ delivered. → [ADR](2026-07-30-durable-waker-cursor.md)
 
 *(The plan below is the unbounded `DependentsListStale`, which paged by `from_id`
 and is removed — see [the cursor ADR](2026-08-03-stale-dependents-cursor.md). The
-conclusion carries: `DependentsListStaleSince` drives from `idx_objects_rv` and
+conclusion carries: `Dependencies().ListStaleSince` drives from `idx_objects_rv` and
 reaches `edges` through `idx_edges_to`, and neither wants this index either.)*
 
 The scan pages by `from_id`, and the `edges` primary key already leads on `from_id`,

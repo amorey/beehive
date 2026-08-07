@@ -78,7 +78,7 @@ tick it is the waker's only cadence and the clamp is gone.
 
 **The cursor write is floored at `wakePersistInterval` (1s).** `scan` persists on the way
 out whenever the watermark moved, which under a sustained stream is every pass —
-so a 10×-faster loop would have meant a 10×-faster `DriverCursorsSet`. Every
+so a 10×-faster loop would have meant a 10×-faster `DriverCursors().Set`. Every
 other cost here is a read competing for connection time; this one is a bare
 write competing for the write lock, which is what the commits themselves need.
 Gating it keeps the cursor write rate exactly what it was. The cursor is an
@@ -114,7 +114,7 @@ time rather than ~13ms.
 
 ### A resumed seed reports a backlog
 
-`seed` already reads `ObjectWritesMaxVersionAll`, so it knows whether the cursor
+`seed` already reads `ObjectWrites().MaxVersionAll`, so it knows whether the cursor
 it resumed from sits below the mark. Reporting `scanMore` there costs nothing
 and keeps a restart with a backlog from waiting a floor for its first page.
 

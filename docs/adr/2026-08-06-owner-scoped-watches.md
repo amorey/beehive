@@ -14,8 +14,8 @@ denormalise `owner_id` into `object_writes` — is wrong three times over. It
 records ownership as of the write, committing the schema on disk to an answer
 that a re-parent verb would falsify. It costs an `(owner_id, resource_version)`
 index on what will be the largest table in the database. And it fails on the
-entry that matters most: `ObjectsCreate` appends the create entry before
-`insertObject` calls `EdgesAdd`, so the create would carry `NULL`.
+entry that matters most: `Objects().Create` appends the create entry before
+`insertObject` calls `Edges().Add`, so the create would carry `NULL`.
 
 That same ordering is what makes the alternative sound. Both statements are in
 one transaction and the tailer only ever reads committed entries, so by the time
@@ -24,7 +24,7 @@ an entry is visible its edge is too.
 ## Decision
 
 **The tailer resolves each page's owners from current state.** One
-`EdgesGroupOutgoingByID` over the page's live ids, beside the `ObjectsListByIDs`
+`Edges().GroupOutgoingByID` over the page's live ids, beside the `Objects().ListByIDs`
 it already runs — one statement per drain page, shared by every subscriber on
 the kind, not a read per entry. A collected object has no edges left, so it
 takes its owner off the delete entry's row image (`RawObject.Owner`), which is

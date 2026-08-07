@@ -51,7 +51,7 @@ func TestOpenMemoryAppliesMigrations(t *testing.T) {
 }
 
 // TestOpenMemorySetsAutoVacuum keeps the in-memory store on the same on-disk
-// format as production, so the tests that exercise FreePagesRelease are exercising
+// format as production, so the tests that exercise ReclaimSpace are exercising
 // the mode Open actually ships.
 func TestOpenMemorySetsAutoVacuum(t *testing.T) {
 	store, err := OpenMemory()

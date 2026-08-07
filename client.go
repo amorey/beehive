@@ -382,7 +382,7 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 // shares it. Callers run it inside a Within so the insert and its ref commit
 // together.
 func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string, spec []byte, co *createOptions) (*RawObject, error) {
-	raw, err := c.bh.store.ObjectsCreate(ctx, c.gk, ObjectsCreateInput{
+	raw, err := c.bh.store.Objects().Create(ctx, c.gk, ObjectsCreateInput{
 		Name:        name,
 		Spec:        spec,
 		SpecVersion: migratorSpecVersion(c.bh.migratorFor(c.gk)),
@@ -394,7 +394,7 @@ func (c *clientImpl[Spec, Status]) insertObject(ctx context.Context, name string
 	// The child owns the edge (child -> owner) so the owner's GC walk finds it.
 	// No wake stamp: ownership owes the child no reconcile.
 	if co.owner != nil {
-		res, err := c.bh.store.EdgesAdd(ctx, raw.ID, *co.owner, RelationOwnedBy)
+		res, err := c.bh.store.Edges().Add(ctx, raw.ID, *co.owner, RelationOwnedBy)
 		if err != nil {
 			return nil, err
 		}
@@ -459,7 +459,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 	// One Within around the read and the insert removes the TOCTOU: the loser
 	// of a concurrent create observes the winner's row.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		existing, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
+		existing, err := c.bh.store.Objects().GetByName(ctx, c.gk, name)
 		if err == nil {
 			// Found: returned as-is, live or deletion-pending. A pre-existing
 			// poison row's decode error surfaces with created=false.
@@ -493,9 +493,9 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 
 func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
 	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
-		// ObjectsUpdateSpec folds this client's kind into the write;
+		// Objects().UpdateSpec folds this client's kind into the write;
 		// hideWrongKind keeps a foreign id invisible.
-		raw, changed, err := c.bh.store.ObjectsUpdateSpec(ctx, c.gk, id, b, version)
+		raw, changed, err := c.bh.store.Objects().UpdateSpec(ctx, c.gk, id, b, version)
 		return raw, changed, c.hideWrongKind(err)
 	})
 }
@@ -505,7 +505,7 @@ func (c *clientImpl[Spec, Status]) UpdateByName(ctx context.Context, name string
 		return nil, err
 	}
 	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
-		return c.bh.store.ObjectsUpdateSpecByName(ctx, c.gk, name, b, version)
+		return c.bh.store.Objects().UpdateSpecByName(ctx, c.gk, name, b, version)
 	})
 }
 
@@ -563,7 +563,7 @@ func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads .
 // ErrNotFound for a foreign id — a Client serves a single kind, so another
 // kind's rows must be invisible through it.
 func (c *clientImpl[Spec, Status]) scopedGet(ctx context.Context, id ObjectID) (*RawObject, error) {
-	raw, err := c.bh.store.ObjectsGet(ctx, id)
+	raw, err := c.bh.store.Objects().Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +586,7 @@ func (c *clientImpl[Spec, Status]) GetByName(ctx context.Context, name string, l
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
-	raw, err := c.bh.store.ObjectsGetByName(ctx, c.gk, name)
+	raw, err := c.bh.store.Objects().GetByName(ctx, c.gk, name)
 	if err != nil {
 		return nil, err
 	}
@@ -615,7 +615,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnerBit
 	}
 	if set&LoadDependenciesBit != 0 {
-		deps, err := store.EdgesListOutgoingByRelation(ctx, obj.ID, RelationDependsOn)
+		deps, err := store.Edges().ListOutgoingByRelation(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -623,7 +623,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependenciesBit
 	}
 	if set&LoadDependentsBit != 0 {
-		dependents, err := store.EdgesListIncoming(ctx, obj.ID, RelationDependsOn)
+		dependents, err := store.Edges().ListIncoming(ctx, obj.ID, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -631,7 +631,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadDependentsBit
 	}
 	if set&LoadOwnedBit != 0 {
-		owned, err := store.EdgesListIncoming(ctx, obj.ID, RelationOwnedBy)
+		owned, err := store.Edges().ListIncoming(ctx, obj.ID, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -639,7 +639,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 		obj.loaded |= LoadOwnedBit
 	}
 	if set&LoadEventsBit != 0 {
-		raw, err := store.EventsList(ctx, obj.ID, storeapi.EventQuery{})
+		raw, err := store.Events().List(ctx, obj.ID, storeapi.EventQuery{})
 		if err != nil {
 			return err
 		}
@@ -652,7 +652,7 @@ func loadObjectRelated[Spec, Status any](ctx context.Context, store Store, obj *
 // fetchOwnerRef resolves id's single owned_by edge; ok is false when there is
 // none.
 func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (ObjectRef, bool, error) {
-	owners, err := store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
+	owners, err := store.Edges().ListOutgoingByRelation(ctx, id, RelationOwnedBy)
 	if err != nil {
 		return ObjectRef{}, false, err
 	}
@@ -663,7 +663,7 @@ func fetchOwnerRef(ctx context.Context, store Store, id ObjectID) (ObjectRef, bo
 }
 
 func (c *clientImpl[Spec, Status]) List(ctx context.Context, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ObjectsList(ctx, c.gk)
+	raws, err := c.bh.store.Objects().List(ctx, c.gk)
 	if err != nil {
 		return nil, err
 	}
@@ -709,7 +709,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		ids[i] = o.ID
 	}
 	if set&LoadOwnerBit != 0 {
-		byID, err := c.bh.store.EdgesGroupOutgoingByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.Edges().GroupOutgoingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -722,7 +722,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependenciesBit != 0 {
-		byID, err := c.bh.store.EdgesGroupOutgoingByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.Edges().GroupOutgoingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -732,7 +732,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadDependentsBit != 0 {
-		byID, err := c.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
+		byID, err := c.bh.store.Edges().GroupIncomingByID(ctx, ids, RelationDependsOn)
 		if err != nil {
 			return err
 		}
@@ -742,7 +742,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		}
 	}
 	if set&LoadOwnedBit != 0 {
-		byID, err := c.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationOwnedBy)
+		byID, err := c.bh.store.Edges().GroupIncomingByID(ctx, ids, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -756,7 +756,7 @@ func (c *clientImpl[Spec, Status]) loadListRelated(ctx context.Context, objs []*
 		// object — the deliberate exception. Prefer the lazy EventsList for
 		// large lists.
 		for _, o := range objs {
-			raw, err := c.bh.store.EventsList(ctx, o.ID, storeapi.EventQuery{})
+			raw, err := c.bh.store.Events().List(ctx, o.ID, storeapi.EventQuery{})
 			if err != nil {
 				return err
 			}
@@ -805,21 +805,21 @@ func (c *clientImpl[Spec, Status]) OwnersGet(ctx context.Context, id ObjectID) (
 }
 
 func (c *clientImpl[Spec, Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationDependsOn)
 }
 
 func (c *clientImpl[Spec, Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationOwnedBy)
 }
 
 // The kind filter lives in the store statement's WHERE, so foreign-kind
 // children never reach Go.
 func (c *clientImpl[Spec, Status]) OwnedObjectsList(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error) {
-	raws, err := c.bh.store.ObjectsListByIncomingEdge(ctx, c.gk, ownerID, RelationOwnedBy)
+	raws, err := c.bh.store.Objects().ListByIncomingEdge(ctx, c.gk, ownerID, RelationOwnedBy)
 	if err != nil {
 		return nil, err
 	}
@@ -867,10 +867,10 @@ func (c *clientImpl[Spec, Status]) SchedulesGet(ctx context.Context, id ObjectID
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
-	// DeletionRequestsCreate bumps resource_version only on a real change, so
+	// DeletionRequests().Create bumps resource_version only on a real change, so
 	// an idempotent retry triggers no spurious watch diff. Kind-folded;
 	// hideWrongKind keeps a foreign id invisible.
-	res, err := c.bh.store.DeletionRequestsCreate(ctx, c.gk, id)
+	res, err := c.bh.store.DeletionRequests().Create(ctx, c.gk, id)
 	if err = c.hideWrongKind(err); err != nil {
 		return err
 	}
@@ -901,7 +901,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 	}
 	// ErrNotFound is idempotent success here — nothing of this kind holds the
 	// name — the one place a name delete departs from Delete.
-	res, err := c.bh.store.DeletionRequestsCreateByName(ctx, c.gk, name)
+	res, err := c.bh.store.DeletionRequests().CreateByName(ctx, c.gk, name)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil // already gone
@@ -918,7 +918,7 @@ func (c *clientImpl[Spec, Status]) DeleteByName(ctx context.Context, name string
 // EventsList reads id's runs and maps them to public Events. Reads by id, not
 // kind-scoped, like the ref lookups.
 func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error) {
-	raw, err := c.bh.store.EventsList(ctx, id, resolveEvents(opts).query)
+	raw, err := c.bh.store.Events().List(ctx, id, resolveEvents(opts).query)
 	if err != nil {
 		return nil, err
 	}
@@ -926,7 +926,7 @@ func (c *clientImpl[Spec, Status]) EventsList(ctx context.Context, id ObjectID, 
 }
 
 func (c *clientImpl[Spec, Status]) EventsGetLatest(ctx context.Context, id ObjectID, category string) (Event, bool, error) {
-	raw, err := c.bh.store.EventsGetLatest(ctx, id, category)
+	raw, err := c.bh.store.Events().GetLatest(ctx, id, category)
 	if err != nil {
 		return Event{}, false, err
 	}

@@ -9,8 +9,8 @@ The waker promises that a write reaches its dependents on the next commit. Two
 things had to be in place before that promise could hold, and neither was when
 `Start` returned:
 
-- **The watermark.** `seed` read `ObjectWritesMaxVersionAll` — and the stored
-  cursor, when the store is a `DriverCursorer` — on the waker's own goroutine,
+- **The watermark.** `seed` read `ObjectWrites().MaxVersionAll` — and the stored
+  cursor — on the waker's own goroutine,
   whenever the runtime first scheduled it. A write committed between `Start`
   returning and that read landed *below* the watermark, and no scan read it.
 - **The subscription.** `run` registered with `kindWriteHub.WatchAcross` on that
@@ -22,7 +22,7 @@ things had to be in place before that promise could hold, and neither was when
 the window was easy to hit. [The durable cursor](2026-07-30-durable-waker-cursor.md)
 narrowed it — a racing write sits *above* a stored cursor — but it reopened
 whenever the seed fell back to the mark: a fresh store, a store with no
-`DriverCursorer`, or a seed whose reads failed.
+no persisted cursor, or a seed whose reads failed.
 
 The cost was latency rather than divergence: the stale-dependents pass derives
 staleness from `dependency_watermarks`, and the racing write bumps the target's
@@ -50,7 +50,7 @@ abandoning startup, and `Start` already contracts to answer `start aborted` for
 it, so it tears the subscription back down and returns that error.
 
 `Start` also becomes a store *writer*: `seed` ends in `persist`, so a fresh
-store takes one `DriverCursorsSet` for the seed point. A store that refuses it
+store takes one `DriverCursors().Set` for the seed point. A store that refuses it
 warns and startup continues.
 
 ### run keeps its eager first pass
@@ -60,7 +60,7 @@ seed; now the seed is already done, so it is an ordinary scan from the watermark
 `prime` took — or, when prime's read failed, the seed retried at once.
 
 It was tempting to skip it: on a caught-up seed it spends an
-`ObjectWritesListSinceAll` that comes back empty. A decision function answering
+`ObjectWrites().ListSinceAll` that comes back empty. A decision function answering
 "how long before the first pass" from what the seed found was written, reviewed,
 and removed again. It bought ~21µs and one scan-floor window of first-wake
 latency, once per process, and it cost a second copy of decisions `pass` already
@@ -90,7 +90,7 @@ and with no stored cursor to resume from, that retry reads the mark as of
 through the stale-dependents pass, not through the waker. `backingOff` is why a
 commit in that window does not shorten it: an unseeded waker drops wakes until
 its retry fires. This is narrower than what this ADR closes — it needs a failed
-store read *and* a store with no `DriverCursorer` or no cursor yet — but it is
+store read *and* a store with no cursor stored yet — but it is
 the same shape, so `docs/TODO.md` keeps an entry for it rather than claiming the
 race is gone.
 

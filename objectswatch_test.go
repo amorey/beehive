@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/amorey/beehive/internal/storeapi"
 	"log/slog"
 	"math"
 	"slices"
@@ -41,11 +42,15 @@ type flakyListStore struct {
 	failures atomic.Int64
 }
 
-func (s *flakyListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *flakyListStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *flakyListStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	if s.failures.Add(-1) >= 0 {
 		return nil, 0, errBoom
 	}
-	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	return s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 }
 
 // A poll that fails is skipped, not fatal. Tearing the stream down would turn a
@@ -133,7 +138,7 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	ev := recv(t, ch)
 	assert.Equal(t, Deleted, ev.Type)
@@ -302,7 +307,7 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 	// Remove the row outright and stop reading: the next poll tails the delete
 	// entry, builds the tombstone from its row image, and parks in the send.
 	drainProbe(store.tailed)
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 	waitClosed(t, chanAfter(store.tailed, 1), "the tail that observes the removal")
 	cancel()
 
@@ -325,7 +330,7 @@ func TestWatchReportsRemovalOfARowItCouldNeverDecode(t *testing.T) {
 	defer cancel()
 
 	store, _, client, _ := watchFixture(t)
-	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	poison, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
@@ -335,7 +340,7 @@ func TestWatchReportsRemovalOfARowItCouldNeverDecode(t *testing.T) {
 	require.NoError(t, err)
 	waitClosed(t, chanAfter(store.polled, 2), "the poll that quarantines the poison row")
 
-	require.NoError(t, store.ObjectsDelete(ctx, poison.ID))
+	require.NoError(t, store.Objects().Delete(ctx, poison.ID))
 
 	// A good object created after the removal is the barrier: it can only arrive
 	// after the poll that dropped the poison row from the stream's own bookkeeping.
@@ -658,18 +663,18 @@ func TestOwnedObjectsListWatchReportsAnUndecodableCollectedChild(t *testing.T) {
 	defer cancel()
 	store, _, client, _ := watchFixture(t)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
-	poison, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	poison, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
 	require.NoError(t, err)
-	_, err = store.EdgesAdd(ctx, poison.ID, owner.ID, RelationOwnedBy)
+	_, err = store.Edges().Add(ctx, poison.ID, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 
 	_, ch, err := client.OwnedObjectsListWatch(ctx, owner.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, store.ObjectsDelete(ctx, poison.ID))
+	require.NoError(t, store.Objects().Delete(ctx, poison.ID))
 
 	ev := recv(t, ch)
 	require.Equal(t, Deleted, ev.Type, "the removal went unreported")
@@ -881,7 +886,7 @@ func TestDeletedChangeComesFromTheLogImage(t *testing.T) {
 	require.NoError(t, err)
 	store.listIDsErr.Store(true) // the liveness probe is gone; using it would fail here
 
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	ev := recv(t, ch)
 	require.Equal(t, Deleted, ev.Type)
@@ -1073,7 +1078,7 @@ func TestCoalescedCreateThenDeleteReportsDeleted(t *testing.T) {
 	defer cancel()
 	store, _, client, _ := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, store.ObjectsDelete(ctx, obj.ID))
+	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
 	_, ch, err := client.WatchList(ctx, WithResumeFrom(0))
 	require.NoError(t, err)
@@ -1089,8 +1094,12 @@ type imagelessStore struct {
 	Store
 }
 
-func (s *imagelessStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
-	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+func (s *imagelessStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *imagelessStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	page, trimmed, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	for i := range page {
 		page[i].Final = nil
 	}
@@ -1116,7 +1125,7 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	require.NoError(t, bh.store.ObjectsDelete(ctx, doomed.ID))
+	require.NoError(t, bh.store.Objects().Delete(ctx, doomed.ID))
 	_, err = client.Update(ctx, survivor.ID, cSpec{Val: "still here"})
 	require.NoError(t, err)
 
@@ -1137,12 +1146,16 @@ type edgelessStore struct {
 	failed chan struct{}
 }
 
-func (s *edgelessStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *edgelessStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *edgelessStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, r Relation) (map[ObjectID][]ObjectRef, error) {
 	if s.broken.Load() {
 		probeSignal(s.failed)
 		return nil, errBoom
 	}
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, r)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, r)
 }
 
 // A watch that asked for relations fails rather than delivering objects whose
@@ -1196,14 +1209,18 @@ type emptyPageStore struct {
 	listed chan struct{}
 }
 
-func (s *emptyPageStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
+func (s *emptyPageStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites, listSince: s.listSinceObjectWrites}
+}
+
+func (s *emptyPageStore) maxVersionObjectWrites(context.Context, GroupKind) (int64, error) {
 	// Rises on every call, so it stays above the cursor the tailer seeds from
 	// this same read. A constant would equal that cursor and gate every drain
 	// out, leaving the test asserting quiet while exercising nothing.
 	return s.gate.Add(1), nil
 }
 
-func (s *emptyPageStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]ObjectWrite, int64, error) {
+func (s *emptyPageStore) listSinceObjectWrites(context.Context, GroupKind, int64, int) ([]ObjectWrite, int64, error) {
 	probeSignal(s.listed)
 	return nil, 0, nil
 }
@@ -1244,7 +1261,11 @@ type vanishingStore struct {
 	read chan struct{}
 }
 
-func (s *vanishingStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
+func (s *vanishingStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listByIDs: s.listByIDsObjects}
+}
+
+func (s *vanishingStore) listByIDsObjects(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
 	probeSignal(s.read)
 	return nil, nil
 }
@@ -1585,8 +1606,12 @@ type writeDuringMaxVersionStore struct {
 	onRead func()
 }
 
-func (s *writeDuringMaxVersionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+func (s *writeDuringMaxVersionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *writeDuringMaxVersionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	s.once.Do(func() {
 		if s.onRead != nil {
 			s.onRead()
@@ -1622,9 +1647,13 @@ type countingTailStore struct {
 	positionReads atomic.Int64
 }
 
-func (s *countingTailStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *countingTailStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *countingTailStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	s.positionReads.Add(1)
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // A burst larger than one page drains on its own. The wakes collapse into one
@@ -1650,7 +1679,7 @@ func TestTailerDrainsBurstAbovePageCap(t *testing.T) {
 	spec, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
 	for i := range burst {
-		_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 			Name: fmt.Sprintf("burst-%d", i),
 			Spec: spec,
 		})
@@ -1825,7 +1854,7 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 		mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
 	}
 	// Retention overtakes the cursor, then the store recovers.
-	_, err := store.ObjectWritesSweep(ctx, 1, 0)
+	_, err := store.ObjectWrites().Sweep(ctx, 1, 0)
 	require.NoError(t, err)
 	store.failures.Store(0)
 
@@ -1872,7 +1901,7 @@ func seedWriteLog(t *testing.T, ctx context.Context, store Store, n int) {
 	spec, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
 	for i := range n {
-		_, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+		_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 			Name: fmt.Sprintf("seed-%d", i),
 			Spec: spec,
 		})
@@ -1935,7 +1964,7 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 			mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
 		}
 		// Retention overtakes the cursor the tailer started from.
-		_, err := store.ObjectWritesSweep(ctx, 1, 0)
+		_, err := store.ObjectWrites().Sweep(ctx, 1, 0)
 		require.NoError(t, err)
 
 		_, _, done := tailer.pass(ctx, tailer.now(), false)
@@ -2101,9 +2130,13 @@ type slowListStore struct {
 	perPage time.Duration
 }
 
-func (s *slowListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *slowListStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *slowListStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	s.clk.advance(s.perPage)
-	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	return s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 }
 
 // The throttle floors drain *starts*. Re-arming a budget-stopped drain for a
@@ -2157,8 +2190,12 @@ type gateAheadStore struct {
 	ahead int64
 }
 
-func (s *gateAheadStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+func (s *gateAheadStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *gateAheadStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	return at + s.ahead, err
 }
 
@@ -2191,11 +2228,15 @@ type failGateStore struct {
 	built atomic.Bool
 }
 
-func (s *failGateStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *failGateStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *failGateStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if s.built.Swap(true) {
 		return 0, errBoom
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // A failed gate read costs the step and nothing else: the cursor stays where it
@@ -2326,7 +2367,7 @@ func TestWatchAfterAResetJoinsAFreshTailer(t *testing.T) {
 	for i := range 3 {
 		mustCreate(t, ctx, client, fmt.Sprintf("trimmed-%d", i), cSpec{})
 	}
-	_, err = store.ObjectWritesSweep(ctx, 1, 0)
+	_, err = store.ObjectWrites().Sweep(ctx, 1, 0)
 	require.NoError(t, err)
 	store.failures.Store(0)
 
@@ -2624,9 +2665,13 @@ type countingLoadStore struct {
 	relationReads atomic.Int64
 }
 
-func (s *countingLoadStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *countingLoadStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *countingLoadStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	s.relationReads.Add(1)
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
 }
 
 // A resume replays the log gap before going live, and pages it: with a day of
@@ -2750,7 +2795,7 @@ func TestOnePageCoalescesToCurrentStateInWriteOrder(t *testing.T) {
 	_, err = client.Update(ctx, first.ID, cSpec{Val: "first3"})
 	require.NoError(t, err)
 
-	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	page, _, err := bh.store.ObjectWrites().ListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
 	changes, err := collectChanges(ctx, bh, clientTestGK, page, false)
 	require.NoError(t, err)
@@ -2774,7 +2819,7 @@ func TestOnePageResolvesCurrentOwners(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
 
-	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	page, _, err := bh.store.ObjectWrites().ListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
 	changes, err := collectChanges(ctx, bh, clientTestGK, page, true)
 	require.NoError(t, err)
@@ -2798,7 +2843,7 @@ func TestOnePageSkipsTheOwnerLookupWhenUnscoped(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
 
-	page, _, err := bh.store.ObjectWritesListSince(ctx, clientTestGK, 0, tailPageCap)
+	page, _, err := bh.store.ObjectWrites().ListSince(ctx, clientTestGK, 0, tailPageCap)
 	require.NoError(t, err)
 	before := store.relationReads.Load()
 
@@ -2850,7 +2895,11 @@ type failingLoadStore struct {
 	tried chan struct{}
 }
 
-func (s *failingLoadStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *failingLoadStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *failingLoadStore) groupOutgoingByIDEdges(context.Context, []ObjectID, Relation) (map[ObjectID][]ObjectRef, error) {
 	s.once.Do(func() { close(s.tried) })
 	return nil, errBoom
 }
@@ -2879,7 +2928,7 @@ func TestWatchLoadFailureRetriesUntilTheCallerGivesUp(t *testing.T) {
 			var ch <-chan ObjectChange[cSpec, cStatus]
 			var err error
 			if tc.resume {
-				at, mErr := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+				at, mErr := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 				require.NoError(t, mErr)
 				mustCreate(t, ctx, client, "gapped", cSpec{})
 				_, ch, err = client.WatchList(ctx, WithResumeFrom(at), WithLoads(LoadOwner()))
@@ -2922,13 +2971,17 @@ func newResumeListStore(t *testing.T) *resumeListStore {
 	}
 }
 
-func (s *resumeListStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *resumeListStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *resumeListStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	replay := afterRV == s.from && limit == tailPageCap
 	if replay && (s.failAll.Load() || s.fail.CompareAndSwap(true, false)) {
 		s.triedOnce.Do(func() { close(s.tried) })
 		return nil, 0, errBoom
 	}
-	page, trimmedThrough, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	page, trimmedThrough, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	if replay {
 		s.servedOnce.Do(func() { close(s.served) })
 		if s.trim.Load() {
@@ -2948,7 +3001,7 @@ func TestWatchResumeRetriesAFailedGapRead(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	store.from = at
 	missed := mustCreate(t, ctx, client, "missed", cSpec{})
@@ -2973,7 +3026,7 @@ func TestWatchResumeEndsWhenRetentionOvertakesIt(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	store.from = at
 	mustCreate(t, ctx, client, "trimmed", cSpec{})
@@ -3004,12 +3057,16 @@ func newFailListByIDsStore(t *testing.T) *failListByIDsStore {
 	return &failListByIDsStore{Store: newClientTestStore(t), tried: make(chan struct{})}
 }
 
-func (s *failListByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+func (s *failListByIDsStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listByIDs: s.listByIDsObjects}
+}
+
+func (s *failListByIDsStore) listByIDsObjects(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
 	if s.failAll.Load() || s.fail.CompareAndSwap(true, false) {
 		s.triedOnce.Do(func() { close(s.tried) })
 		return nil, errBoom
 	}
-	return s.Store.ObjectsListByIDs(ctx, gk, ids)
+	return s.Store.Objects().ListByIDs(ctx, gk, ids)
 }
 
 // The state read behind a replayed page is retried with the same backoff as
@@ -3022,7 +3079,7 @@ func TestWatchResumeRetriesAFailedStateRead(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	missed := mustCreate(t, ctx, client, "missed", cSpec{})
 	// Set last: the tailer this watch starts reads no state of its own, so the
@@ -3046,7 +3103,7 @@ func TestWatchResumeWithNoGapGoesLiveAtOnce(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	store.from = at
 
@@ -3072,7 +3129,7 @@ func TestWatchSingleObjectResumeReplaysOnlyItsID(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"})
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 
 	_, err = client.Update(ctx, mine.ID, cSpec{Val: "b"})
@@ -3103,11 +3160,15 @@ type countingLoadByIDsStore struct {
 	sizes []int
 }
 
-func (s *countingLoadByIDsStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+func (s *countingLoadByIDsStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listByIDs: s.listByIDsObjects}
+}
+
+func (s *countingLoadByIDsStore) listByIDsObjects(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
 	s.mu.Lock()
 	s.sizes = append(s.sizes, len(ids))
 	s.mu.Unlock()
-	return s.Store.ObjectsListByIDs(ctx, gk, ids)
+	return s.Store.Objects().ListByIDs(ctx, gk, ids)
 }
 
 func (s *countingLoadByIDsStore) batchSizes() []int {
@@ -3126,7 +3187,7 @@ func TestWatchResumeStopsDeliveringWhenTheCallerGivesUp(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	at, err := bh.store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := bh.store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	for i := range 2 {
 		mustCreate(t, ctx, client, fmt.Sprintf("gap-%d", i), cSpec{})
@@ -3183,7 +3244,7 @@ func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
 			bh := newTestBeehive(t, store, WithWatchFloorInterval(fastTick))
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-			at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+			at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 			require.NoError(t, err)
 			if gap != nil {
 				gap.from = at
@@ -3289,9 +3350,13 @@ type failingPositionStore struct {
 	tried    chan struct{}
 }
 
-func (s *failingPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *failingPositionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *failingPositionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if !s.armed.Load() {
-		return s.Store.ObjectWritesMaxVersion(ctx, gk)
+		return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	}
 	s.attempts.Add(1)
 	select {
@@ -3407,12 +3472,16 @@ type blockingPositionStore struct {
 	release chan struct{}
 }
 
-func (s *blockingPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *blockingPositionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *blockingPositionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if gk == s.gk {
 		s.once.Do(func() { close(s.entered) })
 		<-s.release
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // Building a tailer must not hold tailMu, which is process-global, across the
@@ -3544,18 +3613,26 @@ func (s *failAfterArmStore) hit() bool {
 	return true
 }
 
-func (s *failAfterArmStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *failAfterArmStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *failAfterArmStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	if s.failEdges && s.hit() {
 		return nil, errBoom
 	}
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
 }
 
-func (s *failAfterArmStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *failAfterArmStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites}
+}
+
+func (s *failAfterArmStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	if s.failWrites && s.hit() {
 		return nil, 0, errBoom
 	}
-	return s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	return s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 }
 
 // A subscriber retrying a failed read must observe the tailer ending, not only
@@ -3642,7 +3719,7 @@ func TestWatchQuarantinesAnUndecodableWriteOnTheTail(t *testing.T) {
 	_, ch, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	_, err = store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{
+	_, err = store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
 		Name: uniqueName(),
 		Spec: []byte(`not json`),
 	})
@@ -3668,12 +3745,16 @@ type blockFirstPositionStore struct {
 	release chan struct{}
 }
 
-func (s *blockFirstPositionStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *blockFirstPositionStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *blockFirstPositionStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if gk == s.gk && s.blocks.CompareAndSwap(true, false) {
 		close(s.entered)
 		<-s.release
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // The build runs outside tailMu, so two first watches on one kind can both
@@ -3743,7 +3824,7 @@ func TestResumeAboveTheLogHeadFails(t *testing.T) {
 
 	// A position exactly at the head is caught up, not ahead: it is what a
 	// subscriber that read every entry checkpoints.
-	at, err := bh.store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := bh.store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 	snap, live, err := client.WatchList(ctx, WithResumeFrom(at))
 	require.NoError(t, err)
@@ -3765,21 +3846,25 @@ type failHeadCheckStore struct {
 	failed chan struct{} // closed once the head check has been failed
 }
 
-func (s *failHeadCheckStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
-	page, trimmedThrough, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+func (s *failHeadCheckStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), listSince: s.listSinceObjectWrites, maxVersion: s.maxVersionObjectWrites}
+}
+
+func (s *failHeadCheckStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+	page, trimmedThrough, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	if err == nil && len(page) == 0 && (s.always || !s.spent.Load()) {
 		s.armed.Store(true) // the head check is the next position read
 	}
 	return page, trimmedThrough, err
 }
 
-func (s *failHeadCheckStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+func (s *failHeadCheckStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
 	if s.armed.CompareAndSwap(true, false) {
 		s.spent.Store(true)
 		s.once.Do(func() { close(s.failed) })
 		return 0, errBoom
 	}
-	return s.Store.ObjectWritesMaxVersion(ctx, gk)
+	return s.Store.ObjectWrites().MaxVersion(ctx, gk)
 }
 
 // The read that tells "caught up" from "resumed past the head" can fail, and a
@@ -3795,7 +3880,7 @@ func TestResumeRetriesAFailedHeadCheck(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 
 	_, ch, err := client.WatchList(ctx, WithResumeFrom(at))
@@ -3832,7 +3917,7 @@ func TestResumeHeadCheckRetryEndsWithTheCaller(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
 
-	at, err := store.ObjectWritesMaxVersion(ctx, clientTestGK)
+	at, err := store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
 
 	watchCtx, endWatch := context.WithCancel(ctx)
@@ -3858,11 +3943,15 @@ type countingLoadFailStore struct {
 	failuresLeft atomic.Int64
 }
 
-func (s *countingLoadFailStore) EdgesGroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *countingLoadFailStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), groupOutgoingByID: s.groupOutgoingByIDEdges}
+}
+
+func (s *countingLoadFailStore) groupOutgoingByIDEdges(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]ObjectRef, error) {
 	if s.failuresLeft.Add(-1) >= 0 {
 		return nil, errBoom
 	}
-	return s.Store.EdgesGroupOutgoingByID(ctx, ids, rel)
+	return s.Store.Edges().GroupOutgoingByID(ctx, ids, rel)
 }
 
 // Only the relation load is retried. Decoding is pure and cannot fail the call,
@@ -3900,7 +3989,7 @@ func TestWatchLoadRetryDecodesOnce(t *testing.T) {
 	// migrator has something to convert. A Create would stamp the current one.
 	spec, err := json.Marshal(cSpec{Val: "a"})
 	require.NoError(t, err)
-	obj, err := store.ObjectsCreate(ctx, clientTestGK, ObjectsCreateInput{Name: "w1", Spec: spec})
+	obj, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: "w1", Spec: spec})
 	require.NoError(t, err)
 	require.NoError(t, bh.kindWriteHub.Send(clientTestGK))
 

@@ -108,12 +108,12 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	if err != nil {
 		return err
 	}
-	return c.wakeAfter(ctx, c.bh.store.ObjectsUpdateStatus(
+	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
 		ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
 func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id ObjectID, condition Condition) error {
-	return c.wakeAfter(ctx, c.bh.store.ConditionsSet(ctx, c.gk, id, storeapi.Condition{
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Set(ctx, c.gk, id, storeapi.Condition{
 		Type:     condition.Type,
 		Status:   string(condition.Status),
 		Reason:   condition.Reason,
@@ -123,7 +123,7 @@ func (c *controllerClientImpl[Status]) ConditionsSet(ctx context.Context, id Obj
 }
 
 func (c *controllerClientImpl[Status]) ConditionsDelete(ctx context.Context, id ObjectID, conditionType string) error {
-	return c.wakeAfter(ctx, c.bh.store.ConditionsDelete(ctx, c.gk, id, conditionType))
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Delete(ctx, c.gk, id, conditionType))
 }
 
 func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectID, event EventSpec) error {
@@ -134,7 +134,7 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 			return err
 		}
 	}
-	if err := c.bh.store.EventsAdd(ctx, c.gk, id, storeapi.EventsAddInput{
+	if err := c.bh.store.Events().Add(ctx, c.gk, id, storeapi.EventsAddInput{
 		Category: event.Category,
 		Type:     string(event.Type),
 		Reason:   event.Reason,
@@ -151,7 +151,7 @@ func (c *controllerClientImpl[Status]) EventsAdd(ctx context.Context, id ObjectI
 // gcCollect still re-checks the RESTRICT block. See
 // docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md.
 func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id ObjectID, finalizer string) error {
-	clearedLast, err := c.bh.store.FinalizersDelete(ctx, c.gk, id, finalizer)
+	clearedLast, err := c.bh.store.Objects().DeleteFinalizer(ctx, c.gk, id, finalizer)
 	if err := c.wakeAfter(ctx, err); err != nil {
 		return err
 	}
@@ -162,13 +162,13 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 }
 
 // DependenciesAdd is one store call, not a composition: the edge and the durable
-// reconcile-owed stamp are indivisible inside EdgesAdd, so an edge can never
+// reconcile-owed stamp are indivisible inside Edges().Add, so an edge can never
 // commit without its wake. The enqueue below is the prompt half; the stamp is
 // the guarantee. It is gated on the store reporting the edge as new — which
 // bounds it to one enqueue per edge ever created — and routed by res.From
 // because the edge is cross-kind.
 func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, fromID, toID ObjectID) error {
-	res, err := c.bh.store.EdgesAdd(ctx, fromID, toID, RelationDependsOn)
+	res, err := c.bh.store.Edges().Add(ctx, fromID, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}
@@ -185,7 +185,7 @@ func (c *controllerClientImpl[Status]) DependenciesAdd(ctx context.Context, from
 // because the edge is cross-kind. See
 // docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
 func (c *controllerClientImpl[Status]) DependenciesDelete(ctx context.Context, fromID, toID ObjectID) error {
-	res, err := c.bh.store.EdgesDelete(ctx, fromID, toID, RelationDependsOn)
+	res, err := c.bh.store.Edges().Delete(ctx, fromID, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}
@@ -204,19 +204,19 @@ func (c *controllerClientImpl[Status]) OwnersGet(ctx context.Context, id ObjectI
 }
 
 func (c *controllerClientImpl[Status]) DependenciesList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListOutgoingByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) DependentsList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationDependsOn)
 }
 
 func (c *controllerClientImpl[Status]) OwnedList(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
-	return c.bh.store.EdgesListIncoming(ctx, id, RelationOwnedBy)
+	return c.bh.store.Edges().ListIncoming(ctx, id, RelationOwnedBy)
 }
 
 func (c *controllerClientImpl[Status]) EdgesHasIncoming(ctx context.Context, id ObjectID) (bool, error) {
-	return c.bh.store.EdgesHasIncoming(ctx, id)
+	return c.bh.store.Edges().HasIncoming(ctx, id)
 }
 
 // Within groups writes into one transaction. It adds no kind scoping of its

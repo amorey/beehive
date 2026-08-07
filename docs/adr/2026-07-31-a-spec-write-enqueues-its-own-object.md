@@ -1,7 +1,7 @@
 # A write enqueues the object it made owe a reconcile, gated on what it changed
 
 - **Status:** Accepted — implemented in `client.go` (`signalSpecWritten`,
-  `signalCreated`) over a `changed` bool added to both `ObjectsUpdateSpec*`
+  `signalCreated`) over a `changed` bool added to both `Objects().UpdateSpec*`
   mutators in `internal/storeapi` and `sqlite/store.go`, and in `controller.go`
   (`DependenciesAdd`) over `EdgesAddResult`. Both go through
   `Beehive.signalRequeueNow`/`signalRequeueThrottled`. Narrows the "Writes schedule nothing" section of
@@ -38,7 +38,7 @@ transaction then discarded.
 
 ### The gate is "this write changed the object", and nothing else
 
-The store now reports it: both `ObjectsUpdateSpec*` mutators return a `changed`
+The store now reports it: both `Objects().UpdateSpec*` mutators return a `changed`
 bool beside the row, true only when the spec was written and `Generation` bumped.
 A create always changes the object. The
 [write-shapes ADR](2026-07-30-store-write-shapes.md) sanctions exactly this shape —
@@ -64,7 +64,7 @@ The lesson is worth stating plainly: **"unsettled" is what the object owes, and
 The owed pass answers the first, on its own cadence, which is what a backstop is for.
 
 **A status write cannot reach the helper.** `UpdateStatus`, both condition mutators
-and `FinalizersDelete` leave the generation alone, and none of them is on the
+and `Objects().DeleteFinalizer` leave the generation alone, and none of them is on the
 `Client` surface. So the loop that a reconcile could otherwise close — reconcile ends
 in a status write, status write enqueues the next reconcile — does not exist. This is
 the same hazard `dependentsWake` avoids by skipping `from_id == to_id`, reached by a
@@ -74,7 +74,7 @@ different route.
 
 A caller that updates the spec and then reports that generation through
 `UpdateStatus` in the same outer `Within` commits a *settled* row, which
-`ObjectsListUnsettledIDs` would not select — and the enqueue registered by the spec
+`Objects().ListUnsettledIDs` would not select — and the enqueue registered by the spec
 write still stands, because that write did change the object.
 
 **That is a duplicate, not a defect.** The object is dispatched once more, reconciles
@@ -133,7 +133,7 @@ the hook is a no-op.
 
 ## Extension: a new dependency edge enqueues its source
 
-`EdgesAdd` increments `reconcile_owed` for every `depends_on` edge it creates, and
+`Edges().Add` increments `reconcile_owed` for every `depends_on` edge it creates, and
 that count waited for the owed pass. The same decision applies at that site, so it
 is recorded here rather than in a second ADR that repeats the argument.
 

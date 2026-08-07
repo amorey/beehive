@@ -26,7 +26,7 @@ It is the long form of conditions, which keep only the current run per type.
 
 ## `Detail` is typed in, opaque out
 
-`EventSpec.Detail` (`any`, marshaled by `EventsAdd`) → the opaque `detail` blob
+`EventSpec.Detail` (`any`, marshaled by `Events().Add`) → the opaque `detail` blob
 column → `Event.Detail` (`json.RawMessage`), decoded by the free generic helper
 `EventDetail[T]`.
 
@@ -41,7 +41,7 @@ could not express. The per-event `EventDetail[T]` helper can.
 
 ## Reads and retention
 
-Reads live on `Client`: `EventsList` / `EventsGetLatest` / `EventsWatch` (lazy), plus
+Reads live on `Client`: `Events().List` / `Events().GetLatest` / `EventsWatch` (lazy), plus
 eager `LoadEvents()` → `Object.Events()`, gated by `LoadEventsBit` in the same
 `LoadSet` and returning `ErrNotLoaded` when unrequested.
 
@@ -56,16 +56,16 @@ Retention runs in `gcSweeperRun` and has its own record —
 [event retention is a ring per timeline](2026-08-06-event-retention-is-a-ring-per-timeline.md).
 `events.object_id` is `FK … ON DELETE CASCADE`, so object deletion cascades the log.
 
-Store set: `EventsAdd` / `EventsGetLatest` / `EventsList` / `EventsListSince` /
-`EventsMaxVersion` / `EventsSnapshot` / `EventsSweep`. The store has no event watch:
-the watch is a client-side reader over `EventsListSince`, woken by the commit.
+Store set: `Events().Add` / `Events().GetLatest` / `Events().List` / `Events().ListSince` /
+`Events().MaxVersion` / `Events().Snapshot` / `Events().Sweep`. The store has no event watch:
+the watch is a client-side reader over `Events().ListSince`, woken by the commit.
 
 ## Naming: "event(s)" is reserved for the log
 
 The object-change surfaces are deliberately named apart:
 
 - The dependency waker reads the store's write log through
-  `Store.ObjectWritesListSince(ctx, afterRV, limit)` — store-wide, paged, yielding
+  `Store.ObjectWrites().ListSince(ctx, afterRV, limit)` — store-wide, paged, yielding
   `[]ObjectWrite` (id plus `ChangeType` = `Added` / `Modified` / `Deleted`, no row).
 - Typed `ObjectChange[Spec,Status]` values reach users through `Client.Watch` /
   `WatchList`, which poll and diff.

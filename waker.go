@@ -39,10 +39,6 @@ import (
 type waker struct {
 	bh *Beehive
 
-	// cursors persists the watermark across restarts when the store supports it;
-	// nil means every restart reseeds from ObjectWritesMaxVersionAll.
-	cursors DriverCursorer
-
 	// now is the waker's only clock, so the rate tests drive it by hand.
 	now func() time.Time
 
@@ -66,7 +62,7 @@ type waker struct {
 
 	// persisted is what the stored cursor row holds (noStoredCursor when none).
 	// Comparing against it keeps a pass from paying a round trip for a write
-	// DriverCursorsSet would discard anyway.
+	// DriverCursors().Set would discard anyway.
 	persisted int64
 
 	// persistFailures counts the current streak of failed cursor writes, so the
@@ -238,12 +234,10 @@ func (dw *waker) teardown() {
 // applied: the gates take their intervals here, so one built earlier would hold
 // the defaults whatever the caller asked for.
 func newWaker(bh *Beehive) *waker {
-	cursors, _ := bh.store.(DriverCursorer)
 	return &waker{
-		bh:      bh,
-		cursors: cursors,
-		now:     time.Now,
-		retry:   driver.Backoff{Base: wakeRetryBase, Max: wakeRetryMax},
+		bh:    bh,
+		now:   time.Now,
+		retry: driver.Backoff{Base: wakeRetryBase, Max: wakeRetryMax},
 		persistRetry: driver.Backoff{
 			Base: max(bh.wakePersistInterval, wakeRetryBase),
 			Max:  wakePersistRetryMax,
@@ -295,7 +289,7 @@ func (dw *waker) pass(ctx context.Context, now time.Time, backingOff bool) (time
 // carries the attempt costs a scan: the gate floors every attempt, the retry
 // ladder paces a failing one.
 func (dw *waker) persistWait(now time.Time) (time.Duration, bool) {
-	if dw.cursors == nil || dw.watermark <= dw.persisted {
+	if dw.watermark <= dw.persisted {
 		return 0, false
 	}
 	wait := dw.persistOpensAt.Sub(now)
@@ -349,7 +343,7 @@ const (
 // committed in that window is below the watermark and is left to the
 // stale-dependents pass — a latency gap, not a hole.
 func (dw *waker) seed(ctx context.Context) scanResult {
-	mark, trimmed, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	mark, trimmed, err := dw.bh.store.ObjectWrites().MaxVersionAll(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
 			return scanFailed // shutdown, not a loss
@@ -359,17 +353,14 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 		return scanFailed
 	}
 
-	var stored int64
-	var ok bool
-	if dw.cursors != nil {
-		if stored, ok, err = dw.cursors.DriverCursorsGet(ctx, cursorNameWaker); err != nil {
-			if ctx.Err() != nil {
-				return scanFailed
-			}
-			dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next pass",
-				"err", err)
+	stored, ok, err := dw.bh.store.DriverCursors().Get(ctx, cursorNameWaker)
+	if err != nil {
+		if ctx.Err() != nil {
 			return scanFailed
 		}
+		dw.bh.log().WarnContext(ctx, "dependency waker could not read its persisted cursor; retrying on the next pass",
+			"err", err)
+		return scanFailed
 	}
 
 	watermark := resumeWatermark(stored, ok, mark)
@@ -453,7 +444,7 @@ func (dw *waker) noteTrim(ctx context.Context, processed, trimmedThrough int64) 
 //
 // Supplementary — a failure is not a failed scan, since no wake depends on it.
 func (dw *waker) noteTrimIdle(ctx context.Context) {
-	_, trimmed, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	_, trimmed, err := dw.bh.store.ObjectWrites().MaxVersionAll(ctx)
 	if err != nil {
 		return
 	}
@@ -488,7 +479,7 @@ func (dw *waker) scan(ctx context.Context) scanResult {
 // budget rather than the log is what stopped it.
 func (dw *waker) scanPages(ctx context.Context) scanResult {
 	for pages := 0; pages < wakeScanPagesPerPass; pages++ {
-		page, trimmed, err := dw.bh.store.ObjectWritesListSinceAll(ctx, dw.watermark, wakeScanPageCap)
+		page, trimmed, err := dw.bh.store.ObjectWrites().ListSinceAll(ctx, dw.watermark, wakeScanPageCap)
 		if err != nil {
 			if ctx.Err() != nil {
 				return scanFailed // shutdown cancelled this read
@@ -531,7 +522,7 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 	if drained < dw.abandonAfter {
 		return scanMore
 	}
-	mark, _, err := dw.bh.store.ObjectWritesMaxVersionAll(ctx)
+	mark, _, err := dw.bh.store.ObjectWrites().MaxVersionAll(ctx)
 	if err != nil {
 		// Not scanFailed: no wake depends on this read, and backing off would drop
 		// the wakes arriving meanwhile. Restarting the window is what paces the
@@ -560,7 +551,7 @@ func (dw *waker) abandonIfOvertaken(ctx context.Context) scanResult {
 // never rolled back — the wakes are already queued.
 func (dw *waker) persist(ctx context.Context) {
 	// ctx.Err() checked here so a shutdown mid-scan isn't logged as a failure.
-	if dw.cursors == nil || dw.watermark <= dw.persisted || ctx.Err() != nil {
+	if dw.watermark <= dw.persisted || ctx.Err() != nil {
 		return
 	}
 	now := dw.now()
@@ -570,7 +561,7 @@ func (dw *waker) persist(ctx context.Context) {
 	if now.Before(dw.persistOpensAt) {
 		return
 	}
-	if err := dw.cursors.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
+	if err := dw.bh.store.DriverCursors().Set(ctx, cursorNameWaker, dw.watermark); err != nil {
 		dw.persistFailures++
 		dw.persistOpensAt = now.Add(dw.persistRetry.Next())
 		if dw.persistFailures > 1 {
@@ -608,7 +599,7 @@ func (dw *waker) dependentsWake(ctx context.Context, page []ObjectWrite) bool {
 		seen[ref.ID] = struct{}{}
 		ids = append(ids, ref.ID)
 	}
-	byTarget, err := dw.bh.store.EdgesGroupIncomingByID(ctx, ids, RelationDependsOn)
+	byTarget, err := dw.bh.store.Edges().GroupIncomingByID(ctx, ids, RelationDependsOn)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false
@@ -697,7 +688,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	// target written while the sweep runs sits above the mark, so the next sweep
 	// finds it — and the scan stays finite under sustained writes. Taking the
 	// highest target the scan returned instead would skip exactly those targets.
-	mark, err := sd.bh.store.ResourceVersionsMaxIssued(ctx)
+	mark, err := sd.bh.store.GetLatestResourceVersion(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.WarnContext(ctx, "reading the resource version failed; the next pass retries", "err", err)
@@ -716,7 +707,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	enqueue := sd.bh.enqueuerForPage()
 	pos := staleResumeAt(sd.cursor)
 	for {
-		page, next, err := sd.bh.store.DependentsListStaleSince(ctx, sd.kinds, pos, mark, staleDependentsPageCap)
+		page, next, err := sd.bh.store.Dependencies().ListStaleSince(ctx, sd.kinds, pos, mark, staleDependentsPageCap)
 		if err != nil {
 			abandon("listing stale dependents failed; the next pass resumes from the same cursor", pos, err)
 			return
@@ -724,7 +715,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 		if len(page) == 0 {
 			break
 		}
-		if err := sd.bh.store.ReconcileOwedStamp(ctx, page); err != nil {
+		if err := sd.bh.store.ReconcileOwed().Stamp(ctx, page); err != nil {
 			abandon("stamping stale dependents failed; the next pass resumes from the same cursor", pos, err)
 			return
 		}

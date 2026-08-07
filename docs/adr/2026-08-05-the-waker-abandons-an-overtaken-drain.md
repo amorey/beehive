@@ -34,7 +34,7 @@ store whose write rate outruns the drain, not a change to the normal resume path
 ### The bound is measured, not a distance
 
 Capping `mark - stored` at seed was tried and removed. It reads a
-`resource_version` distance, and `EventsAdd` draws from that same sequence while
+`resource_version` distance, and `Events().Add` draws from that same sequence while
 writing nothing the scan reads, so the distance overstates the backlog by an
 unbounded factor: a store logging events at any rate would abandon cursors that
 were a few passes of work. `TestWakerResumesAnEnormousBacklog` pins that seed
@@ -58,8 +58,8 @@ positive interval, but only for a `Beehive` that came from `New`.
 
 ### Two traps in the jump
 
-**The mark folds in no horizon.** `ObjectWritesMaxVersionAll` is a bare
-`MAX(resource_version)`, unlike the per-kind `ObjectWritesMaxVersion` the watch
+**The mark folds in no horizon.** `ObjectWrites().MaxVersionAll` is a bare
+`MAX(resource_version)`, unlike the per-kind `ObjectWrites().MaxVersion` the watch
 tail gates on. Retention lowers it, and a fully trimmed log reads 0, so the jump
 takes `max(watermark, mark)`. Assigning would rewind the watermark onto rows
 already scanned and replay the whole log.
@@ -82,11 +82,11 @@ re-drain exactly the range that was just abandoned.
 The abandoned range costs at most two sweep intervals of latency, one in the
 common case: reaching the threshold proves a sweep *started*, and a sweep that
 fails a page holds its cursor for the next one. Never divergence — this is the
-same trade three documented gaps already accept (a store with no `DriverCursorer`,
+same trade three documented gaps already accept (a store that persists no cursor,
 a wake queued but never delivered, a log trimmed under the cursor).
 
 It leans on the backstop finding a superset of what the waker finds.
-`DependentsListStaleSince` drives from `objects t`, so a physically deleted
+`Dependencies().ListStaleSince` drives from `objects t`, so a physically deleted
 target's dependents would be invisible to it — but `edges.to_id` is `ON DELETE
 RESTRICT`, so a target with live `depends_on` edges cannot be physically deleted,
 and the waker finds nothing there either. Relaxing that constraint would turn this
@@ -101,5 +101,5 @@ noise.
 other way — clearing inside the jump — put the same invariant in two functions.
 
 `BenchmarkWakerScanRateUnderSustainedWrites` is unaffected: its harness resets the
-watermark per iteration, and the one extra `ObjectWritesMaxVersionAll` an abandon
+watermark per iteration, and the one extra `ObjectWrites().MaxVersionAll` an abandon
 costs is not one of the reads it counts.

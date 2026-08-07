@@ -92,9 +92,9 @@ floored at 1×. Work per unit time holds, and a shorter interval keeps today's
 behaviour by sweeping more often.
 
 The event budget lives in the sqlite package, inside `overCapTimelines`, so
-`EventsSweep` takes it as a parameter — a breaking change to `Store`. A
+`Events().Sweep` takes it as a parameter — a breaking change to `Store`. A
 non-positive budget means "the implementation's own", which is what keeps the
-sweep meaningful for a caller that is not the GC loop. `ObjectWritesSweep` needs
+sweep meaningful for a caller that is not the GC loop. `ObjectWrites().Sweep` needs
 no equivalent: its work is bounded by the *kind* count, one statement each, not
 by a per-sweep row budget.
 
@@ -126,6 +126,6 @@ battery-tuned beehive recovers at the same rate it always did. Pinned by
 `TestWakerRetryCapIsNotTheBackstopsCadence` and the tailer's "a failing drain
 settles at the retry cap, not at the floor".
 
-**`Store.EventsSweep` grew a parameter.** External backends do not exist yet
+**`Store.Events().Sweep` grew a parameter.** External backends do not exist yet
 (`Store` is not externally implementable today — see [TODO](../TODO.md)), so the
 cost is the in-tree implementation and the test doubles.

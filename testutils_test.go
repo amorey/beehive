@@ -353,184 +353,664 @@ func (s *fakeStore) Within(ctx context.Context, fn func(context.Context) error) 
 // AfterCommit runs inline: the fake never opens a transaction, so there is no
 // commit to wait for.
 func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) { fn(ctx) }
-func (s *fakeStore) ObjectsCreate(context.Context, GroupKind, ObjectsCreateInput) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsCreate")
-}
-func (s *fakeStore) ObjectsGet(context.Context, ObjectID) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsGet")
-}
-func (s *fakeStore) ObjectsGetForReconcile(context.Context, ObjectID) (storeapi.ReconcileLoad, error) {
-	panic("not implemented: fakeStore.ObjectsGetForReconcile")
-}
-func (s *fakeStore) ObjectsGetMeta(context.Context, ObjectID) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsGetMeta")
-}
-func (s *fakeStore) ObjectsGetByName(context.Context, GroupKind, string) (*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsGetByName")
-}
-func (s *fakeStore) ObjectsList(context.Context, GroupKind) ([]*RawObject, error) {
-	return nil, nil
-}
-func (s *fakeStore) ObjectsListIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	return nil, nil
-}
-func (s *fakeStore) ObjectsListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	return nil, nil
-}
-func (s *fakeStore) DeletionRequestsList(context.Context) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
 
-func (s *fakeStore) ReconcileOwedListIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	return nil, nil
-}
-
-// answers 0: the GC sweeper calls it on every tick
-func (s *fakeStore) ReconcileOwedSweep(context.Context, []GroupKind) (int, error) {
-	return 0, nil
-}
-func (s *fakeStore) ReconcileOwedDecrement(context.Context, GroupKind, ObjectID, int64) error {
-	panic("not implemented: fakeStore.ReconcileOwedDecrement")
-}
-
-// ReconcileOwedStamp answers nil like the listings above it: the stale-dependents
-// driver stamps what it finds, so a panic would break every Start.
-func (s *fakeStore) ReconcileOwedStamp(context.Context, []storeapi.ObjectRef) error {
-	return nil
-}
-
-// ResourceVersionsMaxIssued answers 0: the stale-dependents driver reads it every
+// GetLatestResourceVersion answers 0: the stale-dependents driver reads it every
 // tick, so a panic would break every Start.
-func (s *fakeStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+func (s *fakeStore) GetLatestResourceVersion(context.Context) (int64, error) {
 	return 0, nil
 }
 
-// DependentsListStaleSince answers empty like the listings above it, rather than
-// panicking: the stale-dependents driver runs in every Beehive that has
-// controllers, so a panic would make the fake unusable for anything calling Start.
-func (s *fakeStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]storeapi.ObjectRef, StalePos, error) {
+func (s *fakeStore) Dependencies() storeapi.Dependencies { return fakeDependencies{} }
+
+// fakeDependencies is fakeStore's dependency family. ListStaleSince answers
+// empty rather than panicking: the stale-dependents driver runs in every Beehive
+// that has controllers, so a panic would make the fake unusable for anything
+// calling Start.
+type fakeDependencies struct{}
+
+func (fakeDependencies) ListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]storeapi.ObjectRef, StalePos, error) {
 	return nil, after, nil
 }
-func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
-	panic("not implemented: fakeStore.ObjectsUpdateSpec")
+
+func (fakeDependencies) WatermarkSet(context.Context, ObjectID, int64) error {
+	panic("not implemented: fakeStore.Dependencies().WatermarkSet")
 }
 
-func (s *fakeStore) ObjectsUpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error) {
-	panic("not implemented: ObjectsUpdateSpecByName")
+// cursorsOverride replaces the hooks that are set and delegates the rest.
+type cursorsOverride struct {
+	storeapi.DriverCursors
+	set func(context.Context, string, int64) error
 }
-func (s *fakeStore) ObjectsUpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
-	panic("not implemented: fakeStore.UpdateStatus")
+
+func (o cursorsOverride) Set(ctx context.Context, name string, cursor int64) error {
+	if o.set != nil {
+		return o.set(ctx, name, cursor)
+	}
+	return o.DriverCursors.Set(ctx, name, cursor)
 }
-func (s *fakeStore) FinalizersDelete(context.Context, GroupKind, ObjectID, string) (bool, error) {
-	panic("not implemented: fakeStore.FinalizersDelete")
+
+// depsOverride replaces the hooks that are set on a real Dependencies and
+// delegates the rest, so a probe needs no wrapper type of its own.
+type depsOverride struct {
+	storeapi.Dependencies
+	listStaleSince func(context.Context, []GroupKind, StalePos, int64, int) ([]storeapi.ObjectRef, StalePos, error)
+	watermarkSet   func(context.Context, ObjectID, int64) error
 }
-func (s *fakeStore) DeletionRequestsCreate(context.Context, GroupKind, ObjectID) (storeapi.DeletionRequestResult, error) {
-	panic("not implemented: fakeStore.DeletionRequestsCreate")
+
+func (d depsOverride) ListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
+	if d.listStaleSince != nil {
+		return d.listStaleSince(ctx, kinds, after, through, limit)
+	}
+	return d.Dependencies.ListStaleSince(ctx, kinds, after, through, limit)
 }
-func (s *fakeStore) DeletionRequestsCreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
-	panic("not implemented: fakeStore.DeletionRequestsCreateByName")
+
+func (d depsOverride) WatermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
+	if d.watermarkSet != nil {
+		return d.watermarkSet(ctx, id, cursor)
+	}
+	return d.Dependencies.WatermarkSet(ctx, id, cursor)
 }
-func (s *fakeStore) ConditionsSet(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
-	panic("not implemented: fakeStore.ConditionsSet")
+
+func (s *fakeStore) DeletionRequests() storeapi.DeletionRequests { return fakeDeletionRequests{} }
+
+// fakeDeletionRequests is fakeStore's deletion-request family. List answers
+// empty rather than panicking: the GC sweeper runs in every Beehive.
+type fakeDeletionRequests struct{}
+
+func (fakeDeletionRequests) Create(context.Context, GroupKind, ObjectID) (storeapi.DeletionRequestResult, error) {
+	panic("not implemented: fakeStore.DeletionRequests().Create")
 }
-func (s *fakeStore) ConditionsDelete(context.Context, GroupKind, ObjectID, string) error {
-	panic("not implemented: fakeStore.ConditionsDelete")
+
+func (fakeDeletionRequests) CreateByName(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error) {
+	panic("not implemented: fakeStore.DeletionRequests().CreateByName")
 }
-func (s *fakeStore) ObjectsDelete(context.Context, ObjectID) error {
-	panic("not implemented: fakeStore.ObjectsDelete")
+
+func (fakeDeletionRequests) CreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
+	panic("not implemented: fakeStore.DeletionRequests().CreateFromOwner")
 }
-func (s *fakeStore) DeletionRequestsCreateFromOwner(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error) {
-	panic("not implemented: fakeStore.DeletionRequestsCreateFromOwner")
+
+func (fakeDeletionRequests) List(context.Context) ([]storeapi.ObjectRef, error) { return nil, nil }
+
+// delReqOverride replaces the hooks that are set and delegates the rest.
+type delReqOverride struct {
+	storeapi.DeletionRequests
+	createByName    func(context.Context, GroupKind, string) (storeapi.DeletionRequestResult, error)
+	createFromOwner func(context.Context, ObjectID) (storeapi.DeletionCascadeResult, error)
+	list            func(context.Context) ([]storeapi.ObjectRef, error)
 }
-func (s *fakeStore) EventsAdd(context.Context, GroupKind, ObjectID, EventsAddInput) error {
-	panic("not implemented: fakeStore.EventsAdd")
+
+func (o delReqOverride) CreateByName(ctx context.Context, gk GroupKind, name string) (storeapi.DeletionRequestResult, error) {
+	if o.createByName != nil {
+		return o.createByName(ctx, gk, name)
+	}
+	return o.DeletionRequests.CreateByName(ctx, gk, name)
 }
-func (s *fakeStore) EventsList(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
-	panic("not implemented: fakeStore.EventsList")
+
+func (o delReqOverride) CreateFromOwner(ctx context.Context, id ObjectID) (storeapi.DeletionCascadeResult, error) {
+	if o.createFromOwner != nil {
+		return o.createFromOwner(ctx, id)
+	}
+	return o.DeletionRequests.CreateFromOwner(ctx, id)
 }
-func (s *fakeStore) EventsListSince(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error) {
-	panic("not implemented: fakeStore.EventsListSince")
+
+func (o delReqOverride) List(ctx context.Context) ([]storeapi.ObjectRef, error) {
+	if o.list != nil {
+		return o.list(ctx)
+	}
+	return o.DeletionRequests.List(ctx)
 }
-func (s *fakeStore) EventsSnapshot(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error) {
-	panic("not implemented: fakeStore.EventsSnapshot")
+
+func (s *fakeStore) ReconcileOwed() storeapi.ReconcileOwed { return fakeReconcileOwed{} }
+
+// fakeReconcileOwed is fakeStore's owed-count family.
+type fakeReconcileOwed struct{}
+
+func (fakeReconcileOwed) Decrement(context.Context, GroupKind, ObjectID, int64) error {
+	panic("not implemented: fakeStore.ReconcileOwed().Decrement")
 }
-func (s *fakeStore) EventsMaxVersion(context.Context, ObjectID) (int64, error) {
-	panic("not implemented: fakeStore.EventsMaxVersion")
-}
-func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
-	panic("not implemented: fakeStore.EventsGetLatest")
-}
-func (s *fakeStore) EventsSweep(context.Context, int, time.Duration, int) (int, error) {
-	panic("not implemented: fakeStore.EventsSweep")
-}
-func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
-	panic("not implemented: fakeStore.EdgesAdd")
-}
-func (s *fakeStore) EdgesDelete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
-	panic("not implemented: fakeStore.EdgesDelete")
-}
-func (s *fakeStore) EdgesListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
+
+func (fakeReconcileOwed) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
-func (s *fakeStore) ObjectsListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesGroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesListOutgoing(context.Context, ObjectID) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesGroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
-	return nil, nil
-}
-func (s *fakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) error {
+
+func (fakeReconcileOwed) Stamp(context.Context, []storeapi.ObjectRef) error {
 	return nil
 }
-func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
+
+func (fakeReconcileOwed) Sweep(context.Context, []GroupKind) (int, error) {
+	return 0, nil
+}
+
+// owedOverride replaces the hooks that are set and delegates the rest.
+type owedOverride struct {
+	storeapi.ReconcileOwed
+	listIDs   func(context.Context, GroupKind) ([]ObjectID, error)
+	decrement func(context.Context, GroupKind, ObjectID, int64) error
+	stamp     func(context.Context, []storeapi.ObjectRef) error
+	sweep     func(context.Context, []GroupKind) (int, error)
+}
+
+func (o owedOverride) ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	if o.listIDs != nil {
+		return o.listIDs(ctx, gk)
+	}
+	return o.ReconcileOwed.ListIDs(ctx, gk)
+}
+
+func (o owedOverride) Decrement(ctx context.Context, gk GroupKind, id ObjectID, observed int64) error {
+	if o.decrement != nil {
+		return o.decrement(ctx, gk, id, observed)
+	}
+	return o.ReconcileOwed.Decrement(ctx, gk, id, observed)
+}
+
+func (o owedOverride) Stamp(ctx context.Context, refs []storeapi.ObjectRef) error {
+	if o.stamp != nil {
+		return o.stamp(ctx, refs)
+	}
+	return o.ReconcileOwed.Stamp(ctx, refs)
+}
+
+func (o owedOverride) Sweep(ctx context.Context, keep []GroupKind) (int, error) {
+	if o.sweep != nil {
+		return o.sweep(ctx, keep)
+	}
+	return o.ReconcileOwed.Sweep(ctx, keep)
+}
+
+func (s *fakeStore) Edges() storeapi.Edges { return fakeEdges{} }
+
+// fakeEdges is fakeStore's edge family. The listings answer empty rather than
+// panicking: the drivers walk edges in every Beehive.
+type fakeEdges struct{}
+
+func (fakeEdges) Add(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
+	panic("not implemented: fakeStore.Edges().Add")
+}
+
+func (fakeEdges) Delete(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error) {
+	panic("not implemented: fakeStore.Edges().Delete")
+}
+
+func (fakeEdges) ListIncoming(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) GroupIncomingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) ListOutgoingByRelation(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) GroupOutgoingByID(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	return nil, nil
+}
+
+func (fakeEdges) DeleteFinalizingDependsOn(context.Context, ObjectID) error {
+	return nil
+}
+
+func (fakeEdges) HasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
 }
 
-func (s *fakeStore) DependencyWatermarksSet(context.Context, ObjectID, int64) error {
-	panic("not implemented: fakeStore.DependencyWatermarksSet")
+// edgesOverride replaces the hooks that are set and delegates the rest.
+type edgesOverride struct {
+	storeapi.Edges
+	add                       func(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error)
+	delete                    func(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesDeleteResult, error)
+	deleteFinalizingDependsOn func(context.Context, ObjectID) error
+	groupIncomingByID         func(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error)
+	groupOutgoingByID         func(context.Context, []ObjectID, Relation) (map[ObjectID][]storeapi.ObjectRef, error)
+	hasIncoming               func(context.Context, ObjectID) (bool, error)
+	listIncoming              func(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error)
+	listOutgoingByRelation    func(context.Context, ObjectID, Relation) ([]storeapi.ObjectRef, error)
 }
 
-func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesListSince")
+func (o edgesOverride) Add(ctx context.Context, from, to ObjectID, rel Relation) (storeapi.EdgesAddResult, error) {
+	if o.add != nil {
+		return o.add(ctx, from, to, rel)
+	}
+	return o.Edges.Add(ctx, from, to, rel)
 }
-func (s *fakeStore) ObjectWritesListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error) {
+
+func (o edgesOverride) Delete(ctx context.Context, from, to ObjectID, rel Relation) (storeapi.EdgesDeleteResult, error) {
+	if o.delete != nil {
+		return o.delete(ctx, from, to, rel)
+	}
+	return o.Edges.Delete(ctx, from, to, rel)
+}
+
+func (o edgesOverride) DeleteFinalizingDependsOn(ctx context.Context, to ObjectID) error {
+	if o.deleteFinalizingDependsOn != nil {
+		return o.deleteFinalizingDependsOn(ctx, to)
+	}
+	return o.Edges.DeleteFinalizingDependsOn(ctx, to)
+}
+
+func (o edgesOverride) GroupIncomingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	if o.groupIncomingByID != nil {
+		return o.groupIncomingByID(ctx, ids, rel)
+	}
+	return o.Edges.GroupIncomingByID(ctx, ids, rel)
+}
+
+func (o edgesOverride) GroupOutgoingByID(ctx context.Context, ids []ObjectID, rel Relation) (map[ObjectID][]storeapi.ObjectRef, error) {
+	if o.groupOutgoingByID != nil {
+		return o.groupOutgoingByID(ctx, ids, rel)
+	}
+	return o.Edges.GroupOutgoingByID(ctx, ids, rel)
+}
+
+func (o edgesOverride) HasIncoming(ctx context.Context, id ObjectID) (bool, error) {
+	if o.hasIncoming != nil {
+		return o.hasIncoming(ctx, id)
+	}
+	return o.Edges.HasIncoming(ctx, id)
+}
+
+func (o edgesOverride) ListIncoming(ctx context.Context, to ObjectID, rel Relation) ([]storeapi.ObjectRef, error) {
+	if o.listIncoming != nil {
+		return o.listIncoming(ctx, to, rel)
+	}
+	return o.Edges.ListIncoming(ctx, to, rel)
+}
+
+func (o edgesOverride) ListOutgoingByRelation(ctx context.Context, from ObjectID, rel Relation) ([]storeapi.ObjectRef, error) {
+	if o.listOutgoingByRelation != nil {
+		return o.listOutgoingByRelation(ctx, from, rel)
+	}
+	return o.Edges.ListOutgoingByRelation(ctx, from, rel)
+}
+
+func (s *fakeStore) ObjectWrites() storeapi.ObjectWrites { return fakeObjectWrites{} }
+
+// fakeObjectWrites is fakeStore's write-log family.
+type fakeObjectWrites struct{}
+
+func (fakeObjectWrites) ListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().ListSince")
+}
+
+func (fakeObjectWrites) ListSinceAll(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error) {
 	// Empty rather than a panic: Start seeds the waker, so its eager first pass
 	// scans rather than seeding, and every Beehive whose waker runs reaches this.
 	return nil, 0, nil
 }
-func (s *fakeStore) ObjectWritesMaxVersion(context.Context, GroupKind) (int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesMaxVersion")
+
+func (fakeObjectWrites) MaxVersion(context.Context, GroupKind) (int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().MaxVersion")
 }
-func (s *fakeStore) ObjectsListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
-	panic("not implemented: fakeStore.ObjectsListByIDs")
-}
-func (s *fakeStore) ObjectWritesSnapshot(context.Context, GroupKind) ([]*RawObject, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesSnapshot")
-}
-func (s *fakeStore) ObjectWritesSnapshotByID(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesSnapshotByID")
-}
-func (s *fakeStore) ObjectWritesSnapshotByOwner(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
-	panic("not implemented: fakeStore.ObjectWritesSnapshotByOwner")
-}
-func (s *fakeStore) ObjectWritesSweep(context.Context, int, time.Duration) (int, error) {
-	// Zero rather than a panic: write-log retention is on by default, so every
-	// Beehive whose GC sweeper ticks reaches this.
-	return 0, nil
-}
-func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+
+func (fakeObjectWrites) MaxVersionAll(context.Context) (int64, int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.
 	return 0, 0, nil
 }
+
+func (fakeObjectWrites) Snapshot(context.Context, GroupKind) ([]*RawObject, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().Snapshot")
+}
+
+func (fakeObjectWrites) SnapshotByID(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().SnapshotByID")
+}
+
+func (fakeObjectWrites) SnapshotByOwner(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error) {
+	panic("not implemented: fakeStore.ObjectWrites().SnapshotByOwner")
+}
+
+func (fakeObjectWrites) Sweep(context.Context, int, time.Duration) (int, error) {
+	// Zero rather than a panic: write-log retention is on by default, so every
+	// Beehive whose GC sweeper ticks reaches this.
+	return 0, nil
+}
+
+// writesOverride replaces the hooks that are set and delegates the rest.
+type writesOverride struct {
+	storeapi.ObjectWrites
+	listSince     func(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error)
+	listSinceAll  func(context.Context, int64, int) ([]storeapi.ObjectWrite, int64, error)
+	maxVersion    func(context.Context, GroupKind) (int64, error)
+	maxVersionAll func(context.Context) (int64, int64, error)
+	snapshot      func(context.Context, GroupKind) ([]*RawObject, int64, error)
+	snapshotByID  func(context.Context, GroupKind, ObjectID) ([]*RawObject, int64, error)
+}
+
+func (o writesOverride) ListSince(ctx context.Context, gk GroupKind, after int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	if o.listSince != nil {
+		return o.listSince(ctx, gk, after, limit)
+	}
+	return o.ObjectWrites.ListSince(ctx, gk, after, limit)
+}
+
+func (o writesOverride) ListSinceAll(ctx context.Context, after int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
+	if o.listSinceAll != nil {
+		return o.listSinceAll(ctx, after, limit)
+	}
+	return o.ObjectWrites.ListSinceAll(ctx, after, limit)
+}
+
+func (o writesOverride) MaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
+	if o.maxVersion != nil {
+		return o.maxVersion(ctx, gk)
+	}
+	return o.ObjectWrites.MaxVersion(ctx, gk)
+}
+
+func (o writesOverride) MaxVersionAll(ctx context.Context) (int64, int64, error) {
+	if o.maxVersionAll != nil {
+		return o.maxVersionAll(ctx)
+	}
+	return o.ObjectWrites.MaxVersionAll(ctx)
+}
+
+func (o writesOverride) Snapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error) {
+	if o.snapshot != nil {
+		return o.snapshot(ctx, gk)
+	}
+	return o.ObjectWrites.Snapshot(ctx, gk)
+}
+
+func (o writesOverride) SnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error) {
+	if o.snapshotByID != nil {
+		return o.snapshotByID(ctx, gk, id)
+	}
+	return o.ObjectWrites.SnapshotByID(ctx, gk, id)
+}
+
+func (s *fakeStore) Objects() storeapi.Objects { return fakeObjects{} }
+
+// fakeObjects is fakeStore's objects family. The listings answer empty rather
+// than panicking: the drivers list objects in every Beehive.
+type fakeObjects struct{}
+
+func (fakeObjects) Create(context.Context, GroupKind, ObjectsCreateInput) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().Create")
+}
+
+func (fakeObjects) Delete(context.Context, ObjectID) error {
+	panic("not implemented: fakeStore.Objects().Delete")
+}
+
+func (fakeObjects) Get(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().Get")
+}
+
+func (fakeObjects) GetByName(context.Context, GroupKind, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().GetByName")
+}
+
+func (fakeObjects) GetForReconcile(context.Context, ObjectID) (storeapi.ReconcileLoad, error) {
+	panic("not implemented: fakeStore.Objects().GetForReconcile")
+}
+
+func (fakeObjects) GetMeta(context.Context, ObjectID) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().GetMeta")
+}
+
+func (fakeObjects) ListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().ListByIDs")
+}
+
+func (fakeObjects) ListByIncomingEdge(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error) {
+	return nil, nil
+}
+
+func (fakeObjects) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
+
+func (fakeObjects) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	return nil, nil
+}
+
+func (fakeObjects) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.Objects().UpdateSpec")
+}
+
+func (fakeObjects) UpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error) {
+	panic("not implemented: fakeStore.Objects().UpdateSpecByName")
+}
+
+func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
+	panic("not implemented: fakeStore.Objects().UpdateStatus")
+}
+
+func (fakeObjects) List(context.Context, GroupKind) ([]*RawObject, error) {
+	return nil, nil
+}
+
+func (fakeObjects) DeleteFinalizer(context.Context, GroupKind, ObjectID, string) (bool, error) {
+	panic("not implemented: fakeStore.Objects().DeleteFinalizer")
+}
+
+// objectsOverride replaces the hooks that are set and delegates the rest.
+type objectsOverride struct {
+	storeapi.Objects
+	create             func(context.Context, GroupKind, storeapi.ObjectsCreateInput) (*RawObject, error)
+	get                func(context.Context, ObjectID) (*RawObject, error)
+	getForReconcile    func(context.Context, ObjectID) (storeapi.ReconcileLoad, error)
+	getMeta            func(context.Context, ObjectID) (*RawObject, error)
+	list               func(context.Context, GroupKind) ([]*RawObject, error)
+	listByIDs          func(context.Context, GroupKind, []ObjectID) ([]*RawObject, error)
+	listByIncomingEdge func(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error)
+	listIDs            func(context.Context, GroupKind) ([]ObjectID, error)
+	listUnsettledIDs   func(context.Context, GroupKind) ([]ObjectID, error)
+	delete             func(context.Context, ObjectID) error
+	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
+	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
+	updateStatus       func(context.Context, GroupKind, ObjectID, int64, []byte, int) error
+}
+
+func (o objectsOverride) Create(ctx context.Context, gk GroupKind, in storeapi.ObjectsCreateInput) (*RawObject, error) {
+	if o.create != nil {
+		return o.create(ctx, gk, in)
+	}
+	return o.Objects.Create(ctx, gk, in)
+}
+
+func (o objectsOverride) Delete(ctx context.Context, id ObjectID) error {
+	if o.delete != nil {
+		return o.delete(ctx, id)
+	}
+	return o.Objects.Delete(ctx, id)
+}
+
+func (o objectsOverride) Get(ctx context.Context, id ObjectID) (*RawObject, error) {
+	if o.get != nil {
+		return o.get(ctx, id)
+	}
+	return o.Objects.Get(ctx, id)
+}
+
+func (o objectsOverride) GetForReconcile(ctx context.Context, id ObjectID) (storeapi.ReconcileLoad, error) {
+	if o.getForReconcile != nil {
+		return o.getForReconcile(ctx, id)
+	}
+	return o.Objects.GetForReconcile(ctx, id)
+}
+
+func (o objectsOverride) GetMeta(ctx context.Context, id ObjectID) (*RawObject, error) {
+	if o.getMeta != nil {
+		return o.getMeta(ctx, id)
+	}
+	return o.Objects.GetMeta(ctx, id)
+}
+
+func (o objectsOverride) List(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
+	if o.list != nil {
+		return o.list(ctx, gk)
+	}
+	return o.Objects.List(ctx, gk)
+}
+
+func (o objectsOverride) ListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+	if o.listByIDs != nil {
+		return o.listByIDs(ctx, gk, ids)
+	}
+	return o.Objects.ListByIDs(ctx, gk, ids)
+}
+
+func (o objectsOverride) ListByIncomingEdge(ctx context.Context, gk GroupKind, to ObjectID, rel Relation) ([]*RawObject, error) {
+	if o.listByIncomingEdge != nil {
+		return o.listByIncomingEdge(ctx, gk, to, rel)
+	}
+	return o.Objects.ListByIncomingEdge(ctx, gk, to, rel)
+}
+
+func (o objectsOverride) ListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	if o.listIDs != nil {
+		return o.listIDs(ctx, gk)
+	}
+	return o.Objects.ListIDs(ctx, gk)
+}
+
+func (o objectsOverride) ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	if o.listUnsettledIDs != nil {
+		return o.listUnsettledIDs(ctx, gk)
+	}
+	return o.Objects.ListUnsettledIDs(ctx, gk)
+}
+
+func (o objectsOverride) UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, v int) (*RawObject, bool, error) {
+	if o.updateSpec != nil {
+		return o.updateSpec(ctx, gk, id, spec, v)
+	}
+	return o.Objects.UpdateSpec(ctx, gk, id, spec, v)
+}
+
+func (o objectsOverride) GetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error) {
+	if o.getByName != nil {
+		return o.getByName(ctx, gk, name)
+	}
+	return o.Objects.GetByName(ctx, gk, name)
+}
+
+func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observed int64, status []byte, version int) error {
+	if o.updateStatus != nil {
+		return o.updateStatus(ctx, gk, id, observed, status, version)
+	}
+	return o.Objects.UpdateStatus(ctx, gk, id, observed, status, version)
+}
+
+func (s *fakeStore) Conditions() storeapi.Conditions { return fakeConditions{} }
+
+// fakeConditions is fakeStore's conditions family.
+type fakeConditions struct{}
+
+func (fakeConditions) Set(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
+	panic("not implemented: fakeStore.Conditions().Set")
+}
+
+func (fakeConditions) Delete(context.Context, GroupKind, ObjectID, string) error {
+	panic("not implemented: fakeStore.Conditions().Delete")
+}
+
+func (s *fakeStore) Events() storeapi.Events { return fakeEvents{} }
+
+// fakeEvents is fakeStore's event-log family. Sweep answers zero rather than
+// panicking: the GC sweeper runs in every Beehive.
+type fakeEvents struct{}
+
+func (fakeEvents) Add(context.Context, GroupKind, ObjectID, EventsAddInput) error {
+	panic("not implemented: fakeStore.Events().Add")
+}
+
+func (fakeEvents) GetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
+	panic("not implemented: fakeStore.Events().GetLatest")
+}
+
+func (fakeEvents) List(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error) {
+	panic("not implemented: fakeStore.Events().List")
+}
+
+func (fakeEvents) ListSince(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error) {
+	panic("not implemented: fakeStore.Events().ListSince")
+}
+
+func (fakeEvents) MaxVersion(context.Context, ObjectID) (int64, error) {
+	panic("not implemented: fakeStore.Events().MaxVersion")
+}
+
+func (fakeEvents) Snapshot(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error) {
+	panic("not implemented: fakeStore.Events().Snapshot")
+}
+
+func (fakeEvents) Sweep(context.Context, int, time.Duration, int) (int, error) {
+	panic("not implemented: fakeStore.Events().Sweep")
+}
+
+// eventsOverride replaces the hooks that are set and delegates the rest.
+type eventsOverride struct {
+	storeapi.Events
+	getLatest  func(context.Context, ObjectID, string) (*RawEvent, error)
+	list       func(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, error)
+	listSince  func(context.Context, ObjectID, *string, int64, int) ([]RawEvent, int64, error)
+	maxVersion func(context.Context, ObjectID) (int64, error)
+	snapshot   func(context.Context, ObjectID, storeapi.EventQuery) ([]RawEvent, int64, error)
+	sweep      func(context.Context, int, time.Duration, int) (int, error)
+}
+
+func (o eventsOverride) GetLatest(ctx context.Context, id ObjectID, category string) (*RawEvent, error) {
+	if o.getLatest != nil {
+		return o.getLatest(ctx, id, category)
+	}
+	return o.Events.GetLatest(ctx, id, category)
+}
+
+func (o eventsOverride) List(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, error) {
+	if o.list != nil {
+		return o.list(ctx, id, q)
+	}
+	return o.Events.List(ctx, id, q)
+}
+
+func (o eventsOverride) ListSince(ctx context.Context, id ObjectID, cat *string, afterRV int64, limit int) ([]RawEvent, int64, error) {
+	if o.listSince != nil {
+		return o.listSince(ctx, id, cat, afterRV, limit)
+	}
+	return o.Events.ListSince(ctx, id, cat, afterRV, limit)
+}
+
+func (o eventsOverride) MaxVersion(ctx context.Context, id ObjectID) (int64, error) {
+	if o.maxVersion != nil {
+		return o.maxVersion(ctx, id)
+	}
+	return o.Events.MaxVersion(ctx, id)
+}
+
+func (o eventsOverride) Snapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
+	if o.snapshot != nil {
+		return o.snapshot(ctx, id, q)
+	}
+	return o.Events.Snapshot(ctx, id, q)
+}
+
+func (o eventsOverride) Sweep(ctx context.Context, perTimeline int, maxAge time.Duration, capBudget int) (int, error) {
+	if o.sweep != nil {
+		return o.sweep(ctx, perTimeline, maxAge, capBudget)
+	}
+	return o.Events.Sweep(ctx, perTimeline, maxAge, capBudget)
+}
+
+// ReclaimSpace reclaims nothing, which the contract permits. The GC sweeper
+// calls it every tick, so a panic here would reach every Beehive.
+func (s *fakeStore) ReclaimSpace(context.Context, int) (int, error) {
+	return 0, nil
+}
+
+func (s *fakeStore) DriverCursors() storeapi.DriverCursors { return noopDriverCursors{} }
+
+// noopDriverCursors persists nothing, which the contract permits: ok=false is
+// "none stored yet", so a waker over it reseeds from the write log's max every
+// time. cursorStore is the persisting double.
+type noopDriverCursors struct{}
+
+func (noopDriverCursors) Get(context.Context, string) (int64, bool, error) { return 0, false, nil }
+func (noopDriverCursors) Set(context.Context, string, int64) error         { return nil }
 
 // depsStore serves a per-target dependent set from the waker's batched lookup
 // and records what it was asked, so a test can control the exact edges — and
@@ -544,7 +1024,11 @@ type depsStore struct {
 	seen  [][]ObjectID // the id slices each call was asked to resolve
 }
 
-func (s *depsStore) EdgesGroupIncomingByID(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
+func (s *depsStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.fakeStore.Edges(), groupIncomingByID: s.groupIncomingByIDEdges}
+}
+
+func (s *depsStore) groupIncomingByIDEdges(_ context.Context, toIDs []ObjectID, _ Relation) (map[ObjectID][]ObjectRef, error) {
 	s.calls.Add(1)
 	if s.err != nil {
 		return nil, s.err
@@ -581,7 +1065,11 @@ type seedProbe struct {
 	reads   int
 }
 
-func (s *seedProbe) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+func (s *seedProbe) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersionAll: s.maxVersionAllObjectWrites}
+}
+
+func (s *seedProbe) maxVersionAllObjectWrites(context.Context) (int64, int64, error) {
 	s.reads++
 	if s.onRead != nil {
 		s.onRead()
@@ -616,7 +1104,11 @@ type replayStore struct {
 	healFromCall int
 }
 
-func (s *replayStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
+func (s *replayStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.depsStore.ObjectWrites(), maxVersionAll: s.maxVersionAllObjectWrites, listSinceAll: s.listSinceAllObjectWrites}
+}
+
+func (s *replayStore) maxVersionAllObjectWrites(context.Context) (int64, int64, error) {
 	s.marks++
 	if s.seedErr != nil {
 		return 0, 0, s.seedErr
@@ -648,7 +1140,7 @@ func (s *replayStore) failing() bool {
 	return true
 }
 
-func (s *replayStore) ObjectWritesListSinceAll(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *replayStore) listSinceAllObjectWrites(_ context.Context, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	s.pages = append(s.pages, [2]int64{afterRV, int64(limit)})
 	probeSignal(s.lists)
 	if s.failing() {
@@ -679,11 +1171,11 @@ func replayRows(count int) []ObjectWrite {
 	return rows
 }
 
-// cursorStore layers storeapi.DriverCursorer on top of replayStore, so a waker
-// test can script what a durable store already has stored for the waker's
-// cursor name and observe what it writes. A plain *replayStore does not
-// implement DriverCursorer at all — that is what exercises the no-capability
-// fallback — so this is a distinct type rather than a field toggle.
+// cursorStore gives replayStore a real cursor table, so a waker test can script
+// what a durable store already holds for the waker's cursor name and observe what
+// it writes. A plain *replayStore persists nothing and always reports ok=false —
+// that is what exercises the no-persistence fallback — so this is a distinct type
+// rather than a field toggle.
 type cursorStore struct {
 	replayStore
 	stored map[string]int64 // what DriverCursorsGet reports; nil means nothing stored
@@ -698,7 +1190,12 @@ type cursorStore struct {
 	setAttempts int
 }
 
-func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
+func (s *cursorStore) DriverCursors() storeapi.DriverCursors { return cursorStoreCursors{s} }
+
+// cursorStoreCursors is cursorStore's scripted cursor table.
+type cursorStoreCursors struct{ *cursorStore }
+
+func (s cursorStoreCursors) Get(_ context.Context, name string) (int64, bool, error) {
 	if s.getErr != nil {
 		return 0, false, s.getErr
 	}
@@ -706,7 +1203,7 @@ func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, b
 	return v, ok, nil
 }
 
-func (s *cursorStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
+func (s cursorStoreCursors) Set(_ context.Context, name string, cursor int64) error {
 	s.setAttempts++
 	if s.setErr != nil {
 		return s.setErr
@@ -893,7 +1390,7 @@ func findCondition(conds []Condition, condType string) *Condition {
 // itself: a spec change bumps the generation, and this listing is what notices.
 func unsettledIDs(t *testing.T, store Store) []ObjectID {
 	t.Helper()
-	ids, err := store.ObjectsListUnsettledIDs(context.Background(), clientTestGK)
+	ids, err := store.Objects().ListUnsettledIDs(context.Background(), clientTestGK)
 	require.NoError(t, err)
 	return ids
 }
@@ -988,7 +1485,7 @@ func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStat
 // stays a one-liner with no side effects on the owed listings. Tests that assert
 // on the EdgesAddResult or the stamp call the method directly.
 func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relation) error {
-	res, err := store.EdgesAdd(ctx, from, to, relation)
+	res, err := store.Edges().Add(ctx, from, to, relation)
 	if err != nil {
 		return err
 	}
@@ -996,7 +1493,7 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
 		// the source's own kind is needed here — and res.From already carries it,
 		// projected from the endpoint check EdgesAdd had to do anyway.
-		return store.ReconcileOwedDecrement(ctx, res.From, from, 1)
+		return store.ReconcileOwed().Decrement(ctx, res.From, from, 1)
 	}
 	return nil
 }
@@ -1021,7 +1518,7 @@ func objectRefIDs(refs []ObjectRef) []ObjectID {
 // assertions are about which objects are owed a pass, not how many rows say so.
 func staleDependentIDs(t *testing.T, store Store, gk GroupKind) []ObjectID {
 	t.Helper()
-	refs, _, err := store.DependentsListStaleSince(
+	refs, _, err := store.Dependencies().ListStaleSince(
 		context.Background(), []GroupKind{gk}, StalePos{}, math.MaxInt64, 100)
 	require.NoError(t, err)
 	seen := make(map[ObjectID]struct{}, len(refs))
@@ -1054,8 +1551,12 @@ type wakeProbeStore struct {
 	looked   chan struct{} // one send per targetID depends_on lookup
 }
 
-func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error) {
-	refs, err := s.Store.EdgesListIncoming(ctx, toID, relation)
+func (s *wakeProbeStore) Edges() storeapi.Edges {
+	return edgesOverride{Edges: s.Store.Edges(), listIncoming: s.listIncomingEdges, groupIncomingByID: s.groupIncomingByIDEdges}
+}
+
+func (s *wakeProbeStore) listIncomingEdges(ctx context.Context, toID ObjectID, relation Relation) ([]ObjectRef, error) {
+	refs, err := s.Store.Edges().ListIncoming(ctx, toID, relation)
 	if toID == s.targetID {
 		s.note(relation)
 	}
@@ -1065,8 +1566,8 @@ func (s *wakeProbeStore) EdgesListIncoming(ctx context.Context, toID ObjectID, r
 // EdgesGroupIncomingByID is the waker's own lookup (it resolves a whole batch of
 // changed targets in one query), so the probe has to cover it too — otherwise a
 // test waiting on "the waker looked" would wait forever.
-func (s *wakeProbeStore) EdgesGroupIncomingByID(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error) {
-	refs, err := s.Store.EdgesGroupIncomingByID(ctx, toIDs, relation)
+func (s *wakeProbeStore) groupIncomingByIDEdges(ctx context.Context, toIDs []ObjectID, relation Relation) (map[ObjectID][]ObjectRef, error) {
+	refs, err := s.Store.Edges().GroupIncomingByID(ctx, toIDs, relation)
 	if slices.Contains(toIDs, s.targetID) {
 		s.note(relation)
 	}
@@ -1126,8 +1627,8 @@ type listProbeStore struct {
 	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
 	owedListed      chan struct{} // ReconcileOwedListIDs (per-kind)
 	gcSwept         chan struct{} // DeletionRequestsList (global)
-	staleListed     chan struct{} // DependentsListStaleSince (global)
-	watermarkSet    chan struct{} // DependencyWatermarksSet (per successful dependent pass)
+	staleListed     chan struct{} // Dependencies().ListStaleSince (global)
+	watermarkSet    chan struct{} // Dependencies().WatermarkSet (per successful dependent pass)
 
 	// mu guards staleKinds alone. The other fields are channels, but this one is
 	// written by the stale-dependents driver on its own goroutine and read by the
@@ -1148,20 +1649,32 @@ func probeSignal(ch chan struct{}) {
 	}
 }
 
-func (s *listProbeStore) ObjectsListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ObjectsListUnsettledIDs(ctx, gk)
+func (s *listProbeStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), listUnsettledIDs: s.listUnsettledIDsObjects}
+}
+
+func (s *listProbeStore) listUnsettledIDsObjects(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.Objects().ListUnsettledIDs(ctx, gk)
 	probeSignal(s.unsettledListed)
 	return ids, err
 }
 
-func (s *listProbeStore) ReconcileOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
-	ids, err := s.Store.ReconcileOwedListIDs(ctx, gk)
+func (s *listProbeStore) ReconcileOwed() storeapi.ReconcileOwed {
+	return owedOverride{ReconcileOwed: s.Store.ReconcileOwed(), listIDs: s.probeOwedListIDs}
+}
+
+func (s *listProbeStore) probeOwedListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+	ids, err := s.Store.ReconcileOwed().ListIDs(ctx, gk)
 	probeSignal(s.owedListed)
 	return ids, err
 }
 
-func (s *listProbeStore) DeletionRequestsList(ctx context.Context) ([]storeapi.ObjectRef, error) {
-	rows, err := s.Store.DeletionRequestsList(ctx)
+func (s *listProbeStore) DeletionRequests() storeapi.DeletionRequests {
+	return delReqOverride{DeletionRequests: s.Store.DeletionRequests(), list: s.probeDelReqList}
+}
+
+func (s *listProbeStore) probeDelReqList(ctx context.Context) ([]storeapi.ObjectRef, error) {
+	rows, err := s.Store.DeletionRequests().List(ctx)
 	probeSignal(s.gcSwept)
 	return rows, err
 }
@@ -1177,9 +1690,17 @@ func reconcileLoadOf(obj *RawObject, err error) (storeapi.ReconcileLoad, error) 
 	return storeapi.ReconcileLoad{Object: *obj}, nil
 }
 
-// DependentsListStaleSince is the form the sweep calls, so it carries the probe.
-func (s *listProbeStore) DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
-	refs, next, err := s.Store.DependentsListStaleSince(ctx, kinds, after, through, limit)
+func (s *listProbeStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{
+		Dependencies:   s.Store.Dependencies(),
+		listStaleSince: s.probeListStaleSince,
+		watermarkSet:   s.probeWatermarkSet,
+	}
+}
+
+// probeListStaleSince is the form the sweep calls, so it carries the probe.
+func (s *listProbeStore) probeListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
+	refs, next, err := s.Store.Dependencies().ListStaleSince(ctx, kinds, after, through, limit)
 	s.mu.Lock()
 	s.staleKinds = append(s.staleKinds, slices.Clone(kinds))
 	s.mu.Unlock()
@@ -1194,12 +1715,11 @@ func (s *listProbeStore) kindsAsked() [][]GroupKind {
 	return slices.Clone(s.staleKinds)
 }
 
-// DependencyWatermarksSet signals *after* the write, so a test can order a change
-// to a target against the dependent's pass having already recorded what it
-// observed — without which the change might land under the pass and be recorded
-// as seen.
-func (s *listProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
-	err := s.Store.DependencyWatermarksSet(ctx, id, cursor)
+// probeWatermarkSet signals *after* the write, so a test can order a change to a
+// target against the dependent's pass having already recorded what it observed —
+// without which the change might land under the pass and be recorded as seen.
+func (s *listProbeStore) probeWatermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
+	err := s.Store.Dependencies().WatermarkSet(ctx, id, cursor)
 	probeSignal(s.watermarkSet)
 	return err
 }
@@ -1251,38 +1771,42 @@ type pollProbeStore struct {
 	metaErr           atomic.Bool
 }
 
-func (s *pollProbeStore) ObjectWritesMaxVersion(ctx context.Context, gk GroupKind) (int64, error) {
-	at, err := s.Store.ObjectWritesMaxVersion(ctx, gk)
+func (s *pollProbeStore) ObjectWrites() storeapi.ObjectWrites {
+	return writesOverride{ObjectWrites: s.Store.ObjectWrites(), maxVersion: s.maxVersionObjectWrites, snapshot: s.snapshotObjectWrites, snapshotByID: s.snapshotByIDObjectWrites, listSince: s.listSinceObjectWrites}
+}
+
+func (s *pollProbeStore) maxVersionObjectWrites(ctx context.Context, gk GroupKind) (int64, error) {
+	at, err := s.Store.ObjectWrites().MaxVersion(ctx, gk)
 	probeSignal(s.polled)
 	return at, err
 }
 
 // The snapshot reads are the watch's first read, so they carry the same failure
 // injection and the same signal as the listing they replaced.
-func (s *pollProbeStore) ObjectWritesSnapshot(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error) {
+func (s *pollProbeStore) snapshotObjectWrites(ctx context.Context, gk GroupKind) ([]*RawObject, int64, error) {
 	if s.listErr.Load() {
 		return nil, 0, errBoom
 	}
-	out, at, err := s.Store.ObjectWritesSnapshot(ctx, gk)
+	out, at, err := s.Store.ObjectWrites().Snapshot(ctx, gk)
 	probeSignal(s.listed)
 	return out, at, err
 }
 
-func (s *pollProbeStore) ObjectWritesSnapshotByID(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error) {
+func (s *pollProbeStore) snapshotByIDObjectWrites(ctx context.Context, gk GroupKind, id ObjectID) ([]*RawObject, int64, error) {
 	if s.getErr.Load() {
 		return nil, 0, errBoom
 	}
-	return s.Store.ObjectWritesSnapshotByID(ctx, gk, id)
+	return s.Store.ObjectWrites().SnapshotByID(ctx, gk, id)
 }
 
 // ObjectWritesListSince is the tail's own listing: it carries listErr and signals
 // after the read, which is the seam the cancellation tests need — past it the only
 // thing left that can observe a cancelled context is the send itself.
-func (s *pollProbeStore) ObjectWritesListSince(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
+func (s *pollProbeStore) listSinceObjectWrites(ctx context.Context, gk GroupKind, afterRV int64, limit int) ([]ObjectWrite, int64, error) {
 	if s.listErr.Load() {
 		return nil, 0, errBoom
 	}
-	page, trimmed, err := s.Store.ObjectWritesListSince(ctx, gk, afterRV, limit)
+	page, trimmed, err := s.Store.ObjectWrites().ListSince(ctx, gk, afterRV, limit)
 	if forced := s.forceTrimmed.Load(); forced > 0 {
 		trimmed = forced
 	}
@@ -1291,20 +1815,24 @@ func (s *pollProbeStore) ObjectWritesListSince(ctx context.Context, gk GroupKind
 }
 
 // ObjectsList signals *after* the read returns.
-func (s *pollProbeStore) ObjectsList(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
+func (s *pollProbeStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.Store.Objects(), list: s.listObjects, listByIDs: s.listByIDsObjects, listIDs: s.listIDsObjects, get: s.getObjects, getMeta: s.getMetaObjects}
+}
+
+func (s *pollProbeStore) listObjects(ctx context.Context, gk GroupKind) ([]*RawObject, error) {
 	if s.listErr.Load() {
 		return nil, errBoom
 	}
-	out, err := s.Store.ObjectsList(ctx, gk)
+	out, err := s.Store.Objects().List(ctx, gk)
 	probeSignal(s.listed)
 	return out, err
 }
 
-func (s *pollProbeStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
+func (s *pollProbeStore) listByIDsObjects(ctx context.Context, gk GroupKind, ids []ObjectID) ([]*RawObject, error) {
 	if s.getErr.Load() {
 		return nil, errBoom
 	}
-	out, err := s.Store.ObjectsListByIDs(ctx, gk, ids)
+	out, err := s.Store.Objects().ListByIDs(ctx, gk, ids)
 	select {
 	case s.byIDs <- ids:
 	default:
@@ -1312,39 +1840,48 @@ func (s *pollProbeStore) ObjectsListByIDs(ctx context.Context, gk GroupKind, ids
 	return out, err
 }
 
-func (s *pollProbeStore) ObjectsListIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
+func (s *pollProbeStore) listIDsObjects(ctx context.Context, gk GroupKind) ([]ObjectID, error) {
 	if s.listIDsErr.Load() {
 		return nil, errBoom
 	}
-	return s.Store.ObjectsListIDs(ctx, gk)
+	return s.Store.Objects().ListIDs(ctx, gk)
 }
 
-func (s *pollProbeStore) ObjectsGet(ctx context.Context, id ObjectID) (*RawObject, error) {
+func (s *pollProbeStore) getObjects(ctx context.Context, id ObjectID) (*RawObject, error) {
 	if s.getErr.Load() {
 		return nil, errBoom
 	}
-	return s.Store.ObjectsGet(ctx, id)
+	return s.Store.Objects().Get(ctx, id)
 }
 
 // ObjectsGetMeta is the event watch's per-tick read, so it signals on every call —
 // error or not — which is what a test waiting out a failing phase needs.
-func (s *pollProbeStore) ObjectsGetMeta(ctx context.Context, id ObjectID) (*RawObject, error) {
+func (s *pollProbeStore) getMetaObjects(ctx context.Context, id ObjectID) (*RawObject, error) {
 	defer probeSignal(s.metaRead)
 	if s.metaErr.Load() {
 		return nil, errBoom
 	}
-	return s.Store.ObjectsGetMeta(ctx, id)
+	return s.Store.Objects().GetMeta(ctx, id)
 }
 
 // EventsListSince is the event reader's own page read: it carries eventsErr and
 // signals after the read, which is the seam the cancellation test needs — past
 // it the only thing left that can observe a cancelled context is the send.
-func (s *pollProbeStore) EventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) ([]RawEvent, int64, error) {
+func (s *pollProbeStore) Events() storeapi.Events {
+	return eventsOverride{
+		Events:     s.Store.Events(),
+		listSince:  s.eventsListSince,
+		maxVersion: s.eventsMaxVersion,
+		snapshot:   s.eventsSnapshot,
+	}
+}
+
+func (s *pollProbeStore) eventsListSince(ctx context.Context, id ObjectID, category *string, afterRV int64, limit int) ([]RawEvent, int64, error) {
 	if s.eventsErr.Load() {
 		probeSignal(s.eventsFailed)
 		return nil, 0, errBoom
 	}
-	page, trimmed, err := s.Store.EventsListSince(ctx, id, category, afterRV, limit)
+	page, trimmed, err := s.Store.Events().ListSince(ctx, id, category, afterRV, limit)
 	if forced := s.forceEventTrimmed.Load(); forced > 0 {
 		trimmed = forced
 	}
@@ -1354,18 +1891,18 @@ func (s *pollProbeStore) EventsListSince(ctx context.Context, id ObjectID, categ
 
 // EventsSnapshot and EventsMaxVersion are the reads only the subscribe path
 // makes, each with its own fault so a test can drive one at a time.
-func (s *pollProbeStore) EventsSnapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
+func (s *pollProbeStore) eventsSnapshot(ctx context.Context, id ObjectID, q storeapi.EventQuery) ([]RawEvent, int64, error) {
 	if s.eventsSnapErr.Load() {
 		return nil, 0, errBoom
 	}
-	return s.Store.EventsSnapshot(ctx, id, q)
+	return s.Store.Events().Snapshot(ctx, id, q)
 }
 
-func (s *pollProbeStore) EventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
+func (s *pollProbeStore) eventsMaxVersion(ctx context.Context, id ObjectID) (int64, error) {
 	if s.markErr.Load() {
 		return 0, errBoom
 	}
-	return s.Store.EventsMaxVersion(ctx, id)
+	return s.Store.Events().MaxVersion(ctx, id)
 }
 
 // watchFixture wires a Beehive with one registered kind over a probe store — the

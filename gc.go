@@ -34,7 +34,7 @@ import "context"
 // per kind rather than per child because it is cross-kind and coalesces anyway.
 func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, err error) {
 	err = bh.store.Within(ctx, func(ctx context.Context) error {
-		obj, err := bh.store.ObjectsGetMeta(ctx, id)
+		obj, err := bh.store.Objects().GetMeta(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -47,7 +47,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// kind: a wide cascade would otherwise queue one commit hook per row
 		// for wakes that coalesce anyway. Ungated on Marked, unlike the push: a
 		// re-cascade's wake reads one position and finds nothing.
-		cascade, err := bh.store.DeletionRequestsCreateFromOwner(ctx, id)
+		cascade, err := bh.store.DeletionRequests().CreateFromOwner(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -77,12 +77,12 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// Drop depends_on edges from finalizing dependents first, or two
 		// deletion-pending objects that depend on each other would hold each
 		// other's RESTRICT forever. owned_by edges are left for the cascade.
-		if err := bh.store.EdgesDeleteFinalizingDependsOn(ctx, id); err != nil {
+		if err := bh.store.Edges().DeleteFinalizingDependsOn(ctx, id); err != nil {
 			return err
 		}
 		// Still referenced: RESTRICT forbids the delete. A later sweep retries
 		// once the referrer is gone.
-		referenced, err := bh.store.EdgesHasIncoming(ctx, id)
+		referenced, err := bh.store.Edges().HasIncoming(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -91,8 +91,8 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 
 		// Read before the delete: edges.from_id is ON DELETE CASCADE. owned_by
-		// only: EdgesHasIncoming discounts depends_on from a deleting source.
-		owners, err := bh.store.EdgesListOutgoingByRelation(ctx, id, RelationOwnedBy)
+		// only: Edges().HasIncoming discounts depends_on from a deleting source.
+		owners, err := bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationOwnedBy)
 		if err != nil {
 			return err
 		}
@@ -100,7 +100,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		// would spin, since requeueNow bypasses the re-enqueue floor.
 		var blocked []ObjectRef
 		for _, owner := range owners {
-			meta, err := bh.store.ObjectsGetMeta(ctx, owner.ID)
+			meta, err := bh.store.Objects().GetMeta(ctx, owner.ID)
 			if err != nil {
 				return err
 			}
@@ -108,7 +108,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 				blocked = append(blocked, owner)
 			}
 		}
-		if err := bh.store.ObjectsDelete(ctx, id); err != nil {
+		if err := bh.store.Objects().Delete(ctx, id); err != nil {
 			return err
 		}
 		bh.signalKindWritten(ctx, GroupKind{Group: obj.Group, Kind: obj.Kind})

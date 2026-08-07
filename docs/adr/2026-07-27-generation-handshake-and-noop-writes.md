@@ -28,14 +28,14 @@ a bug regardless of whether the bytes changed.
 ## The content no-op splits the two halves of the write
 
 Every mutator skips a write whose bytes already match what is stored:
-`ObjectsUpdateSpec`, `FinalizersDelete`, `ConditionsDelete` and `UpdateStatus`. No
+`Objects().UpdateSpec`, `Objects().DeleteFinalizer`, `Conditions().Delete` and `UpdateStatus`. No
 `resource_version` bump, no `updated_at`. Otherwise a watch poll would report a change
 that didn't happen, and any dependent riding on this kind's status would reconcile for
 nothing on every unchanged pass.
 
 `UpdateStatus` is different in one way: it also carries `observed_generation` and
 `observed_at`, which record *that the controller ran*, not what it wrote — and
-`ObjectsListUnsettledIDs` selects on `observed_generation < generation`. So the no-op
+`Objects().ListUnsettledIDs` selects on `observed_generation < generation`. So the no-op
 branch still advances those two columns when they would move. Skipping them would
 leave a genuinely converged object unsettled and re-queued forever.
 
@@ -66,7 +66,7 @@ row per version bump, which a level-triggered loop absorbs.
 ## The stamp is never downward, on either branch
 
 One rule, `stampVersion(stored, incoming)` — the write-side twin of `convertBlob`,
-applied by both `ObjectsUpdateSpec` and `UpdateStatus` to the content no-op *and* the real
+applied by both `Objects().UpdateSpec` and `UpdateStatus` to the content no-op *and* the real
 content write:
 
 - `incoming == 0` is "no opinion" (kind unversioned, or this build lost the

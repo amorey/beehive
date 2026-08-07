@@ -14,7 +14,7 @@ that logged it and carried on committed every write that had already landed.
 
 Any pair of writes was therefore atomic only by the grace of its callers.
 
-`EdgesAdd` shows both the local escape and its limit. Issuing the `reconcile_owed`
+`Edges().Add` shows both the local escape and its limit. Issuing the `reconcile_owed`
 stamp as a second store call after the edge insert would let a caller that swallowed
 the stamp's error commit an edge with no stamp — the stranded dependent that
 [the stamp-every-new-edge ADR](2026-07-29-stamp-every-new-dependency-edge.md) exists
@@ -73,7 +73,7 @@ Seven things make it correct rather than merely plausible:
   height is the rightful next one; a mismatch returns `ErrConcurrentNestedTx`.
   Serialising instead would deadlock as soon as `fn` waited on another goroutine that
   also wanted the store. Ordinary depth is not a concurrency signal — a
-  `ControllerClient.Within` around a `Client.Create` around `ObjectsCreate`'s
+  `ControllerClient.Within` around a `Client.Create` around `Objects().Create`'s
   self-wrap is three frames in production.
 
   The entry check is a tripwire, not a lock. It sees nested `Within`s; a store call
@@ -155,15 +155,15 @@ A recover here would turn a panic into a half-committed transaction.
 
 ## Consequences
 
-**`EdgesAdd`'s reverse residual is gone.** `EdgesAdd` self-wraps, so a failed insert
+**`Edges().Add`'s reverse residual is gone.** `Edges().Add` self-wraps, so a failed insert
 now unwinds the stamp issued ahead of it; a caller that swallows the error commits
 neither. `TestRefsAddEdgeFailureLeavesStamp` pinned that residual as a tolerated cost
 and is renamed to `…UnwindsTheStamp` to pin its absence. The ordering argument is
-unaffected and still governs `EdgesAdd`: stamp-then-insert is chosen because the
+unaffected and still governs `Edges().Add`: stamp-then-insert is chosen because the
 opposite leaves an edge with no wake, which nothing re-derives. Savepoints make the
 failure atomic; they do not make the ordering arbitrary.
 
-**Cost, measured.** One outer `Within` enclosing eight self-wrapping `ObjectsCreate`
+**Cost, measured.** One outer `Within` enclosing eight self-wrapping `Objects().Create`
 calls — the shape `gcCollect` and the owed pass run on, and the worst case for this
 change, since the savepoints are the largest share of the work they will ever be:
 
@@ -197,6 +197,6 @@ signature moved. `fakeStore` satisfies it only vacuously (it opens no transactio
 there is nothing to unwind, while its in-memory mutations would not unwind) — no test
 may use it to exercise the guarantee.
 
-**Not done, deliberately:** `EdgesAdd`'s ordering is left alone. The boundary makes
+**Not done, deliberately:** `Edges().Add`'s ordering is left alone. The boundary makes
 the reordering unnecessary, not wrong, and undoing it would mix a mechanism change
 with an invariant that the `synchronous=NORMAL` argument leans on.

@@ -1,14 +1,14 @@
 # The dependency waker persists its scan cursor, as an optimisation over the stale-dependents pass
 
 - **Status:** Accepted — implemented in `sqlite/migrations/0001_init.sql`
-  (`driver_cursors`), `internal/storeapi/storeapi.go` (`DriverCursorer`),
+  (`driver_cursors`), `internal/storeapi/storeapi.go` (`Store.DriverCursors*`),
   `store.go`, `sqlite/store.go`, `waker.go`, `beehive.go`.
 - **Date:** 2026-07-30
 
 ## Context
 
 The waker's scan watermark (`waker.watermark`) was in-memory only. `seed` took
-`ObjectWritesMaxVersion` at startup, so every restart discarded whatever interval
+`ObjectWrites().MaxVersion` at startup, so every restart discarded whatever interval
 the process had been down for: writes committed while nothing was running sat
 below the new watermark and were never scanned by this driver. That was not a
 correctness gap — [the dependency-watermarks ADR](2026-07-29-dependency-watermarks.md)
@@ -36,19 +36,21 @@ This is that version, built on top of the ground truth rather than replacing it.
 **Persist the watermark; keep everything downstream of it exactly as
 approximate as it already was.**
 
-### `DriverCursorer`, an optional capability
+### Cursor persistence, a required `Store` member
 
 ```go
-type DriverCursorer interface {
-    DriverCursorsGet(ctx context.Context, name string) (cursor int64, ok bool, err error)
-    DriverCursorsSet(ctx context.Context, name string, cursor int64) error
-}
+// Store.DriverCursors()
+Get(ctx context.Context, name string) (cursor int64, ok bool, err error)
+Set(ctx context.Context, name string, cursor int64) error
 ```
 
-Not a `Store` member, for the same reason `FreePagesReleaser` is not: a `Store`
-that doesn't implement it is simply not resumed across restarts — the waker's
-original, tested behaviour — rather than every implementation and test double
-having to answer a question only some of them need to. `ok bool` rather than
+This began as an optional `DriverCursorer` the waker type-asserted, so a `Store`
+that didn't implement it was simply not resumed across restarts — the waker's
+original, tested behaviour. It is now required, because `ok=false` already says
+exactly that: a backend that persists nothing reports absence forever, reseeds
+from the write log's max every restart, and the stale-dependents pass covers the
+gap as it always did. The optionality bought a nil check rather than any
+semantics. `ok bool` rather than
 `ErrNotFound` marks absence as the normal first-run state rather than a fault;
 `ErrNotFound`'s own contract scopes it to "no object matches", and zero is a
 legitimate cursor value on an empty store, so it cannot double as "no cursor"
@@ -57,8 +59,8 @@ the way it can for `Get`/`GetOrCreate`.
 The sqlite implementation is `driver_cursors`, one row per driver name (one row
 today: `"dependency_waker"`), `WITHOUT ROWID` because the key is `TEXT` rather
 than the `INTEGER PRIMARY KEY`-aliases-the-rowid case `dependency_watermarks`
-makes its own rowid argument on. `DriverCursorsSet` is the same monotone,
-self-suppressing upsert as `DependencyWatermarksSet`: a lower cursor is refused,
+makes its own rowid argument on. `DriverCursors().Set` is the same monotone,
+self-suppressing upsert as `Dependencies().WatermarkSet`: a lower cursor is refused,
 and a cursor that hasn't advanced dirties no page — load-bearing at a 1s tick
 rate on a store that may otherwise be idle. Single-writer, and documented as
 such in the migration comment: nothing in this project documents or tests two
@@ -68,7 +70,7 @@ keep true rather than a gap to close.
 ### Seed clamps rather than trusts or resets
 
 `seed` reads the stored cursor and takes `min(stored, max)` against
-`ObjectWritesMaxVersion`, never the stored value outright. `max` is a max over
+`ObjectWrites().MaxVersion`, never the stored value outright. `max` is a max over
 *live* rows, so deleting the highest-versioned object legitimately lowers it
 below a cursor the waker really did process — a stored cursor above `max` is
 therefore not evidence of a swapped or truncated database. Clamping down costs
@@ -87,7 +89,7 @@ the next tick and the persisted cursor carries it across restarts.
 **There is deliberately no second bound on how far behind a cursor may be before
 `seed` abandons it.** An earlier revision had one, keyed on `max - stored`, and
 it was wrong in a way no tuning fixes: that distance is in `resource_version`
-units, and `EventsAdd` draws from the same sequence without writing anything
+units, and `Events().Add` draws from the same sequence without writing anything
 this scan reads. A store logging events at any rate inflates the gap by an
 unbounded factor against the object rows actually behind it, so the threshold
 fires on backlogs that were a few ticks of work and throws away a cursor that
@@ -152,7 +154,7 @@ scheduled sit *above* it and are scanned on the next tick. The race survives
 only on the very first start of a fresh database, where there is nothing stored
 yet and the fallback is `max`, as before. That weakens the case for seeding
 synchronously in `Start` without removing it — and a synchronous seed would now
-read *two* rows (`ObjectWritesMaxVersion` and `DriverCursorsGet`) inside
+read *two* rows (`ObjectWrites().MaxVersion` and `DriverCursors().Get`) inside
 `Start`'s critical section instead of one, which is the same hesitation that
 item already records, doubled.
 

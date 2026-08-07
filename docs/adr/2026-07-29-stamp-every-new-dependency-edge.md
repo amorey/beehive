@@ -1,6 +1,6 @@
 # Every new depends_on edge stamps a durable owed reconcile
 
-- **Status:** Accepted — implemented in `sqlite/store.go` (`EdgesAdd`,
+- **Status:** Accepted — implemented in `sqlite/store.go` (`Edges().Add`,
   `reconcile_owed`), `reconciler.go` (drain). Replaces
   `2026-07-27-caller-versioned-dependencies.md`, whose conditional stamp left one
   strand; everything from it that still governs live code is folded in below.
@@ -18,7 +18,7 @@ clearing the dependent's `dependency_watermarks` row so the stale-dependents pas
 would find it (an absent row means stale).
 
 That left exactly one interleaving uncovered, and it was a strand rather than
-latency: a **third party declaring between a dependent's `ObjectsGetForReconcile`
+latency: a **third party declaring between a dependent's `Objects().GetForReconcile`
 and that dependent's own watermark write**. The in-flight pass — which never read
 the new target — rewrote the row the declare had just cleared, from a load cursor
 that may already sit above the quiet target's version. The dependent then read as
@@ -28,13 +28,13 @@ re-derives it concurrently; only recorded owed work can.
 
 ## Decision
 
-`EdgesAdd` increments `fromID`'s `objects.reconcile_owed` for **every `depends_on`
+`Edges().Add` increments `fromID`'s `objects.reconcile_owed` for **every `depends_on`
 edge the call creates**, unconditionally. Self-edges are
 excluded, as every scan excludes them: an object's own pass always reads its
 current self, so a self-wake has nothing to deliver. Owner edges stamp nothing —
 an `owned_by` edge is not a dependency.
 
-This is sound under every interleaving because `ReconcileOwedDecrement` subtracts
+This is sound under every interleaving because `ReconcileOwed().Decrement` subtracts
 only the count the pass observed at *load*: a stamp landing mid-pass sits above
 that count, survives the subtraction, and keeps the object owed for the owed pass —
 the property the count was built with (see "a count, not a flag" below).
@@ -50,7 +50,7 @@ the conjunction, and it now costs what it costs rather than being subsidised by 
 correctness hole.
 
 The `targetResourceVersion` parameter is removed outright, from
-`ControllerClient.DependenciesAdd` and `Store.EdgesAdd`, along with
+`ControllerClient.DependenciesAdd` and `Store.Edges().Add`, along with
 `ErrTargetResourceVersionFuture`. Once the stamp stopped conditioning on it, the
 claim's only remaining job was a pre-write sanity check — rejecting a version
 above the target's current one as "read from the wrong object". That rejection
@@ -72,26 +72,26 @@ the window until the stamped pass runs and rewrites it honestly.
 
 **The wake is durable, so a crash can't lose it.** The count *is* the wake — there
 is no in-memory requeue beside it to race — and `enqueueOwedPass` drains
-`ReconcileOwedListIDs` at startup unconditionally (not gated on the startup full
+`ReconcileOwed().ListIDs` at startup unconditionally (not gated on the startup full
 pass), so a process that dies the instant after the commit finds the row still owed
 on restart.
 
-**The stamp is inside `EdgesAdd`, and before the insert.** A nested `Within` is a
+**The stamp is inside `Edges().Add`, and before the insert.** A nested `Within` is a
 bare `fn(ctx)` that unwinds nothing, so a stamp issued as a second store call after
-`EdgesAdd` returned would let a caller that swallows the error commit the edge with
+`Edges().Add` returned would let a caller that swallows the error commit the edge with
 no wake — the stranded dependent this mechanism exists to prevent. Ordering points
 the leftover failure the harmless way: a stamp with no edge is one spurious owed
 wake that drains back to 0, while an edge with no stamp is invisible forever. The
 stamp's own `WHERE … NOT EXISTS` is the **only** edge-new test (a probe down the
 `WITHOUT ROWID` primary key, so no pre-read), shared verbatim with the watermark
 clear via the `edgeIsNew` const so the two cannot drift. Every other fallible step
-sits on the same side of the insert for the same reason. `EdgesAdd` self-wraps in
+sits on the same side of the insert for the same reason. `Edges().Add` self-wraps in
 `Within`, so endpoint check, stamp, clear and insert are one atomic unit however it
 is called.
 
 **The stamp lands on `fromID`'s row and is routed by `fromID`'s kind.** The edge is
 cross-kind, so the pass it buys runs on the dependent's reconciler, not the
-declarer's; `ReconcileOwedListIDs` is per-kind, so each reconciler picks up only
+declarer's; `ReconcileOwed().ListIDs` is per-kind, so each reconciler picks up only
 its own rows.
 
 **The stamp is not gated on `fromID`'s kind being registered.** The store cannot
@@ -105,7 +105,7 @@ cross-kind sweeper that would reclaim it is unbuilt, in `docs/TODO.md`.
 it loaded, floored at 0. Increments landing after the load survive; subtracting
 `observed` rather than 1 leaves no remainder that nothing would re-queue.
 `ReconcileOwedIncrement` stays off the `Store` interface so "the stamp rides
-`EdgesAdd`" is true at compile time; it exists on the concrete sqlite store for
+`Edges().Add`" is true at compile time; it exists on the concrete sqlite store for
 tests and future non-edge producers.
 
 ## Consequences
@@ -124,6 +124,6 @@ tests and future non-edge producers.
   `TestRefsAddStampsOnlyNewEdge` pin the once-per-edge bound where their
   predecessors pinned the per-claim conditions.
 - With the claim gone, `DependenciesAdd(ctx, fromID, toID)` and
-  `EdgesAdd(ctx, fromID, toID, relation)` are the whole declare surface; the
+  `Edges().Add(ctx, fromID, toID, relation)` are the whole declare surface; the
   version-guard tests (`TestAddDependencyRejectsFutureResourceVersion` and kin)
   went with the error they pinned.
