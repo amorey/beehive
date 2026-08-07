@@ -707,7 +707,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	enqueue := sd.bh.enqueuerForPage()
 	pos := staleResumeAt(sd.cursor)
 	for {
-		page, next, err := sd.bh.store.DependentsListStaleSince(ctx, sd.kinds, pos, mark, staleDependentsPageCap)
+		page, next, err := sd.bh.store.Dependencies().ListStaleSince(ctx, sd.kinds, pos, mark, staleDependentsPageCap)
 		if err != nil {
 			abandon("listing stale dependents failed; the next pass resumes from the same cursor", pos, err)
 			return

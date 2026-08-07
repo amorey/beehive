@@ -407,11 +407,42 @@ func (s *fakeStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
 	return 0, nil
 }
 
-// DependentsListStaleSince answers empty like the listings above it, rather than
-// panicking: the stale-dependents driver runs in every Beehive that has
-// controllers, so a panic would make the fake unusable for anything calling Start.
-func (s *fakeStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]storeapi.ObjectRef, StalePos, error) {
+func (s *fakeStore) Dependencies() storeapi.Dependencies { return fakeDependencies{} }
+
+// fakeDependencies is fakeStore's dependency family. ListStaleSince answers
+// empty rather than panicking: the stale-dependents driver runs in every Beehive
+// that has controllers, so a panic would make the fake unusable for anything
+// calling Start.
+type fakeDependencies struct{}
+
+func (fakeDependencies) ListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]storeapi.ObjectRef, StalePos, error) {
 	return nil, after, nil
+}
+
+func (fakeDependencies) WatermarkSet(context.Context, ObjectID, int64) error {
+	panic("not implemented: fakeStore.Dependencies().WatermarkSet")
+}
+
+// depsOverride replaces the hooks that are set on a real Dependencies and
+// delegates the rest, so a probe needs no wrapper type of its own.
+type depsOverride struct {
+	storeapi.Dependencies
+	listStaleSince func(context.Context, []GroupKind, StalePos, int64, int) ([]storeapi.ObjectRef, StalePos, error)
+	watermarkSet   func(context.Context, ObjectID, int64) error
+}
+
+func (d depsOverride) ListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
+	if d.listStaleSince != nil {
+		return d.listStaleSince(ctx, kinds, after, through, limit)
+	}
+	return d.Dependencies.ListStaleSince(ctx, kinds, after, through, limit)
+}
+
+func (d depsOverride) WatermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
+	if d.watermarkSet != nil {
+		return d.watermarkSet(ctx, id, cursor)
+	}
+	return d.Dependencies.WatermarkSet(ctx, id, cursor)
 }
 func (s *fakeStore) ObjectsUpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.ObjectsUpdateSpec")
@@ -511,10 +542,6 @@ func (s *fakeStore) EdgesDeleteFinalizingDependsOn(context.Context, ObjectID) er
 }
 func (s *fakeStore) EdgesHasIncoming(context.Context, ObjectID) (bool, error) {
 	return false, nil
-}
-
-func (s *fakeStore) DependencyWatermarksSet(context.Context, ObjectID, int64) error {
-	panic("not implemented: fakeStore.DependencyWatermarksSet")
 }
 
 func (s *fakeStore) ObjectWritesListSince(context.Context, GroupKind, int64, int) ([]storeapi.ObjectWrite, int64, error) {
@@ -1063,7 +1090,7 @@ func objectRefIDs(refs []ObjectRef) []ObjectID {
 // assertions are about which objects are owed a pass, not how many rows say so.
 func staleDependentIDs(t *testing.T, store Store, gk GroupKind) []ObjectID {
 	t.Helper()
-	refs, _, err := store.DependentsListStaleSince(
+	refs, _, err := store.Dependencies().ListStaleSince(
 		context.Background(), []GroupKind{gk}, StalePos{}, math.MaxInt64, 100)
 	require.NoError(t, err)
 	seen := make(map[ObjectID]struct{}, len(refs))
@@ -1168,8 +1195,8 @@ type listProbeStore struct {
 	unsettledListed chan struct{} // ObjectsListUnsettledIDs (per-kind)
 	owedListed      chan struct{} // ReconcileOwedListIDs (per-kind)
 	gcSwept         chan struct{} // DeletionRequestsList (global)
-	staleListed     chan struct{} // DependentsListStaleSince (global)
-	watermarkSet    chan struct{} // DependencyWatermarksSet (per successful dependent pass)
+	staleListed     chan struct{} // Dependencies().ListStaleSince (global)
+	watermarkSet    chan struct{} // Dependencies().WatermarkSet (per successful dependent pass)
 
 	// mu guards staleKinds alone. The other fields are channels, but this one is
 	// written by the stale-dependents driver on its own goroutine and read by the
@@ -1219,9 +1246,17 @@ func reconcileLoadOf(obj *RawObject, err error) (storeapi.ReconcileLoad, error) 
 	return storeapi.ReconcileLoad{Object: *obj}, nil
 }
 
-// DependentsListStaleSince is the form the sweep calls, so it carries the probe.
-func (s *listProbeStore) DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
-	refs, next, err := s.Store.DependentsListStaleSince(ctx, kinds, after, through, limit)
+func (s *listProbeStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{
+		Dependencies:   s.Store.Dependencies(),
+		listStaleSince: s.probeListStaleSince,
+		watermarkSet:   s.probeWatermarkSet,
+	}
+}
+
+// probeListStaleSince is the form the sweep calls, so it carries the probe.
+func (s *listProbeStore) probeListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]storeapi.ObjectRef, StalePos, error) {
+	refs, next, err := s.Store.Dependencies().ListStaleSince(ctx, kinds, after, through, limit)
 	s.mu.Lock()
 	s.staleKinds = append(s.staleKinds, slices.Clone(kinds))
 	s.mu.Unlock()
@@ -1236,12 +1271,11 @@ func (s *listProbeStore) kindsAsked() [][]GroupKind {
 	return slices.Clone(s.staleKinds)
 }
 
-// DependencyWatermarksSet signals *after* the write, so a test can order a change
-// to a target against the dependent's pass having already recorded what it
-// observed — without which the change might land under the pass and be recorded
-// as seen.
-func (s *listProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
-	err := s.Store.DependencyWatermarksSet(ctx, id, cursor)
+// probeWatermarkSet signals *after* the write, so a test can order a change to a
+// target against the dependent's pass having already recorded what it observed —
+// without which the change might land under the pass and be recorded as seen.
+func (s *listProbeStore) probeWatermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
+	err := s.Store.Dependencies().WatermarkSet(ctx, id, cursor)
 	probeSignal(s.watermarkSet)
 	return err
 }

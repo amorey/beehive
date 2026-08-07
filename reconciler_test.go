@@ -3131,12 +3131,16 @@ type watermarkProbeStore struct {
 	err  error
 }
 
-func (s *watermarkProbeStore) DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error {
+func (s *watermarkProbeStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{Dependencies: s.Store.Dependencies(), watermarkSet: s.watermarkSet}
+}
+
+func (s *watermarkProbeStore) watermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
 	s.sets = append(s.sets, id)
 	if s.err != nil {
 		return s.err
 	}
-	return s.Store.DependencyWatermarksSet(ctx, id, cursor)
+	return s.Store.Dependencies().WatermarkSet(ctx, id, cursor)
 }
 
 // TestReconcileSkipsDependencyWatermarkWithoutDependencies pins the skip: an

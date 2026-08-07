@@ -4537,7 +4537,7 @@ func TestRefsAddWatermarkClearFailurePropagates(t *testing.T) {
 	old := newRefObject(t, store)
 	a := newDependentObject(t, store, old.ID) // the edge the watermark write gates on
 	b := newRefObject(t, store)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, a.ID, 42))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, a.ID, 42))
 	blockWatermarkDeletes(t, store)
 
 	_, err := store.EdgesAdd(ctx, a.ID, b.ID, "depends_on")
@@ -6189,7 +6189,7 @@ func TestDependencyWatermarksSetRecordsTheCursor(t *testing.T) {
 	target := newRefObject(t, store)
 	dep := newDependentObject(t, store, target.ID)
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 42))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 42))
 
 	against, at, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok, "a dependent's pass records a watermark")
@@ -6206,13 +6206,13 @@ func TestDependencyWatermarksSetGatesOnOutgoingDependsOn(t *testing.T) {
 	owner := newRefObject(t, store)
 
 	lone := newRefObject(t, store)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, lone.ID, 7))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, lone.ID, 7))
 	_, _, ok := readWatermark(t, store, lone.ID)
 	assert.False(t, ok, "an object with no edges gets no row")
 
 	owned := newRefObject(t, store)
 	require.NoError(t, addEdge(ctx, store, owned.ID, owner.ID, beehive.RelationOwnedBy))
-	require.NoError(t, store.DependencyWatermarksSet(ctx, owned.ID, 7))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, owned.ID, 7))
 	_, _, ok = readWatermark(t, store, owned.ID)
 	assert.False(t, ok, "owned_by is not a dependency")
 }
@@ -6223,8 +6223,8 @@ func TestDependencyWatermarksSetUpserts(t *testing.T) {
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 20))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 10))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 20))
 
 	against, _, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
@@ -6240,7 +6240,7 @@ func TestDependencyWatermarksSetSkipsCollectedObject(t *testing.T) {
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 5))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 5))
 
 	_, _, ok := readWatermark(t, store, dep.ID)
 	assert.False(t, ok)
@@ -6254,7 +6254,7 @@ func TestDependencyWatermarksSetBumpsNoResourceVersion(t *testing.T) {
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 9))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 9))
 
 	probe.expectNone()
 }
@@ -6264,7 +6264,7 @@ func TestDependencyWatermarksCascadeOnObjectDelete(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 3))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 3))
 
 	require.NoError(t, store.ObjectsDelete(ctx, dep.ID))
 
@@ -6289,8 +6289,8 @@ func TestDependencyWatermarksSetNeverRegresses(t *testing.T) {
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 20))
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 5))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 20))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 5))
 
 	against, _, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
@@ -6306,15 +6306,15 @@ func TestDependencyWatermarksSetMovesReconciledAtOnlyWithTheCursor(t *testing.T)
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
 	const sentinel = int64(1)
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 10))
 	stampWatermarkAt(t, store, dep.ID, sentinel)
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 10))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 10))
 	_, at, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
 	assert.Equal(t, sentinel, at, "re-applying the same cursor rewrites nothing")
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, 11))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, 11))
 	against, at, ok := readWatermark(t, store, dep.ID)
 	require.True(t, ok)
 	assert.Equal(t, int64(11), against)
@@ -6475,7 +6475,7 @@ func staleIDs(t *testing.T, store beehive.Store) []beehive.ObjectID {
 // rows themselves.
 func staleRefs(t *testing.T, store beehive.Store, kinds ...beehive.GroupKind) []beehive.ObjectRef {
 	t.Helper()
-	refs, _, err := store.DependentsListStaleSince(context.Background(),
+	refs, _, err := store.Dependencies().ListStaleSince(context.Background(),
 		kinds, beehive.StalePos{}, math.MaxInt64, 100)
 	require.NoError(t, err)
 	return refs
@@ -6501,13 +6501,13 @@ func TestDependentsListStaleSinceFindsMovedTargets(t *testing.T) {
 	ctx := context.Background()
 	target := newRefObject(t, store)
 	dep := newDependentObject(t, store, target.ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 	require.Empty(t, staleIDs(t, store), "nothing has moved since the watermark")
 
 	moveTarget(t, store, target.ID)
 	assert.Equal(t, []beehive.ObjectID{dep.ID}, staleIDs(t, store))
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 	assert.Empty(t, staleIDs(t, store), "a pass that observed the change settles it")
 }
 
@@ -6523,11 +6523,11 @@ func TestDependentsListStaleSincePagesInsideAFanOut(t *testing.T) {
 	b := newDependentObject(t, store, target.ID)
 	c := newDependentObject(t, store, target.ID)
 
-	refs, pos, err := store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, beehive.StalePos{}, markNow(t, store), 2)
+	refs, pos, err := store.Dependencies().ListStaleSince(ctx, []beehive.GroupKind{testGK}, beehive.StalePos{}, markNow(t, store), 2)
 	require.NoError(t, err)
 	require.Equal(t, []beehive.ObjectID{a.ID, b.ID}, refIDs(refs), "the cap cuts mid fan-out")
 
-	refs, _, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, pos, markNow(t, store), 2)
+	refs, _, err = store.Dependencies().ListStaleSince(ctx, []beehive.GroupKind{testGK}, pos, markNow(t, store), 2)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{c.ID}, refIDs(refs), "the next page resumes inside the same target")
 }
@@ -6552,18 +6552,18 @@ func TestDependentsListStaleSinceStopsAtTheMark(t *testing.T) {
 	dep := newDependentObject(t, store, target.ID)
 	mark := markNow(t, store)
 
-	refs, _, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
+	refs, _, err := store.Dependencies().ListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
 	require.NoError(t, err)
 	require.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "in scope as of the mark")
 
 	// A write landing while the sweep runs.
 	moveTarget(t, store, target.ID)
 
-	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
+	refs, _, err = store.Dependencies().ListStaleSince(ctx, kinds, beehive.StalePos{}, mark, 100)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "the target moved above the mark, so this sweep leaves it")
 
-	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
+	refs, _, err = store.Dependencies().ListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
 	require.NoError(t, err)
 	assert.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "and the next sweep picks it up")
 }
@@ -6578,12 +6578,12 @@ func TestDependentsListStaleSinceIsEmptyWithoutKindsOrLimit(t *testing.T) {
 	newDependentObject(t, store, newRefObject(t, store).ID)
 	after := beehive.StalePos{TargetVersion: 7, TargetID: 2, DependentID: 3}
 
-	refs, pos, err := store.DependentsListStaleSince(ctx, nil, after, markNow(t, store), 100)
+	refs, pos, err := store.Dependencies().ListStaleSince(ctx, nil, after, markNow(t, store), 100)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "no kinds, nothing to enqueue into")
 	assert.Equal(t, after, pos)
 
-	refs, pos, err = store.DependentsListStaleSince(ctx, []beehive.GroupKind{testGK}, after, markNow(t, store), 0)
+	refs, pos, err = store.Dependencies().ListStaleSince(ctx, []beehive.GroupKind{testGK}, after, markNow(t, store), 0)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "a non-positive limit asks for nothing")
 	assert.Equal(t, after, pos)
@@ -6596,7 +6596,7 @@ func TestDependentsListStaleSinceQueryError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, _, err := store.DependentsListStaleSince(context.Background(),
+	_, _, err := store.Dependencies().ListStaleSince(context.Background(),
 		[]beehive.GroupKind{testGK}, beehive.StalePos{}, 9000, 10)
 
 	assert.Error(t, err)
@@ -6640,16 +6640,16 @@ func TestDependentsListStaleSinceSkipsConvergedAndSpentPositions(t *testing.T) {
 	dep := newDependentObject(t, store, target.ID)
 	kinds := []beehive.GroupKind{testGK}
 
-	refs, pos, err := store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
+	refs, pos, err := store.Dependencies().ListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
 	require.NoError(t, err)
 	require.Equal(t, []beehive.ObjectID{dep.ID}, refIDs(refs), "no watermark counts as stale")
 
-	refs, _, err = store.DependentsListStaleSince(ctx, kinds, pos, markNow(t, store), 100)
+	refs, _, err = store.Dependencies().ListStaleSince(ctx, kinds, pos, markNow(t, store), 100)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "the scan does not re-read the row it just returned")
 
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
-	refs, _, err = store.DependentsListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
+	refs, _, err = store.Dependencies().ListStaleSince(ctx, kinds, beehive.StalePos{}, markNow(t, store), 100)
 	require.NoError(t, err)
 	assert.Empty(t, refs, "a dependent that observed its target is not returned")
 }
@@ -6665,7 +6665,7 @@ func TestRefsAddClearsTheDependentsWatermark(t *testing.T) {
 	ctx := context.Background()
 	target := newRefObject(t, store) // never moves again
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 	require.Empty(t, staleIDs(t, store), "the dependent has converged")
 
 	// A third party declares the edge on the dependent's behalf.
@@ -6686,7 +6686,7 @@ func TestRefsAddKeepsTheWatermarkOnAReDeclaredEdge(t *testing.T) {
 	ctx := context.Background()
 	target := newRefObject(t, store)
 	dep := newDependentObject(t, store, target.ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 
 	require.NoError(t, addEdge(ctx, store, dep.ID, target.ID, beehive.RelationDependsOn))
 
@@ -6702,7 +6702,7 @@ func TestRefsAddKeepsTheWatermarkOnAnOwnerEdge(t *testing.T) {
 	ctx := context.Background()
 	owner := newRefObject(t, store)
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 
 	require.NoError(t, addEdge(ctx, store, dep.ID, owner.ID, beehive.RelationOwnedBy))
 
@@ -6718,7 +6718,7 @@ func TestRefsAddKeepsTheWatermarkOnASelfEdge(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	dep := newDependentObject(t, store, newRefObject(t, store).ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 
 	require.NoError(t, addEdge(ctx, store, dep.ID, dep.ID, beehive.RelationDependsOn))
 
@@ -6790,7 +6790,7 @@ func TestDependentsListStaleSinceFindsDependentsOfUnregisteredTargets(t *testing
 	})
 	require.NoError(t, err)
 	dep := newDependentObject(t, store, target.ID)
-	require.NoError(t, store.DependencyWatermarksSet(ctx, dep.ID, cursorNow(t, store)))
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, dep.ID, cursorNow(t, store)))
 	require.Empty(t, staleIDs(t, store))
 
 	_, _, err = store.ObjectsUpdateSpec(ctx, beehive.GroupKind{Kind: "Gadget"}, target.ID, []byte(`{"v":2}`), 0)

@@ -40,6 +40,10 @@ type sqliteConditions struct{ *sqliteStore }
 
 func (s *sqliteStore) Conditions() storeapi.Conditions { return sqliteConditions{s} }
 
+type sqliteDependencies struct{ *sqliteStore }
+
+func (s *sqliteStore) Dependencies() storeapi.Dependencies { return sqliteDependencies{s} }
+
 type sqliteDriverCursors struct{ *sqliteStore }
 
 func (s *sqliteStore) DriverCursors() storeapi.DriverCursors { return sqliteDriverCursors{s} }
@@ -1056,7 +1060,7 @@ func (s *sqliteStore) ReconcileOwedDecrement(ctx context.Context, gk storeapi.Gr
 // No GROUP BY: a row is one (target, dependent) pair, and the position needs
 // both to resume. The kinds list is not chunked; it comes from Register calls,
 // not caller data.
-func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []storeapi.GroupKind, after storeapi.StalePos, through int64, limit int) ([]storeapi.ObjectRef, storeapi.StalePos, error) {
+func (s sqliteDependencies) ListStaleSince(ctx context.Context, kinds []storeapi.GroupKind, after storeapi.StalePos, through int64, limit int) ([]storeapi.ObjectRef, storeapi.StalePos, error) {
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, after, nil
 	}
@@ -1105,7 +1109,7 @@ func (s *sqliteStore) DependentsListStaleSince(ctx context.Context, kinds []stor
 // monotonic, and it suppresses a no-advance write outright — no page dirtied —
 // so a polling dependent pays no row write per pass. One predicate guards both
 // columns, so reconciled_at cannot move without reconciled_against.
-func (s *sqliteStore) DependencyWatermarksSet(ctx context.Context, id storeapi.ObjectID, cursor int64) error {
+func (s sqliteDependencies) WatermarkSet(ctx context.Context, id storeapi.ObjectID, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
 		SELECT ?, ?, ?

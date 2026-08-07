@@ -244,7 +244,7 @@ func benchStaleGraph(b *testing.B, objects int) (Store, []ObjectID) {
 	require.NoError(b, err)
 	err = store.Within(ctx, func(ctx context.Context) error {
 		for _, id := range ids {
-			if err := store.DependencyWatermarksSet(ctx, id, mark); err != nil {
+			if err := store.Dependencies().WatermarkSet(ctx, id, mark); err != nil {
 				return err
 			}
 		}

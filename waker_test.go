@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1688,7 +1689,11 @@ func (s *staleListErrorStore) ResourceVersionsMaxIssued(context.Context) (int64,
 	return s.issued, nil
 }
 
-func (s *staleListErrorStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]ObjectRef, StalePos, error) {
+func (s *staleListErrorStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{Dependencies: s.fakeStore.Dependencies(), listStaleSince: s.listStaleSince}
+}
+
+func (s *staleListErrorStore) listStaleSince(_ context.Context, _ []GroupKind, after StalePos, _ int64, _ int) ([]ObjectRef, StalePos, error) {
 	s.calls.Add(1)
 	return nil, after, errBoom
 }
@@ -1710,7 +1715,11 @@ func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, err
 	return s.issued, s.issuedErr
 }
 
-func (s *staleSweepStore) DependentsListStaleSince(_ context.Context, _ []GroupKind, after StalePos, through int64, _ int) ([]ObjectRef, StalePos, error) {
+func (s *staleSweepStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{Dependencies: s.fakeStore.Dependencies(), listStaleSince: s.listStaleSince}
+}
+
+func (s *staleSweepStore) listStaleSince(_ context.Context, _ []GroupKind, after StalePos, through int64, _ int) ([]ObjectRef, StalePos, error) {
 	s.asked = append(s.asked, after)
 	s.throughs = append(s.throughs, through)
 	if len(s.pages) == 0 {

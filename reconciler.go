@@ -126,7 +126,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// See docs/adr/2026-08-03-stale-dependents-cursor.md.
 	if reconcileErr == nil && load.HasDependencies {
 		// A cancelled write is shutdown, not a lost pass.
-		if err := t.bh.store.DependencyWatermarksSet(ctx, id, load.Cursor); err != nil && ctx.Err() == nil {
+		if err := t.bh.store.Dependencies().WatermarkSet(ctx, id, load.Cursor); err != nil && ctx.Err() == nil {
 			log.WarnContext(ctx, "failed to record the dependency watermark; the next target change re-derives it", "err", err)
 		}
 	}

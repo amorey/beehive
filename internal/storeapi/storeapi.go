@@ -367,10 +367,52 @@ type Store interface {
 	// Conditions is the conditions table.
 	Conditions() Conditions
 
+	// Dependencies is the dependency-watermark table and the staleness scan
+	// derived from it.
+	Dependencies() Dependencies
+
 	// DriverCursors is the per-driver scan-position table.
 	DriverCursors() DriverCursors
 
 	unmigrated
+}
+
+// Dependencies is the dependency-watermark table: what each dependent was last
+// reconciled against, and the scan that finds the ones a target has moved past.
+type Dependencies interface {
+	// ListStaleSince returns objects of the given kinds with a
+	// depends_on edge to a target whose resource_version is above their
+	// dependency watermark, bounded to targets written above after and no higher
+	// than through. Ordered by StalePos, at most limit rows, plus the position of
+	// the last row to resume from. An empty kinds slice returns nothing. A
+	// missing watermark counts as stale; self-edges are excluded. Cost tracks
+	// what changed, not the graph.
+	//
+	// The kind filter applies to the DEPENDENT and MUST NOT be extended to the
+	// target: a registered object may depend on a client-only one, and
+	// narrowing to registered targets would silently strand its dependents.
+	//
+	// through is what makes a sweep finite. Without it a store taking writes
+	// faster than the caller pages could never reach a short page, so the sweep
+	// would never end and its cursor would never move. Targets written above
+	// through belong to the next sweep.
+	//
+	// A dependent appears once per moved target it depends on; stamping and
+	// enqueuing are idempotent, so a duplicate costs a pass, not correctness.
+	ListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]ObjectRef, StalePos, error)
+
+	// WatermarkSet records cursor as the store-wide write cursor
+	// id's reconcile observed. Upserts; the stored cursor never decreases, and
+	// a non-advancing value writes nothing. Bumps no resource_version (it
+	// writes no objects row). Also sets a reconciled-at timestamp under the
+	// same predicate — observability only.
+	//
+	// The write gates in SQL on id having at least one outgoing depends_on
+	// edge: a dependency-free object can never be found stale, and the gate
+	// closes safely when the object is collected mid-pass. EdgesAdd is the
+	// row's other writer and only clears it.
+	// See docs/adr/2026-07-29-dependency-watermarks.md.
+	WatermarkSet(ctx context.Context, id ObjectID, cursor int64) error
 }
 
 // DriverCursors persists a periodic driver's scan position, so a restart
@@ -690,40 +732,6 @@ type unmigrated interface {
 	// for an event write too, so it is a "did anything change" answer, not a
 	// log position to scan from.
 	ResourceVersionsMaxIssued(ctx context.Context) (int64, error)
-
-	// DependencyWatermarksSet records cursor as the store-wide write cursor
-	// id's reconcile observed. Upserts; the stored cursor never decreases, and
-	// a non-advancing value writes nothing. Bumps no resource_version (it
-	// writes no objects row). Also sets a reconciled-at timestamp under the
-	// same predicate — observability only.
-	//
-	// The write gates in SQL on id having at least one outgoing depends_on
-	// edge: a dependency-free object can never be found stale, and the gate
-	// closes safely when the object is collected mid-pass. EdgesAdd is the
-	// row's other writer and only clears it.
-	// See docs/adr/2026-07-29-dependency-watermarks.md.
-	DependencyWatermarksSet(ctx context.Context, id ObjectID, cursor int64) error
-
-	// DependentsListStaleSince returns objects of the given kinds with a
-	// depends_on edge to a target whose resource_version is above their
-	// dependency watermark, bounded to targets written above after and no higher
-	// than through. Ordered by StalePos, at most limit rows, plus the position of
-	// the last row to resume from. An empty kinds slice returns nothing. A
-	// missing watermark counts as stale; self-edges are excluded. Cost tracks
-	// what changed, not the graph.
-	//
-	// The kind filter applies to the DEPENDENT and MUST NOT be extended to the
-	// target: a registered object may depend on a client-only one, and
-	// narrowing to registered targets would silently strand its dependents.
-	//
-	// through is what makes a sweep finite. Without it a store taking writes
-	// faster than the caller pages could never reach a short page, so the sweep
-	// would never end and its cursor would never move. Targets written above
-	// through belong to the next sweep.
-	//
-	// A dependent appears once per moved target it depends on; stamping and
-	// enqueuing are idempotent, so a duplicate costs a pass, not correctness.
-	DependentsListStaleSince(ctx context.Context, kinds []GroupKind, after StalePos, through int64, limit int) ([]ObjectRef, StalePos, error)
 
 	// ObjectWritesListSince returns gk's log entries above afterRV in cursor
 	// order, at most limit. afterRV < trimmedThrough means entries were trimmed
