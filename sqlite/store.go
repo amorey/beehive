@@ -1422,8 +1422,15 @@ func (s *sqliteStore) updateSpec(
 func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64) error {
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
-		if err := s.selectScoped(ctx, gk, id, ""); err != nil {
+		var observedGen sql.NullInt64
+		if err := s.selectScoped(ctx, gk, id, `observed_generation`, &observedGen); err != nil {
 			return err
+		}
+		// >=, not ==: with no content to re-derive, a stale report is dropped
+		// rather than rolling a converged object back to unsettled. (UpdateStatus's
+		// content path deliberately does the opposite.)
+		if observedGen.Valid && observedGen.Int64 >= observedGeneration {
+			return nil
 		}
 		return s.stampObserved(ctx, s.conn(ctx), gk, id, observedGeneration)
 	})

@@ -1476,6 +1476,50 @@ func TestSetObservedGenerationSettlesWithoutWritingStatus(t *testing.T) {
 	assert.Zero(t, updated.StatusVersion, "no status version stamped")
 }
 
+// Settling twice at one generation must write once: a controller reports on
+// every pass, and a second bump would wake every dependent for nothing.
+func TestSetObservedGenerationIsIdempotentPerGeneration(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	settled, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+	again, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+
+	assert.Equal(t, settled.ResourceVersion, again.ResourceVersion, "second settle writes nothing")
+	assert.Equal(t, settled.ObservedAt, again.ObservedAt)
+}
+
+// The clamp, and the one place this verb differs from UpdateStatus: with no
+// content to re-derive, a stale report is dropped rather than unsettling a
+// converged object.
+func TestSetObservedGenerationDropsAStaleReport(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
+	require.NoError(t, err)
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, bumped.Generation))
+	settled, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+
+	// A slow controller reports the generation it loaded, now stale.
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+
+	reread, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+	require.NotNil(t, reread.ObservedGeneration)
+	assert.EqualValues(t, bumped.Generation, *reread.ObservedGeneration, "must not roll backwards")
+	assert.Equal(t, settled.ResourceVersion, reread.ResourceVersion, "dropped report writes nothing")
+}
+
 // TestSchemaVersionColumnsRoundTrip verifies the opaque per-column schema
 // versions: they default to 0, ObjectsCreate persists the caller-set spec version
 // (status is nil at create, so its version stays 0), and the version args to
