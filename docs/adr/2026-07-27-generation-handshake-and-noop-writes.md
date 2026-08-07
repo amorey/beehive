@@ -1,7 +1,8 @@
 # The generation handshake, and what a content no-op still writes
 
 - **Status:** Accepted — implemented in `sqlite/store.go`, `controller.go`.
-- **Date:** 2026-07-27 (recorded retroactively)
+- **Date:** 2026-07-27 (recorded retroactively); amended 2026-08-07 with
+  `SetObservedGeneration`.
 
 ## The handshake
 
@@ -24,6 +25,61 @@ so it reconciles again.
 The guard is a read-first check, not a `WHERE generation >= ?` clause, and it
 fires on the no-op path too: a caller reporting a generation that doesn't exist is
 a bug regardless of whether the bytes changed.
+
+## Settling is its own verb, because not every controller writes status
+
+`UpdateStatus` was for a time the only way to move `observed_generation`, so a
+controller whose whole report is `Conditions().Set` could never settle: the
+condition write bumps `resource_version` but deliberately leaves the handshake
+alone, and the object sat in `ListUnsettledIDs` forever, re-queued by every owed
+pass. The better a controller is at not writing redundant status, the more likely
+it hits this.
+
+`Objects().SetObservedGeneration` / `ControllerClient.SetObservedGeneration`
+records the handshake and nothing else. It composes inside `Within` for a pass
+that also reports conditions, and stands alone for a pass that legitimately
+reports nothing.
+
+It differs from `UpdateStatus` in one way, and it is the interesting one: **the
+clamp is unconditional**. `UpdateStatus` writes a stale `observedGeneration`
+verbatim on its content path, because a stale reporter just overwrote the status
+and unsettling is what gets that content re-derived. There is no content here, so
+a stale report is simply dropped. The clamp also bounds the write to once per
+generation, which is why a settle cannot sustain a dependency cycle the way a
+condition write can — in a cycle no generation moves, so the second settle writes
+nothing.
+
+The store verb reports `settled`, and the client emits only on it. A controller
+is meant to call this every pass, so the steady state is the clamped no-op, which
+appends no write-log entry — signalling it anyway would wake every tailer for the
+kind and the dependency waker, per pass, for a write that did not happen. Same
+gate as `UpdateSpec`'s `changed` and `EdgesAddResult.ReconcileOwedStamped`.
+
+Two alternatives were rejected. **An `observedGeneration` argument on
+`SetConditions`** would copy the two-axis no-op rule below into a second place,
+and would force a condition write that does not settle (`Progressing=True`
+mid-pass) to say something about settlement — needing a "don't touch" sentinel,
+which is the tell that the concern does not belong on the verb. **Stamping in the
+reconciler after a successful `Reconcile`** would silently override a controller
+that used the content path's deliberate unsettle, and would flip the default for
+kinds that opt out of settling by never writing status.
+
+There is also a way to settle without the verb — re-pass the status you were
+handed — and it is unsound rather than merely awkward. The no-op gate is
+`stamp == storedVersion && bytes.Equal(...)`, not the bytes alone, so on a build
+where the migrator's status version rose the identical bytes carry a higher stamp
+and the same call falls through to the content path: it rewrites status, moves
+`updated_at`, and lands the generation unclamped. Nothing at the call site says
+which build you are on. `TestUpdateStatusReUseIsUnsoundAcrossAStatusVersionBump`
+pins the cliff.
+
+## Neither writer accepts a generation below 1
+
+`generation` is `NOT NULL DEFAULT 1`, so no row ever holds one. A zero is an
+uninitialised caller, not a stale report, and it used to pass the future check and
+settle — a `resource_version` bump and a dependent wake to record nothing. Both
+writers now reject it with `ErrInvalidObservedGeneration`, before the transaction
+opens.
 
 ## The content no-op splits the two halves of the write
 

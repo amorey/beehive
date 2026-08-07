@@ -319,7 +319,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   change; `ObservedGeneration` records what the controller last settled.
   Byte-identical writes are skipped (except that `UpdateStatus` still advances
   `observed_generation`), which is what stops a controller re-applying its own
-  spec from waking itself forever.
+  spec from waking itself forever. **`SetObservedGeneration` settles without
+  writing status**, for a controller whose whole report is conditions, and
+  clamps unconditionally — which also bounds it to one write per generation.
   → [ADR](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md)
 - **Schema-version migration** (`Migrator`): per-kind, on read, at the decode
   boundary; spec and status version independently; an undecodable blob

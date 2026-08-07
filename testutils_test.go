@@ -767,6 +767,10 @@ func (fakeObjects) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, err
 	return nil, nil
 }
 
+func (fakeObjects) SetObservedGeneration(context.Context, GroupKind, ObjectID, int64) (bool, error) {
+	panic("not implemented: fakeStore.Objects().SetObservedGeneration")
+}
+
 func (fakeObjects) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
 	panic("not implemented: fakeStore.Objects().UpdateSpec")
 }

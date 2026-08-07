@@ -656,6 +656,7 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 ```go
 type ControllerClient[Status any] interface {
     UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
+    SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error
     SetCondition(ctx context.Context, id ObjectID, condition Condition) error
     SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
     DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
@@ -676,6 +677,10 @@ type ControllerClient[Status any] interface {
 `UpdateStatus` **does nothing when the status marshals to the bytes already stored**. There is no `resource_version` bump, so a watch and the dependency waker both find nothing — the same way re-applying an unchanged spec does nothing on the `Client` side. So report observed state unconditionally; you don't need your own equality check, and a dependent riding on this kind's status won't be woken by a pass that found nothing new.
 
 The generation handshake is the exception. `observedGeneration` and `ObservedAt` are recorded even when the content is unchanged, so a reconcile that legitimately changed no status still settles the object instead of being re-queued by every owed-pass tick. That write does bump `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees the object converge. It happens at most once per generation: the next unchanged pass finds the generation already recorded and writes nothing.
+
+**If your pass reports only conditions — or nothing at all — call `SetObservedGeneration(ctx, id, obj.Generation)`.** `SetCondition` bumps `resource_version` but deliberately leaves the handshake alone, so a controller whose real output is conditions would otherwise never settle and would sit in the owed listing forever, re-queued every interval. This verb records the handshake and writes no status; compose it inside `Within` to land with a `SetConditions`. Unlike `UpdateStatus` it always clamps — a generation at or below the recorded one writes nothing, so it is idempotent per generation and can never roll a converged object back to unsettled. Neither verb accepts a generation below 1 (`ErrInvalidObservedGeneration`); no object holds one.
+
+Do **not** settle by re-passing the status you were handed to `UpdateStatus`. It usually works and is unsound — the no-op gate is the schema version as well as the bytes; the ADR below has the detail.
 
 `ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `AddEvent` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
 

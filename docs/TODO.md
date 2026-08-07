@@ -15,7 +15,10 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   Almost any write sustains it: changed status bytes, a byte-identical
   `UpdateStatus` at a generation the object has not settled at, any real condition
   write, or `DeleteFinalizer`. Only `AddEvent` is safe, because it bumps no
-  object `resource_version`.
+  object `resource_version`. `SetObservedGeneration` is safe for a different
+  reason: its clamp bounds it to one write per generation, and in a cycle no
+  generation moves, so the second settle writes nothing. Pinned by
+  `TestSetObservedGenerationWakesDependentsOncePerGeneration`.
 
   **The contention is gone.** The work queue's re-enqueue floor bounds the loop to
   one round trip per `defaultMinRequeueInterval`, whatever the wake rate, so it no

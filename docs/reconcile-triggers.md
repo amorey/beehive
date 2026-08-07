@@ -407,9 +407,12 @@ See [the ADR](adr/2026-07-30-durable-waker-cursor.md).
 
 **What bumps a target's `resource_version`**, and thus wakes its dependents, is
 wider than a spec change. The full list is `Objects().Create`, `Objects().UpdateSpec`, the
-content and handshake-only paths of `Objects().UpdateStatus`, `Conditions().Set`,
+content and handshake-only paths of `Objects().UpdateStatus`,
+`Objects().SetObservedGeneration`, `Conditions().Set`,
 `Conditions().Delete`, `Objects().DeleteFinalizer`, `markForDeletion`, and the cascade mark.
 `Events().Add` is the one write that does not bump it. That is by design.
+`Objects().SetObservedGeneration` clamps, so it wakes a dependent at most once per
+generation — which is what keeps a settle from sustaining a dependency cycle.
 
 This list is scoped to writes on a target that can still be depended on.
 `Objects().Delete` also draws a version and appends a write-log entry, but a physical

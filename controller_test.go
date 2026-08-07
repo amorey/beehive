@@ -449,6 +449,45 @@ func TestControllerClientSetConditions(t *testing.T) {
 	assert.Nil(t, findCondition(after.Conditions, "Ready"))
 }
 
+// A controller whose whole report is conditions has no status write to carry
+// the handshake, so without SetObservedGeneration it sits in the owed listing
+// forever. Both halves are asserted: the gap is deliberate, so nobody closes it
+// by stamping in the reconciler.
+func TestControllerClientSetObservedGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+
+	require.NoError(t, cc.SetCondition(ctx, obj.ID, Condition{Type: "Synced", Status: ConditionFalse, Reason: "Paused"}))
+	unsettled, err := store.Objects().ListUnsettledIDs(ctx, clientTestGK)
+	require.NoError(t, err)
+	require.Contains(t, unsettled, obj.ID, "a condition write settles nothing")
+
+	require.NoError(t, cc.SetObservedGeneration(ctx, obj.ID, obj.Generation))
+
+	unsettled, err = store.Objects().ListUnsettledIDs(ctx, clientTestGK)
+	require.NoError(t, err)
+	assert.NotContains(t, unsettled, obj.ID)
+
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.ObservedGeneration)
+	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
+	assert.Nil(t, got.Status, "the handshake writes no status")
+
+	assert.ErrorIs(t, cc.SetObservedGeneration(ctx, obj.ID, obj.Generation+4), ErrObservedGenerationFuture)
+	assert.ErrorIs(t, cc.SetObservedGeneration(ctx, obj.ID, 0), ErrInvalidObservedGeneration)
+}
+
 func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

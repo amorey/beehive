@@ -147,6 +147,32 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 	assert.Equal(t, "gone", ev.Object.Spec.Val, "the tombstone carries the row's last known state")
 }
 
+// Settling writes no content, but a watcher waiting for the object to converge
+// has to see it, so the handshake still emits.
+func TestWatchSeesASettleWithNoStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, fast()...)
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hi"})
+
+	_, ch, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, cc.SetObservedGeneration(ctx, obj.ID, obj.Generation))
+
+	ev := recv(t, ch)
+	assert.Equal(t, Modified, ev.Type)
+	require.NotNil(t, ev.Object)
+	require.NotNil(t, ev.Object.ObservedGeneration)
+	assert.Equal(t, obj.Generation, *ev.Object.ObservedGeneration)
+}
+
 // A single-object watch is kind-scoped like Get: another kind's id reads as
 // absent rather than streaming that kind's rows through this client, where they
 // would be decoded as this Spec.

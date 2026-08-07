@@ -69,9 +69,15 @@ var ErrStaleTxContext = errors.New("beehive: transaction context is not the live
 // same-goroutine frames unwind before fn returns.
 var ErrConcurrentNestedTx = errors.New("beehive: nested transaction frame still open at commit")
 
-// ErrObservedGenerationFuture is returned by Objects().UpdateStatus when
-// observedGeneration exceeds the object's current generation.
+// ErrObservedGenerationFuture is returned by Objects().UpdateStatus and
+// Objects().SetObservedGeneration when observedGeneration exceeds the object's
+// current generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
+
+// ErrInvalidObservedGeneration is returned by the same two when
+// observedGeneration is below 1. generation is NOT NULL DEFAULT 1, so no object
+// ever holds one — a zero is an uninitialised caller, not a stale report.
+var ErrInvalidObservedGeneration = errors.New("beehive: observed generation is not a generation")
 
 // ErrSchemaVersionDowngrade is returned by Objects().UpdateSpec/Objects().UpdateStatus when the
 // caller's schema version is non-zero and lower than the row's. Zero means "no
@@ -740,6 +746,19 @@ type Objects interface {
 	// observed_generation doesn't match generation (not yet converged).
 	ListUnsettledIDs(ctx context.Context, gk GroupKind) ([]ObjectID, error)
 
+	// SetObservedGeneration records observedGeneration as the generation id's
+	// controller has settled, writing no status: the handshake for a controller
+	// whose report is conditions, or nothing at all. Advancing it bumps
+	// ObservedAt and ResourceVersion, leaving UpdatedAt — which tracks content —
+	// alone. A generation at or below the recorded one writes nothing and reports
+	// settled=false, so the call is idempotent per generation and can never roll
+	// a converged object back to unsettled. settled=true is what callers emit on.
+	//
+	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
+	// observedGeneration above the row's generation → ErrObservedGenerationFuture;
+	// below 1 → ErrInvalidObservedGeneration. Returns no row.
+	SetObservedGeneration(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64) (settled bool, err error)
+
 	// UpdateSpec replaces an object's spec, bumping Generation and
 	// ResourceVersion, and stamps specVersion. Spec bytes identical to the
 	// stored ones at the row's own schema version are a no-op: no bump, and
@@ -767,8 +786,8 @@ type Objects interface {
 	// rolling the object back to unsettled so a later pass re-derives it.
 	//
 	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// observedGeneration above the row's generation → ErrObservedGenerationFuture.
-	// Returns no row.
+	// observedGeneration above the row's generation → ErrObservedGenerationFuture;
+	// below 1 → ErrInvalidObservedGeneration. Returns no row.
 	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
 }
 

@@ -70,6 +70,14 @@ type ControllerClient[Status any] interface {
 	// twice is refused with ErrDuplicateConditionType; an empty slice writes
 	// nothing. Same stamping as SetCondition.
 	SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
+	// SetObservedGeneration records the generation this reconcile settled without
+	// writing status, for a controller whose report is conditions or nothing at
+	// all. Pass the generation of the object you were handed. A generation at or
+	// below the recorded one writes nothing; one above the object's current
+	// generation → ErrObservedGenerationFuture, below 1 →
+	// ErrInvalidObservedGeneration — which UpdateStatus rejects too. Compose it
+	// inside Within to land with a SetConditions.
+	SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error
 	// UpdateStatus records status and the generation this reconcile observed.
 	// Status that marshals to the stored bytes writes nothing, so a controller
 	// can report unconditionally without waking watchers on an unchanged poll —
@@ -117,6 +125,16 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	}
 	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
 		ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
+}
+
+// Gated on settled: a controller calls this every pass, so the steady state is
+// the clamped no-op, which appends no log entry for a wake to read.
+func (c *controllerClientImpl[Status]) SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error {
+	settled, err := c.bh.store.Objects().SetObservedGeneration(ctx, c.gk, id, observedGeneration)
+	if err != nil || !settled {
+		return err
+	}
+	return c.wakeAfter(ctx, nil)
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
