@@ -205,3 +205,45 @@ unreachable through the cascade, which filters pending children before it, so wh
 actually costs is a caveat in the doc comment and a test to pin a distinction nothing
 observes. One helper with one behaviour is worth more than 17 µs on the narrowest
 cascade there is.
+
+## A pass writes its conditions in one write (2026-08-07)
+
+`Conditions().Set` took one condition, so a controller reporting two — the common
+shape, `Connected` beside `Healthy` — made two writes. Wrapped in `Within` they were
+already atomic, which is the part callers ask for and the part they already had. What
+they did not have is a single write *record*: each call ran its own gate read, drew
+its own version and appended its own `object_writes` entry, so one pass cost two of
+each, at reconcile rate, under a log retention measured in hours.
+
+`Set` is now variadic and writes the batch under **one** version bump: one gate read
+joined to the stored conditions of the types being written, one upsert per chunk, one
+`bumpObject`. `SetConditions(ctx, id, []Condition)` is the client spelling;
+`SetCondition` is a one-element call into it, so there is one write path rather than a
+fast one and a batch one.
+
+The gate read generalises rather than multiplies: `conditionSetLoad` grows an `IN`
+list, so it stays one round trip on the single connection for N types, and
+`TestConditionSetLoadsTheGateAndTheConditionsTogether` pins the plan at both widths.
+
+**Suppression stays per condition, and the bump is per batch.** A batch where one
+condition changed writes that row and leaves the other's `updated_at` alone, and a
+batch where none changed writes nothing at all — the no-op contract is unchanged,
+just applied element-wise. The two are not in tension: the bump reports that *the
+object* moved, and one condition moving is enough.
+
+**A type named twice is refused** (`ErrDuplicateConditionType`) rather than resolved
+by slice position. Both spellings are defensible — last wins, first wins — which is
+the argument against picking one: the outcome would depend on how the caller happened
+to build the slice, and a duplicate is a caller bug either way. The check runs before
+the transaction opens, so a refused batch writes none of its conditions.
+
+`conditionChunkSize` is a parameter-limit ceiling like `idChunkSize`, not a measured
+optimum like `markChunkSize`: conditions per object are a handful, so the chunk loop
+exists to keep a pathological batch correct rather than to shape a cost curve.
+
+**Rejected: a verb that carries conditions alongside `UpdateStatus`**, which is the
+other half of what prompted this. `Within` already lands both in one transaction, so
+the verb would buy one version bump in exchange for a status method that also writes
+conditions — against the rule that a method's noun names what it writes. If one bump
+across a whole `Within` frame is ever wanted, the fix is to defer the bump to commit
+for every writer in the frame, not to fuse two verbs.

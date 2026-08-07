@@ -1009,17 +1009,28 @@ func TestConditionsReadsRideThePrimaryKey(t *testing.T) {
 	}
 }
 
-// ConditionsSet's kind gate and its no-op comparison key on the same object, so
-// they are one read rather than two round trips on the single connection — and the
-// join has to ride a primary key on each side or the fold costs more than it saves.
-func TestConditionSetLoadsTheGateAndTheConditionTogether(t *testing.T) {
+// ConditionsSet's kind gate and its no-op comparisons key on the same object, so
+// they are one read rather than a round trip per type on the single connection —
+// and the join has to ride a primary key on each side or the fold costs more than
+// it saves. A batch must not lose that: the whole point is one read for N types.
+func TestConditionSetLoadsTheGateAndTheConditionsTogether(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 
-	plan := queryPlan(t, store, conditionSetLoad, "Ready", int64(1))
-	assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
-		"objects must be reached by rowid:\n"+plan)
-	assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
-		"conditions must be reached through its primary key:\n"+plan)
+	for _, tc := range []struct {
+		name  string
+		types []any
+	}{
+		{"one type", []any{"Ready"}},
+		{"several types", []any{"Ready", "Healthy", "Connected"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := queryPlan(t, store, conditionSetLoad(len(tc.types)), append(tc.types, int64(1))...)
+			assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
+				"objects must be reached by rowid:\n"+plan)
+			assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
+				"conditions must be reached through its primary key:\n"+plan)
+		})
+	}
 }
 
 // EventsGetLatest surfaces a scan fault on the current run.
@@ -5035,6 +5046,162 @@ func TestSetConditionNoOpSuppressed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, first.ResourceVersion, again.ResourceVersion, "identical condition write is a no-op")
 	probe.expectNone()
+}
+
+func TestSetConditionsTakesOneVersionForTheBatch(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "batch")
+
+	probe := newWriteProbe(t, store)
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Connected", Status: "True", Reason: "Dialed"},
+		storeapi.Condition{Type: "Healthy", Status: "True", Reason: "Probed"},
+		storeapi.Condition{Type: "Ready", Status: "False", Reason: "Warming"}))
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	for _, want := range []struct{ condType, status, reason string }{
+		{"Connected", "True", "Dialed"},
+		{"Healthy", "True", "Probed"},
+		{"Ready", "False", "Warming"},
+	} {
+		cond := findCondition(got.Conditions, want.condType)
+		require.NotNil(t, cond, "%s must be present", want.condType)
+		assert.Equal(t, want.status, cond.Status)
+		assert.Equal(t, want.reason, cond.Reason)
+	}
+	// One entry, not three: the batch is one pass, so no consumer can read half
+	// of it and no dependent is woken per condition.
+	assert.Equal(t, got.ResourceVersion, probe.expectWrite().ResourceVersion)
+	assert.Equal(t, obj.ResourceVersion+1, got.ResourceVersion, "the batch draws one version")
+}
+
+func TestSetConditionsSpanningChunksTakesOneVersion(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "chunked")
+
+	prev := conditionChunkSize
+	conditionChunkSize = 3
+	t.Cleanup(func() { conditionChunkSize = prev })
+
+	conds := make([]storeapi.Condition, 0, 7)
+	for i := range cap(conds) {
+		conds = append(conds, storeapi.Condition{Type: fmt.Sprintf("Type%d", i), Status: "True"})
+	}
+	probe := newWriteProbe(t, store)
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, conds...))
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Len(t, got.Conditions, len(conds), "every chunk lands")
+	assert.Equal(t, got.ResourceVersion, probe.expectWrite().ResourceVersion,
+		"chunking is a statement split, not a write split")
+}
+
+func TestSetConditionsSuppressesPerCondition(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "partial")
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Connected", Status: "True", Reason: "Dialed"},
+		storeapi.Condition{Type: "Healthy", Status: "True", Reason: "Probed"}))
+
+	// Backdate the unchanged condition's clocks so a needless rewrite shows up as
+	// a fresh stamp rather than a same-millisecond coincidence.
+	const sentinel = int64(12345)
+	_, err := store.db.ExecContext(ctx,
+		`UPDATE conditions SET updated_at = ?, transitioned_at = ?
+		   WHERE object_id = ? AND type = 'Connected'`, sentinel, sentinel, obj.ID)
+	require.NoError(t, err)
+
+	probe := newWriteProbe(t, store)
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Connected", Status: "True", Reason: "Dialed"},
+		storeapi.Condition{Type: "Healthy", Status: "False", Reason: "ProbeFailed"}))
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	unchanged := findCondition(got.Conditions, "Connected")
+	require.NotNil(t, unchanged)
+	assert.Equal(t, time.UnixMilli(sentinel).UTC(), unchanged.UpdatedAt,
+		"an unchanged condition in a batch is not rewritten")
+	assert.Equal(t, "False", findCondition(got.Conditions, "Healthy").Status)
+	probe.expectWrite() // the changed one still costs exactly one version
+}
+
+func TestSetConditionsAllNoOpSuppressed(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "batch-noop")
+
+	conds := []storeapi.Condition{
+		{Type: "Connected", Status: "True", Reason: "Dialed"},
+		{Type: "Healthy", Status: "True", Reason: "Probed"},
+	}
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, conds...))
+	first, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+
+	probe := newWriteProbe(t, store)
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, conds...))
+
+	again, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, first.ResourceVersion, again.ResourceVersion,
+		"a batch that changes nothing bumps nothing")
+	probe.expectNone()
+}
+
+func TestSetConditionsRejectsADuplicateType(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "dupe")
+
+	probe := newWriteProbe(t, store)
+	err := store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"},
+		storeapi.Condition{Type: "Ready", Status: "False"})
+	assert.ErrorIs(t, err, storeapi.ErrDuplicateConditionType)
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Conditions, "a refused batch writes none of its conditions")
+	probe.expectNone()
+}
+
+func TestSetConditionsEmptyWritesNothing(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "empty")
+
+	probe := newWriteProbe(t, store)
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID))
+	probe.expectNone()
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, obj.ResourceVersion, got.ResourceVersion)
+}
+
+// The batch path carries the same gate as the single write: it must not reach
+// the FK violation, and it must refuse before writing any of the batch.
+func TestSetConditionsScoped(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "scoped-batch")
+
+	conds := []storeapi.Condition{{Type: "Ready", Status: "True"}, {Type: "Healthy", Status: "True"}}
+	assert.ErrorIs(t, store.Conditions().Set(ctx, beehive.GroupKind{Kind: "Other"}, obj.ID, conds...),
+		beehive.ErrWrongKind)
+	assert.ErrorIs(t, store.Conditions().Set(ctx, testGK, 999999, conds...), beehive.ErrNotFound)
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Conditions)
 }
 
 func TestDeleteCondition(t *testing.T) {

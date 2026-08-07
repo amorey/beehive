@@ -1577,47 +1577,76 @@ func (s *sqliteStore) attachConditions(ctx context.Context, obj *storeapi.RawObj
 	return obj, nil
 }
 
-// conditionSetLoad answers Conditions().Set's kind gate and its no-op comparison in
-// one statement, keyed on the same object. The condition columns are NULL when
-// there is none; status is NOT NULL wherever a row exists, so it marks presence.
-// transitioned_at is absent deliberately: the upsert decides it in SQL.
-const conditionSetLoad = `
-	SELECT o."group", o.kind, c.status, c.reason, c.message, c.liveness, c.updated_at
+// conditionSetLoad answers Conditions().Set's kind gate and its no-op comparisons
+// in one statement, keyed on the same object. The condition columns are NULL when
+// the object holds none of the types; status is NOT NULL wherever a row exists, so
+// it marks presence. transitioned_at is absent deliberately: the upsert decides it
+// in SQL.
+func conditionSetLoad(types int) string {
+	return `
+	SELECT o."group", o.kind, c.type, c.status, c.reason, c.message, c.liveness, c.updated_at
 	  FROM objects o
-	  LEFT JOIN conditions c ON c.object_id = o.id AND c.type = ?
+	  LEFT JOIN conditions c ON c.object_id = o.id AND c.type IN (` + placeholders(types) + `)
 	 WHERE o.id = ?`
+}
 
-// loadForConditionSet runs conditionSetLoad: the scope error, then the stored
-// condition or nil. Stored truth, undowngraded — see downgradeLiveness.
-func (s *sqliteStore) loadForConditionSet(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) (*storeapi.Condition, error) {
-	var (
-		group, kind             string
-		status, reason, message sql.NullString
-		liveness                sql.NullBool
-		updatedAt               sql.NullInt64
-	)
-	err := s.conn(ctx).QueryRowContext(ctx, conditionSetLoad, condType, id).
-		Scan(&group, &kind, &status, &reason, &message, &liveness, &updatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, storeapi.ErrNotFound // bare, like scanObject's
+// loadForConditionSet runs conditionSetLoad over the types being written: the
+// scope error, then whichever of them are stored, keyed by type. Stored truth,
+// undowngraded — see downgradeLiveness.
+func (s *sqliteStore) loadForConditionSet(
+	ctx context.Context,
+	gk storeapi.GroupKind,
+	id storeapi.ObjectID,
+	types []string,
+) (map[string]storeapi.Condition, error) {
+	args := make([]any, 0, len(types)+1)
+	for _, t := range types {
+		args = append(args, t)
 	}
+	args = append(args, id)
+	rows, err := s.conn(ctx).QueryContext(ctx, conditionSetLoad(len(types)), args...)
 	if err != nil {
 		return nil, err
 	}
-	if err := gateKind(gk, id, group, kind); err != nil {
+	defer rows.Close()
+	existing := make(map[string]storeapi.Condition, len(types))
+	var gated bool
+	for rows.Next() {
+		var (
+			group, kind                       string
+			condType, status, reason, message sql.NullString
+			liveness                          sql.NullBool
+			updatedAt                         sql.NullInt64
+		)
+		if err := rows.Scan(&group, &kind, &condType, &status, &reason, &message,
+			&liveness, &updatedAt); err != nil {
+			return nil, err
+		}
+		if !gated {
+			if err := gateKind(gk, id, group, kind); err != nil {
+				return nil, err
+			}
+			gated = true
+		}
+		if !status.Valid { // LEFT JOIN miss: the object holds none of these types
+			continue
+		}
+		existing[condType.String] = storeapi.Condition{
+			Type:      condType.String,
+			Status:    status.String,
+			Reason:    reason.String,
+			Message:   message.String,
+			Liveness:  liveness.Bool,
+			UpdatedAt: fromMillis(updatedAt.Int64),
+		}
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if !status.Valid {
-		return nil, nil
+	if !gated {
+		return nil, storeapi.ErrNotFound // bare, like scanObject's
 	}
-	return &storeapi.Condition{
-		Type:      condType,
-		Status:    status.String,
-		Reason:    reason.String,
-		Message:   message.String,
-		Liveness:  liveness.Bool,
-		UpdatedAt: fromMillis(updatedAt.Int64),
-	}, nil
+	return existing, nil
 }
 
 // bumpObject advances id's resource_version — the visibility half of the
@@ -1633,43 +1662,92 @@ func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, gk storeapi.GroupK
 	return err
 }
 
-// conditionUnchanged reports whether an existing condition already matches the
+// conditionUnchanged reports whether a stored condition already matches the
 // proposed write — the no-op case.
-func (s *sqliteStore) conditionUnchanged(existing *storeapi.Condition, want storeapi.Condition) bool {
-	if existing == nil {
+func (s *sqliteStore) conditionUnchanged(existing map[string]storeapi.Condition, want storeapi.Condition) bool {
+	stored, ok := existing[want.Type]
+	if !ok {
 		return false
 	}
 	// A stale liveness re-confirmation must NOT be suppressed: the write refreshes
 	// updated_at and clears the downgrade; skipping it would pin Unknown forever.
-	if s.livenessStale(existing) {
+	if s.livenessStale(&stored) {
 		return false
 	}
-	return existing.Status == want.Status &&
-		existing.Reason == want.Reason &&
-		existing.Message == want.Message &&
-		existing.Liveness == want.Liveness
+	return stored.Status == want.Status &&
+		stored.Reason == want.Reason &&
+		stored.Message == want.Message &&
+		stored.Liveness == want.Liveness
 }
 
-func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, cond storeapi.Condition) error {
-	// Within keeps the condition write and the object's version bump atomic.
+// conditionChunkSize bounds the conditions bound per upsert, under SQLite's
+// parameter limit at eight parameters a row. A var so tests can shrink it.
+var conditionChunkSize = 512
+
+func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, conds ...storeapi.Condition) error {
+	if len(conds) == 0 {
+		return nil
+	}
+	types := make([]string, 0, len(conds))
+	seen := make(map[string]bool, len(conds))
+	for _, cond := range conds {
+		if seen[cond.Type] {
+			return fmt.Errorf("%w: %q", storeapi.ErrDuplicateConditionType, cond.Type)
+		}
+		seen[cond.Type] = true
+		types = append(types, cond.Type)
+	}
+	// Within keeps the condition writes and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// One read: a metadata-only gate — clean ErrNotFound/ErrWrongKind instead of
-		// an FK violation, no blob decoded — joined to the stored condition, since
-		// no-op suppression needs it and both key on the same object.
-		existing, err := s.loadForConditionSet(ctx, gk, id, cond.Type)
+		// an FK violation, no blob decoded — joined to the stored conditions of the
+		// types being written, since no-op suppression needs them and all key on the
+		// same object.
+		existing, err := s.loadForConditionSet(ctx, gk, id, types)
 		if err != nil {
 			return err
 		}
-		if s.conditionUnchanged(existing, cond) {
+		changed := make([]storeapi.Condition, 0, len(conds))
+		for _, cond := range conds {
+			if !s.conditionUnchanged(existing, cond) {
+				changed = append(changed, cond)
+			}
+		}
+		if len(changed) == 0 {
 			return nil
 		}
-		now := toMillis(time.Now().UTC())
+		if err := s.upsertConditions(ctx, c, id, changed); err != nil {
+			return err
+		}
+		// A condition change bumps resource_version — what watch polls and the
+		// dependency waker look at. One bump for the batch: a caller writing several
+		// conditions is reporting one pass, and a reader must never see half of it.
+		return s.bumpObject(ctx, c, gk, id)
+	})
+}
+
+// upsertConditions writes conds, all under one timestamp: they are one pass, so
+// splitting their clocks would date the same observation differently.
+func (s *sqliteStore) upsertConditions(
+	ctx context.Context,
+	c dbtx,
+	id storeapi.ObjectID,
+	conds []storeapi.Condition,
+) error {
+	now := toMillis(time.Now().UTC())
+	for start := 0; start < len(conds); start += conditionChunkSize {
+		chunk := conds[start:min(start+conditionChunkSize, len(conds))]
+		args := make([]any, 0, len(chunk)*8)
+		for _, cond := range chunk {
+			args = append(args, id, cond.Type, cond.Status, cond.Reason, cond.Message,
+				cond.Liveness, now, now)
+		}
 		if _, err := c.ExecContext(ctx, `
 			INSERT INTO conditions
 				(object_id, type, status, reason, message, liveness,
 				 transitioned_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES `+tupleRows(len(chunk), 8)+`
 			ON CONFLICT(object_id, type) DO UPDATE SET
 				status = excluded.status, reason = excluded.reason,
 				message = excluded.message, liveness = excluded.liveness,
@@ -1677,15 +1755,11 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 				-- unless the status differs from what's stored.
 				transitioned_at = CASE WHEN conditions.status <> excluded.status
 					THEN excluded.transitioned_at ELSE conditions.transitioned_at END,
-				updated_at = excluded.updated_at`,
-			id, cond.Type, cond.Status, cond.Reason, cond.Message, cond.Liveness,
-			now, now); err != nil {
+				updated_at = excluded.updated_at`, args...); err != nil {
 			return err
 		}
-		// A condition change bumps resource_version — what watch polls and the
-		// dependency waker look at.
-		return s.bumpObject(ctx, c, gk, id)
-	})
+	}
+	return nil
 }
 
 func (s sqliteConditions) Delete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) error {

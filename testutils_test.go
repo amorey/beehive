@@ -901,7 +901,7 @@ func (s *fakeStore) Conditions() storeapi.Conditions { return fakeConditions{} }
 // fakeConditions is fakeStore's conditions family.
 type fakeConditions struct{}
 
-func (fakeConditions) Set(context.Context, GroupKind, ObjectID, storeapi.Condition) error {
+func (fakeConditions) Set(context.Context, GroupKind, ObjectID, ...storeapi.Condition) error {
 	panic("not implemented: fakeStore.Conditions().Set")
 }
 

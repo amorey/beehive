@@ -103,6 +103,10 @@ var ErrInvalidName = storeapi.ErrInvalidName
 // row or a deletion-pending one. GetOrCreate returns the existing row instead.
 var ErrNameTaken = storeapi.ErrNameTaken
 
+// ErrDuplicateConditionType is returned by SetConditions when one call names a
+// condition type twice, whose outcome would otherwise depend on apply order.
+var ErrDuplicateConditionType = storeapi.ErrDuplicateConditionType
+
 // ErrStaleTxContext is returned by a nested Within whose ctx is not the
 // transaction's live innermost frame. Deep nesting on one goroutine is fine;
 // using a ctx from outside the frame you are in is not.
