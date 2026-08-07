@@ -1513,6 +1513,27 @@ func TestUpdateStatusRejectsFutureGeneration(t *testing.T) {
 	assert.Empty(t, reread.Status, "rejected status write must not store status")
 }
 
+// A zero observedGeneration is an uninitialised caller, not a stale report: no
+// row ever holds a generation below 1, so settling at one would bump
+// resource_version and wake dependents to record nothing.
+func TestUpdateStatusRejectsNonGeneration(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+
+	for _, gen := range []int64{0, -1} {
+		err := store.Objects().UpdateStatus(ctx, testGK, created.ID, gen, []byte(`{"msg":"hi"}`), 0)
+		require.ErrorIs(t, err, beehive.ErrInvalidObservedGeneration)
+	}
+
+	reread, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Nil(t, reread.ObservedGeneration)
+	assert.Empty(t, reread.Status, "rejected status write must not store status")
+	assert.Equal(t, created.ResourceVersion, reread.ResourceVersion)
+}
+
 func TestUpdateStatusAcceptsStaleGeneration(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -4033,22 +4054,26 @@ func TestGatedWritesReadNoBlobToGateOnKind(t *testing.T) {
 func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 	ctx := context.Background()
 	store := newRawStore(t)
-	id := insertBadFinalizersRow(t, store, testGK) // generation 1, no status, unsettled
+	id := insertBadFinalizersRow(t, store, testGK) // no status, unsettled
+	// Two generations, so the content write can land at the older one and leave
+	// the handshake to advance on the next call.
+	_, err := store.db.ExecContext(ctx, `UPDATE objects SET generation = 2 WHERE id = ?`, id)
+	require.NoError(t, err)
 	hideObjectColumn(t, store, "spec")
 
 	status := []byte(`{"msg":"hi"}`)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 0, status, 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 1, status, 0),
 		"the content branch")
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 1, status, 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 2, status, 0),
 		"identical bytes, handshake advancing")
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 1, status, 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 2, status, 0),
 		"identical bytes at a recorded generation: nothing written")
 
 	var obs int64
 	var stored string
 	require.NoError(t, store.db.QueryRowContext(ctx,
 		`SELECT observed_generation, status FROM objects WHERE id = ?`, id).Scan(&obs, &stored))
-	assert.Equal(t, int64(1), obs)
+	assert.Equal(t, int64(2), obs)
 	assert.JSONEq(t, `{"msg":"hi"}`, stored)
 
 	// The gates still answer from the columns it does read.
@@ -5712,14 +5737,15 @@ func TestUpdateStatusHandshakeResourceVersionError(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	status := []byte(`{"ok":true}`)
-	// Settle at generation 0 first, so the repeat call at the object's real
-	// generation is an unsettled no-op rather than the already-settled path.
-	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, 0, status, 0)
+	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
+	status := []byte(`{"ok":true}`)
+	// Settle at the older generation first, so the repeat call at the current one
+	// is an unsettled no-op rather than the already-settled path.
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 0))
 	dropSeq(t, store)
 
-	err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 0)
+	err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, bumped.Generation, status, 0)
 	require.Error(t, err)
 }
 
@@ -5928,7 +5954,7 @@ func TestScopedMutatorWrongKind(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store) // kind = testGK
 	other := beehive.GroupKind{Kind: "Other"}
-	err := store.Objects().UpdateStatus(ctx, other, obj.ID, 0, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(ctx, other, obj.ID, obj.Generation, []byte(`{}`), 0)
 	require.ErrorIs(t, err, beehive.ErrWrongKind)
 }
 

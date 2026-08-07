@@ -69,9 +69,15 @@ var ErrStaleTxContext = errors.New("beehive: transaction context is not the live
 // same-goroutine frames unwind before fn returns.
 var ErrConcurrentNestedTx = errors.New("beehive: nested transaction frame still open at commit")
 
-// ErrObservedGenerationFuture is returned by Objects().UpdateStatus when
-// observedGeneration exceeds the object's current generation.
+// ErrObservedGenerationFuture is returned by Objects().UpdateStatus and
+// Objects().SetObservedGeneration when observedGeneration exceeds the object's
+// current generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
+
+// ErrInvalidObservedGeneration is returned by the same two when
+// observedGeneration is below 1. generation is NOT NULL DEFAULT 1, so no object
+// ever holds one — a zero is an uninitialised caller, not a stale report.
+var ErrInvalidObservedGeneration = errors.New("beehive: observed generation is not a generation")
 
 // ErrSchemaVersionDowngrade is returned by Objects().UpdateSpec/Objects().UpdateStatus when the
 // caller's schema version is non-zero and lower than the row's. Zero means "no

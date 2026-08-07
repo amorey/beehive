@@ -1419,6 +1419,15 @@ func (s *sqliteStore) updateSpec(
 	return result, changed, err
 }
 
+// checkObservedGeneration rejects a generation no object can hold. Cheap enough
+// to run before the transaction opens.
+func checkObservedGeneration(observedGeneration int64) error {
+	if observedGeneration < 1 {
+		return fmt.Errorf("%w: reported %d", storeapi.ErrInvalidObservedGeneration, observedGeneration)
+	}
+	return nil
+}
+
 // Objects().UpdateStatus skips the status write when the incoming bytes equal the stored
 // ones at the same schema version: no resource_version bump, so no spurious
 // watch diff or dependent wake. A content no-op that advances the generation
@@ -1427,6 +1436,9 @@ func (s *sqliteStore) updateSpec(
 // fires at most once per generation. Identical status with the generation
 // already recorded writes nothing at all.
 func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) error {
+	if err := checkObservedGeneration(observedGeneration); err != nil {
+		return err
+	}
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
