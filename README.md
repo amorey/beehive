@@ -173,7 +173,7 @@ type Condition struct {
     Message  string // human-readable detail
     Liveness bool   // see below
 
-    // Set by the store on read, ignored by SetCondition.
+    // Set by the store on read, ignored on write.
     TransitionedAt time.Time // when Status last changed
     UpdatedAt      time.Time // when the condition was last written at all
 }
@@ -184,7 +184,8 @@ moves on every write that changes the condition — a new `Reason` or `Message` 
 a byte-identical rewrite does not. `TransitionedAt` moves only when `Status` itself
 flips, so "how long has this been Ready" is `time.Since(cond.TransitionedAt)` and
 "how fresh is this observation" is `UpdatedAt`. Both are decided by the store, so
-whatever you put in the `Condition` you hand to `SetCondition` is discarded.
+whatever you put in the `Condition` you hand to `SetCondition` or `SetConditions` is
+discarded.
 
 A liveness condition downgraded to `ConditionUnknown` on read keeps the stamps of the
 stored write: the downgrade is derived per process, not written, so `TransitionedAt`
@@ -656,6 +657,7 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 type ControllerClient[Status any] interface {
     UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
     SetCondition(ctx context.Context, id ObjectID, condition Condition) error
+    SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
     DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
     AddEvent(ctx context.Context, id ObjectID, event EventSpec) error
     DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
@@ -678,6 +680,10 @@ The generation handshake is the exception. `observedGeneration` and `ObservedAt`
 `ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `AddEvent` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
 
 → [ADR: the generation handshake and content no-ops](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md), for how the no-op splits the two halves of the write and why it is gated on the schema version.
+
+`SetConditions` writes several conditions of one object as **one** write: they land in a single transaction under a single `resource_version` bump, so a watcher never sees a fresh `Connected` beside a stale `Healthy`, and a dependent is woken once for the pass rather than once per condition. Suppression stays per condition — the ones matching what is stored are not rewritten, so their `UpdatedAt` holds — and a batch where every condition matches writes nothing at all, exactly like a single `SetCondition` no-op. Naming a type twice in one call is refused with `ErrDuplicateConditionType` rather than resolved by slice order, and nothing in that batch is written. An empty slice writes nothing.
+
+`SetCondition` is the one-condition spelling of the same write. Reach for `SetConditions` when one pass observes several conditions; both compose inside `Within`, which is what to use when conditions must land with an `UpdateStatus` or a `DeleteCondition` — `Within` gives you the atomicity, and `SetConditions` additionally collapses what would be one version bump and one log entry per condition into one of each.
 
 `GetOwner`, `ListDependencies`, `ListDependents` and `ListOwned` are the same lazy lookups the `Client` has. `Reconcile` is handed its object directly, with no read call of its own, so these are how it reads related edges. `GetOwner` returns the owner over `owned_by` and `ListOwned` the reverse, the owner's children; `ListDependents` is the reverse of `ListDependencies` over `depends_on`.
 

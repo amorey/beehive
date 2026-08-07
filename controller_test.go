@@ -402,6 +402,53 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "condition removed via ControllerClient")
 }
 
+// SetConditions is the batch a controller reaches for when one pass observes
+// several conditions: every one lands, and the object moves one version, so a
+// watcher cannot see the pass half-applied.
+func TestControllerClientSetConditions(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+
+	require.NoError(t, cc.SetConditions(ctx, obj.ID, []Condition{
+		{Type: "Connected", Status: ConditionTrue, Reason: "Dialed"},
+		{Type: "Healthy", Status: ConditionFalse, Reason: "ProbeFailed"},
+	}))
+
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	connected := findCondition(got.Conditions, "Connected")
+	healthy := findCondition(got.Conditions, "Healthy")
+	require.NotNil(t, connected)
+	require.NotNil(t, healthy)
+	assert.Equal(t, ConditionTrue, connected.Status)
+	assert.Equal(t, ConditionFalse, healthy.Status)
+	assert.Equal(t, obj.ResourceVersion+1, got.ResourceVersion, "the batch draws one version")
+
+	// A type named twice would apply in whichever order the caller happened to
+	// build the slice, so it is refused rather than resolved.
+	assert.ErrorIs(t, cc.SetConditions(ctx, obj.ID, []Condition{
+		{Type: "Ready", Status: ConditionTrue},
+		{Type: "Ready", Status: ConditionFalse},
+	}), ErrDuplicateConditionType)
+
+	require.NoError(t, cc.SetConditions(ctx, obj.ID, nil))
+	after, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, got.ResourceVersion, after.ResourceVersion,
+		"a refused batch and an empty one both write nothing")
+	assert.Nil(t, findCondition(after.Conditions, "Ready"))
+}
+
 func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

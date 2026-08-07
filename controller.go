@@ -65,6 +65,11 @@ type ControllerClient[Status any] interface {
 	// SetCondition writes id's condition of that type. The store stamps
 	// TransitionedAt and UpdatedAt; the passed values are ignored.
 	SetCondition(ctx context.Context, id ObjectID, condition Condition) error
+	// SetConditions writes every one of id's named conditions together, under a
+	// single version bump, so a watcher never sees half a pass. A type named
+	// twice is refused with ErrDuplicateConditionType; an empty slice writes
+	// nothing. Same stamping as SetCondition.
+	SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
 	// UpdateStatus records status and the generation this reconcile observed.
 	// Status that marshals to the stored bytes writes nothing, so a controller
 	// can report unconditionally without waking watchers on an unchanged poll —
@@ -115,13 +120,24 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	return c.wakeAfter(ctx, c.bh.store.Conditions().Set(ctx, c.gk, id, storeapi.Condition{
-		Type:     condition.Type,
-		Status:   string(condition.Status),
-		Reason:   condition.Reason,
-		Message:  condition.Message,
-		Liveness: condition.Liveness,
-	}))
+	return c.SetConditions(ctx, id, []Condition{condition})
+}
+
+func (c *controllerClientImpl[Status]) SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error {
+	if len(conditions) == 0 {
+		return nil
+	}
+	conds := make([]storeapi.Condition, len(conditions))
+	for i, condition := range conditions {
+		conds[i] = storeapi.Condition{
+			Type:     condition.Type,
+			Status:   string(condition.Status),
+			Reason:   condition.Reason,
+			Message:  condition.Message,
+			Liveness: condition.Liveness,
+		}
+	}
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Set(ctx, c.gk, id, conds...))
 }
 
 func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {

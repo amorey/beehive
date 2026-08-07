@@ -52,6 +52,11 @@ var ErrNameTaken = errors.New("beehive: name is already in use for this kind")
 // different kind than gk.
 var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 
+// ErrDuplicateConditionType is returned by Conditions().Set when one call names
+// a type twice: the batch's outcome would depend on the order it applies, so it
+// is refused rather than resolved.
+var ErrDuplicateConditionType = errors.New("beehive: condition type set twice in one write")
+
 // ErrStaleTxContext is returned by a nested Within whose ctx is not the
 // transaction's live innermost frame: another goroutine's frame, an enclosing
 // frame used while deeper ones are open, or a frame that already unwound.
@@ -829,9 +834,11 @@ type Conditions interface {
 	// wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row.
 	Delete(ctx context.Context, gk GroupKind, id ObjectID, condType string) error
 
-	// Set inserts or updates the condition keyed by (id, cond.Type). A real
-	// change bumps ResourceVersion; an identical write does nothing. Scoped to
-	// gk: wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row;
-	// read conditions back with Objects().Get.
-	Set(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
+	// Set inserts or updates the conditions keyed by (id, cond.Type), together:
+	// they land in one transaction under a single ResourceVersion bump, and a
+	// batch whose every condition matches what is stored writes nothing. A type
+	// named twice → ErrDuplicateConditionType; no conditions at all writes
+	// nothing. Scoped to gk: wrong kind → ErrWrongKind, missing id →
+	// ErrNotFound. Returns no row; read conditions back with Objects().Get.
+	Set(ctx context.Context, gk GroupKind, id ObjectID, conds ...Condition) error
 }

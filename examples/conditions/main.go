@@ -100,20 +100,22 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 			return beehive.Result{}, err
 		}
 	} else {
-		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
-			Type:    condProgressing,
-			Status:  beehive.ConditionTrue,
-			Reason:  "ScalingUp",
-			Message: msg,
-		}); err != nil {
-			return beehive.Result{}, err
-		}
-		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
-			Type:     condReady,
-			Status:   beehive.ConditionFalse,
-			Reason:   "ScalingUp",
-			Message:  msg,
-			Liveness: true,
+		// One pass observed both, so they go in one write: a watcher never sees
+		// this object Progressing beside a Ready left over from the last pass.
+		if err := client.SetConditions(ctx, obj.ID, []beehive.Condition{
+			{
+				Type:    condProgressing,
+				Status:  beehive.ConditionTrue,
+				Reason:  "ScalingUp",
+				Message: msg,
+			},
+			{
+				Type:     condReady,
+				Status:   beehive.ConditionFalse,
+				Reason:   "ScalingUp",
+				Message:  msg,
+				Liveness: true,
+			},
 		}); err != nil {
 			return beehive.Result{}, err
 		}
