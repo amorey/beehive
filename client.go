@@ -933,7 +933,7 @@ func (c *clientImpl[Spec, Status]) GetLatestEvent(ctx context.Context, id Object
 }
 
 // conditionsFromRaw maps the store's raw conditions to the public Condition
-// type, dropping storage-only bookkeeping. Returns nil for none.
+// type. Returns nil for none.
 func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 	if len(raw) == 0 {
 		return nil
@@ -941,11 +941,13 @@ func conditionsFromRaw(raw []storeapi.Condition) []Condition {
 	out := make([]Condition, len(raw))
 	for i, c := range raw {
 		out[i] = Condition{
-			Type:     c.Type,
-			Status:   ConditionStatus(c.Status),
-			Reason:   c.Reason,
-			Message:  c.Message,
-			Liveness: c.Liveness,
+			Type:           c.Type,
+			Status:         ConditionStatus(c.Status),
+			Reason:         c.Reason,
+			Message:        c.Message,
+			Liveness:       c.Liveness,
+			TransitionedAt: c.TransitionedAt,
+			UpdatedAt:      c.UpdatedAt,
 		}
 	}
 	return out

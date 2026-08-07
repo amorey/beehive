@@ -62,6 +62,8 @@ type ControllerClient[Status any] interface {
 	ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// ListOwned returns the objects id owns (its incoming owned_by edges).
 	ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// SetCondition writes id's condition of that type. The store stamps
+	// TransitionedAt and UpdatedAt; the passed values are ignored.
 	SetCondition(ctx context.Context, id ObjectID, condition Condition) error
 	// UpdateStatus records status and the generation this reconcile observed.
 	// Status that marshals to the stored bytes writes nothing, so a controller

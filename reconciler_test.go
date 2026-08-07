@@ -1292,8 +1292,11 @@ func TestRawToTypedSpecUnmarshalError(t *testing.T) {
 func TestRawToTypedMapsConditions(t *testing.T) {
 	specJSON, err := json.Marshal(tSpec{})
 	require.NoError(t, err)
+	transitioned := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	updated := transitioned.Add(time.Minute)
 	raw := &RawObject{Spec: specJSON, Conditions: []storeapi.Condition{
-		{Type: "Ready", Status: "True", Reason: "Up", Message: "ok", Liveness: true},
+		{Type: "Ready", Status: "True", Reason: "Up", Message: "ok", Liveness: true,
+			TransitionedAt: transitioned, UpdatedAt: updated},
 		{Type: "Healthy", Status: "False"},
 	}}
 
@@ -1305,6 +1308,8 @@ func TestRawToTypedMapsConditions(t *testing.T) {
 	assert.Equal(t, "Up", obj.Conditions[0].Reason)
 	assert.Equal(t, "ok", obj.Conditions[0].Message)
 	assert.True(t, obj.Conditions[0].Liveness)
+	assert.Equal(t, transitioned, obj.Conditions[0].TransitionedAt)
+	assert.Equal(t, updated, obj.Conditions[0].UpdatedAt)
 	assert.Equal(t, ConditionFalse, obj.Conditions[1].Status)
 }
 

@@ -172,8 +172,24 @@ type Condition struct {
     Reason   string // machine-readable token, e.g. "DialTimeout"
     Message  string // human-readable detail
     Liveness bool   // see below
+
+    // Set by the store on read, ignored by SetCondition.
+    TransitionedAt time.Time // when Status last changed
+    UpdatedAt      time.Time // when the condition was last written at all
 }
 ```
+
+`TransitionedAt` and `UpdatedAt` are the two clocks a condition carries. `UpdatedAt`
+moves on every write that changes the condition — a new `Reason` or `Message` counts,
+a byte-identical rewrite does not. `TransitionedAt` moves only when `Status` itself
+flips, so "how long has this been Ready" is `time.Since(cond.TransitionedAt)` and
+"how fresh is this observation" is `UpdatedAt`. Both are decided by the store, so
+whatever you put in the `Condition` you hand to `SetCondition` is discarded.
+
+A liveness condition downgraded to `ConditionUnknown` on read keeps the stamps of the
+stored write: the downgrade is derived per process, not written, so `TransitionedAt`
+describes the last stored status change rather than the downgrade. `UpdatedAt` is what
+makes the downgrade legible — it predates the current process, which is the rule.
 
 `Liveness` marks a condition that describes a live, in-process resource, and so is
 only valid inside the process that wrote it. On read, a liveness condition left by an
