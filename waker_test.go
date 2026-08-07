@@ -1587,7 +1587,7 @@ func TestTheWakerSeedReachesTheDatabase(t *testing.T) {
 
 	bh := newTestBeehive(t, store)
 	require.NotEqual(t, scanFailed, bh.waker.seed(context.Background()))
-	cursor, ok, err := store.DriverCursorsGet(context.Background(), cursorNameWaker)
+	cursor, ok, err := store.DriverCursors().Get(context.Background(), cursorNameWaker)
 	require.NoError(t, err)
 	require.True(t, ok, "the seed point reached the database")
 	assert.Equal(t, bh.waker.watermark, cursor)

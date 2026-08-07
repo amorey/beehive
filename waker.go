@@ -353,7 +353,7 @@ func (dw *waker) seed(ctx context.Context) scanResult {
 		return scanFailed
 	}
 
-	stored, ok, err := dw.bh.store.DriverCursorsGet(ctx, cursorNameWaker)
+	stored, ok, err := dw.bh.store.DriverCursors().Get(ctx, cursorNameWaker)
 	if err != nil {
 		if ctx.Err() != nil {
 			return scanFailed
@@ -561,7 +561,7 @@ func (dw *waker) persist(ctx context.Context) {
 	if now.Before(dw.persistOpensAt) {
 		return
 	}
-	if err := dw.bh.store.DriverCursorsSet(ctx, cursorNameWaker, dw.watermark); err != nil {
+	if err := dw.bh.store.DriverCursors().Set(ctx, cursorNameWaker, dw.watermark); err != nil {
 		dw.persistFailures++
 		dw.persistOpensAt = now.Add(dw.persistRetry.Next())
 		if dw.persistFailures > 1 {

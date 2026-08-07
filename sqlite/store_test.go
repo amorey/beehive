@@ -6351,7 +6351,7 @@ func stampDriverCursorAt(t *testing.T, store *sqliteStore, name string, at int64
 func TestDriverCursorsGetReportsAbsence(t *testing.T) {
 	store := newRawStore(t)
 
-	_, ok, err := store.DriverCursorsGet(context.Background(), "dependency_waker")
+	_, ok, err := store.DriverCursors().Get(context.Background(), "dependency_waker")
 	require.NoError(t, err)
 	assert.False(t, ok, "no driver has ever persisted a cursor here")
 }
@@ -6361,9 +6361,9 @@ func TestDriverCursorsSetThenGetRoundTrips(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 42))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 42))
 
-	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	cursor, ok, err := store.DriverCursors().Get(ctx, "dependency_waker")
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.EqualValues(t, 42, cursor)
@@ -6376,12 +6376,12 @@ func TestDriverCursorsSetNeverRegresses(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 20))
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 5))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 20))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 5))
 
 	// The public getter, not readDriverCursor: unlike the watermark table, the
 	// Store surface exposes exactly what this asserts on.
-	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	cursor, ok, err := store.DriverCursors().Get(ctx, "dependency_waker")
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.EqualValues(t, 20, cursor, "a lower cursor leaves the stored value alone")
@@ -6395,15 +6395,15 @@ func TestDriverCursorsSetSuppressesTheWriteWhenTheCursorDoesNotAdvance(t *testin
 	ctx := context.Background()
 	const sentinel = int64(1)
 
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 10))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 10))
 	stampDriverCursorAt(t, store, "dependency_waker", sentinel)
 
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 10))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 10))
 	_, updatedAt, ok := readDriverCursor(t, store, "dependency_waker")
 	require.True(t, ok)
 	assert.Equal(t, sentinel, updatedAt, "re-applying the same cursor rewrites nothing")
 
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 11))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 11))
 	cursor, updatedAt, ok := readDriverCursor(t, store, "dependency_waker")
 	require.True(t, ok)
 	assert.EqualValues(t, 11, cursor)
@@ -6417,7 +6417,7 @@ func TestDriverCursorsGetDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, ok, err := store.DriverCursorsGet(context.Background(), "dependency_waker")
+	_, ok, err := store.DriverCursors().Get(context.Background(), "dependency_waker")
 	require.Error(t, err)
 	assert.False(t, ok, "a failed read reports no cursor, but as an error rather than an absence")
 }
@@ -6430,9 +6430,9 @@ func TestDriverCursorsSetStoresAZeroCursor(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 0))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 0))
 
-	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	cursor, ok, err := store.DriverCursors().Get(ctx, "dependency_waker")
 	require.NoError(t, err)
 	require.True(t, ok, "a zero cursor still creates the row")
 	assert.Zero(t, cursor)
@@ -6444,10 +6444,10 @@ func TestDriverCursorsSetKeysByName(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 
-	require.NoError(t, store.DriverCursorsSet(ctx, "dependency_waker", 10))
-	require.NoError(t, store.DriverCursorsSet(ctx, "some_other_driver", 999))
+	require.NoError(t, store.DriverCursors().Set(ctx, "dependency_waker", 10))
+	require.NoError(t, store.DriverCursors().Set(ctx, "some_other_driver", 999))
 
-	cursor, ok, err := store.DriverCursorsGet(ctx, "dependency_waker")
+	cursor, ok, err := store.DriverCursors().Get(ctx, "dependency_waker")
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.EqualValues(t, 10, cursor, "a second driver's cursor leaves this one alone")

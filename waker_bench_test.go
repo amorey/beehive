@@ -191,7 +191,7 @@ func (s *wakeCountingStore) EdgesGroupIncomingByID(ctx context.Context, ids []Ob
 
 func (s *wakeCountingStore) DriverCursorsSet(ctx context.Context, name string, at int64) error {
 	s.cursorWrites++
-	return s.Store.DriverCursorsSet(ctx, name, at)
+	return s.Store.DriverCursors().Set(ctx, name, at)
 }
 
 // benchSpec returns a spec no row has held. A byte-identical write is a no-op

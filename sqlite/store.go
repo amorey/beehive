@@ -40,6 +40,10 @@ type sqliteConditions struct{ *sqliteStore }
 
 func (s *sqliteStore) Conditions() storeapi.Conditions { return sqliteConditions{s} }
 
+type sqliteDriverCursors struct{ *sqliteStore }
+
+func (s *sqliteStore) DriverCursors() storeapi.DriverCursors { return sqliteDriverCursors{s} }
+
 // object_writes.op. The soft delete is an ordinary update: the row is still
 // live and readable, so only the GC's physical removal is writeOpDelete.
 const (
@@ -2736,7 +2740,7 @@ func (s *sqliteStore) EdgesHasIncoming(ctx context.Context, id storeapi.ObjectID
 
 // DriverCursorsGet reads name's persisted cursor (see storeapi.Store). A
 // missing row is ok=false: absence is the ordinary first-run state, not a fault.
-func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64, bool, error) {
+func (s sqliteDriverCursors) Get(ctx context.Context, name string) (int64, bool, error) {
 	var cursor int64
 	err := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT cursor FROM driver_cursors WHERE name = ?`, name).Scan(&cursor)
@@ -2752,7 +2756,7 @@ func (s *sqliteStore) DriverCursorsGet(ctx context.Context, name string) (int64,
 // DriverCursorsSet upserts name's persisted cursor (see storeapi.Store).
 // The WHERE on DO UPDATE keeps the cursor monotonic and suppresses a no-advance
 // write outright — no page dirtied on a quiet tick.
-func (s *sqliteStore) DriverCursorsSet(ctx context.Context, name string, cursor int64) error {
+func (s sqliteDriverCursors) Set(ctx context.Context, name string, cursor int64) error {
 	_, err := s.conn(ctx).ExecContext(ctx, `
 		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
 		    ON CONFLICT(name) DO UPDATE

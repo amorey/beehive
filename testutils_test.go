@@ -552,16 +552,15 @@ func (s *fakeStore) ReclaimSpace(context.Context, int) (int, error) {
 	return 0, nil
 }
 
-// DriverCursorsGet and DriverCursorsSet persist nothing, which the contract
-// permits: ok=false is "none stored yet", so a waker over this store reseeds
-// from the write log's max every time. cursorStore is the persisting double.
-func (s *fakeStore) DriverCursorsGet(context.Context, string) (int64, bool, error) {
-	return 0, false, nil
-}
+func (s *fakeStore) DriverCursors() storeapi.DriverCursors { return noopDriverCursors{} }
 
-func (s *fakeStore) DriverCursorsSet(context.Context, string, int64) error {
-	return nil
-}
+// noopDriverCursors persists nothing, which the contract permits: ok=false is
+// "none stored yet", so a waker over it reseeds from the write log's max every
+// time. cursorStore is the persisting double.
+type noopDriverCursors struct{}
+
+func (noopDriverCursors) Get(context.Context, string) (int64, bool, error) { return 0, false, nil }
+func (noopDriverCursors) Set(context.Context, string, int64) error         { return nil }
 func (s *fakeStore) ObjectWritesMaxVersionAll(context.Context) (int64, int64, error) {
 	// Zero rather than a panic: every Beehive whose waker runs seeds from this, so a
 	// panic would make the fake unusable for anything that calls Start.
@@ -734,7 +733,13 @@ type cursorStore struct {
 	setAttempts int
 }
 
-func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, bool, error) {
+func (s *cursorStore) DriverCursors() storeapi.DriverCursors { return cursorStoreCursors{s} }
+
+// cursorStoreCursors is cursorStore's scripted cursor table.
+type cursorStoreCursors struct{ s *cursorStore }
+
+func (c cursorStoreCursors) Get(_ context.Context, name string) (int64, bool, error) {
+	s := c.s
 	if s.getErr != nil {
 		return 0, false, s.getErr
 	}
@@ -742,7 +747,8 @@ func (s *cursorStore) DriverCursorsGet(_ context.Context, name string) (int64, b
 	return v, ok, nil
 }
 
-func (s *cursorStore) DriverCursorsSet(_ context.Context, name string, cursor int64) error {
+func (c cursorStoreCursors) Set(_ context.Context, name string, cursor int64) error {
+	s := c.s
 	s.setAttempts++
 	if s.setErr != nil {
 		return s.setErr
