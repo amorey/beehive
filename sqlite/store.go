@@ -1419,6 +1419,16 @@ func (s *sqliteStore) updateSpec(
 	return result, changed, err
 }
 
+func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64) error {
+	// Within keeps the read-compare-write atomic.
+	return s.Within(ctx, func(ctx context.Context) error {
+		if err := s.selectScoped(ctx, gk, id, ""); err != nil {
+			return err
+		}
+		return s.stampObserved(ctx, s.conn(ctx), gk, id, observedGeneration)
+	})
+}
+
 // stampObserved writes the handshake alone: observed_generation and observed_at
 // under a fresh resource_version. updated_at tracks content and stays put.
 // Callers have proved the row exists in gk and have clamped observedGeneration.

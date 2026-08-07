@@ -1454,6 +1454,28 @@ func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
 	assert.JSONEq(t, `{"msg":"hi"}`, string(updated.Status))
 }
 
+// The handshake for a controller whose whole report is conditions: the
+// generation settles, the status column is untouched, and updated_at — which
+// tracks content — holds.
+func TestSetObservedGenerationSettlesWithoutWritingStatus(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+
+	require.NoError(t, store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation))
+
+	updated, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+	require.NotNil(t, updated.ObservedGeneration)
+	assert.EqualValues(t, created.Generation, *updated.ObservedGeneration)
+	require.NotNil(t, updated.ObservedAt)
+	assert.Greater(t, updated.ResourceVersion, created.ResourceVersion)
+	assert.Equal(t, created.UpdatedAt, updated.UpdatedAt, "updated_at tracks content")
+	assert.Empty(t, updated.Status, "no status written")
+	assert.Zero(t, updated.StatusVersion, "no status version stamped")
+}
+
 // TestSchemaVersionColumnsRoundTrip verifies the opaque per-column schema
 // versions: they default to 0, ObjectsCreate persists the caller-set spec version
 // (status is nil at create, so its version stays 0), and the version args to
