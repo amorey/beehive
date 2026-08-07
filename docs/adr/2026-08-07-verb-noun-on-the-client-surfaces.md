@@ -47,6 +47,35 @@ whole handle, and `ctx` cancellation ends and closes it. A watch over a **gauge*
 `EventChange` gap that record left open is still open, and still a behavioural
 change rather than a rename.
 
+### What was renamed
+
+Breaking, with no deprecation shim — pre-release. `Client`:
+
+| Old | New | | Old | New |
+| --- | --- | --- | --- | --- |
+| `DependenciesList` | `ListDependencies` | | `OwnedObjectsListWatch` | `WatchOwnedObjects` |
+| `DependentsList` | `ListDependents` | | `OwnersGet` | `GetOwner` |
+| `EventsGetLatest` | `GetLatestEvent` | | `SchedulesGet` | `GetSchedule` |
+| `EventsList` | `ListEvents` | | `SchedulesWatch` | `WatchSchedule` |
+| `EventsWatch` | `WatchEvents` | | `OwnedList` | `ListOwned` |
+| `OwnedObjectsList` | `ListOwnedObjects` | | | |
+
+`ControllerClient`:
+
+| Old | New | | Old | New |
+| --- | --- | --- | --- | --- |
+| `ConditionsDelete` | `DeleteCondition` | | `EdgesHasIncoming` | `HasIncomingEdges` |
+| `ConditionsSet` | `SetCondition` | | `EventsAdd` | `AddEvent` |
+| `DependenciesAdd` | `AddDependency` | | `FinalizersDelete` | `DeleteFinalizer` |
+| `DependenciesDelete` | `DeleteDependency` | | `OwnedList` | `ListOwned` |
+| `DependenciesList` | `ListDependencies` | | `OwnersGet` | `GetOwner` |
+| `DependentsList` | `ListDependents` | | | |
+
+Unchanged: `Client`'s `Create`/`Delete`/`DeleteByName`/`Get`/`GetByName`/
+`GetOrCreate`/`List`/`Requeue`/`Update`/`UpdateByName`/`Watch`/`WatchList`, and
+`ControllerClient`'s `UpdateStatus`/`Within`. The four relation reads are spelled
+identically on both surfaces, as before. No type was renamed.
+
 ## Consequences
 
 **Godoc no longer groups a type's methods by family.** This is the cost, and it

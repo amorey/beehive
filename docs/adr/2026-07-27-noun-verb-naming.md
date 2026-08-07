@@ -1,25 +1,18 @@
 # Methods are named NounsVerb, and every watch returns a change or a value
 
-- **Status:** Superseded — rule 1 governs no surface. `Store` moved to accessors
-  (see the amendment below); `Client` and `ControllerClient` moved to `VerbNoun`
-  in [the client-surface record](2026-08-07-verb-noun-on-the-client-surfaces.md),
-  which restates rule 2 unchanged.
+- **Status:** Its `NounsVerb` rule is dead — `Store` moved to accessors, then
+  `Client`/`ControllerClient` to
+  [`VerbNoun`](2026-08-07-verb-noun-on-the-client-surfaces.md), which restates
+  rule 2 unchanged. Kept, not deleted, because several judgment calls below are
+  still the only argument for names in live code: `ObjectRef` over
+  `Ref`/`Referrer`, `Add` over `Record` as the write verb, the singular
+  `ReconcileOwed` family, and `DeletionRequests…From`.
 - **Date:** 2026-07-27
 
-> **Amended 2026-08-07, twice.** This record governs neither surface now. Its
-> names below are left as they were written — several of its arguments are
-> *about* those names.
->
-> `Store` went first: the noun moved from the method name onto a type, and each
-> family is reached through an accessor (`store.Edges().Add`). That drops the two
-> costs recorded in *Consequences* — the verb in the middle, and the verb slot
-> reading as a verb only by habit — and lets `Edges().HasIncoming` read as the
-> predicate it is.
->
-> `Client` and `ControllerClient` followed, to `VerbNoun`, for the second of
-> those costs and because they were the last surface reading noun-first. What
-> that gives up is this record's whole argument — godoc grouping a type's
-> methods by family — which the successor records rather than inherits.
+> **Amended 2026-08-07.** Names below are left as written — several arguments
+> are *about* those names, and the `Store` half's two recorded costs (the verb in
+> the middle, and the verb slot reading as a verb only by habit) are what the two
+> moves were for.
 
 ## Context
 

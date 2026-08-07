@@ -358,12 +358,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 
 ## Conventions
 
-- **The noun names a type, and the method is a bare verb.** On `Store` each
+- **On `Store` the noun names a type; on the client surfaces the method is
+  `VerbNoun`.** On `Store` each
   family is a sub-API reached through an accessor (`store.Edges().Add`,
   `store.Objects().ListUnsettledIDs`), so no method carries its family in its
   name. A member with no family behind it sits on the root and carries the noun
-  in the name, verb first (`GetLatestResourceVersion`, `ReclaimSpace`) — the same
-  `VerbNoun` shape `Client` uses. A family is earned by a **protocol worth its own
+  in the name, verb first (`GetLatestResourceVersion`, `ReclaimSpace`). A family is earned by a **protocol worth its own
   noun**, usually a table: `finalizers` is one column and one method, so it went to
   `Objects` (`Objects().DeleteFinalizer`), while `reconcile_owed` and
   `deletion_requested_at` are columns on `objects` that carry four methods each and

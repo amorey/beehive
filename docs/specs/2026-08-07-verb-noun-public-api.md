@@ -1,6 +1,9 @@
 # Spec: rename the public API surface from `NounsVerb` to `VerbNoun`
 
-- **Status:** Proposed — not yet implemented.
+- **Status:** Implemented. **Spent** — this is the work order, kept for its
+  execution detail; the live record of the rule, the judgment calls and what it
+  cost is [the ADR](../adr/2026-08-07-verb-noun-on-the-client-surfaces.md).
+  Amend that, never this.
 - **Date:** 2026-08-07
 - **Branch:** `public-api-rename`
 - **Scope:** `Client` and `ControllerClient` method names, plus every call site,

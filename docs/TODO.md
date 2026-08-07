@@ -147,15 +147,16 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
 
 - **`List` in a method name may be saying what the return type already says** —
   proposed, not decided, and pre-release or never. `ListOwned` → `Owned`,
-  `ListOwnedObjects` → `OwnedObjects`, `WatchOwnedObjects` →
-  `OwnedObjectsWatch`, `ListEvents` → `Events`, `EdgesListIncoming` →
-  `EdgesIncoming`: twenty distinct method names across `Client`,
-  `ControllerClient` and `Store`. The `Store` half is reshaped since the families
-  moved onto types — there the question is now `Edges().ListIncoming` →
-  `Edges().Incoming`.
+  `ListOwnedObjects` → `OwnedObjects`, `ListEvents` → `Events`, and on the store
+  `Edges().ListIncoming` → `Edges().Incoming`: twenty distinct method names
+  across `Client`, `ControllerClient` and `Store`.
+
+  Only the cardinality verbs are in question. `WatchOwnedObjects` and the other
+  watches keep theirs — `Watch` says what the method *does*, not how many it
+  returns, and a bare `OwnedObjects` could not say it streams.
 
   **The argument is already in the naming ADR, applied to a different surface.**
-  `Object`'s relation accessors dropped their verbs — `GetOwner`/`ListDependencies`
+  `Object`'s relation accessors dropped their verbs — `OwnersGet`/`DependenciesList`
   became `Owner()`/`Dependencies()` — because "the `Get`/`List` cardinality signal
   moves to the return type, which already carried it"
   ([ADR](adr/2026-07-27-noun-verb-naming.md)). A plural noun returning a slice has
@@ -168,12 +169,12 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   call site. That is the case to make or reject, and it is not obviously wrong
   either way.
 
-  **The bare family cannot follow.** `Client`'s own CRUD omits the prefix, so
-  `List` has no noun to fall back on, and `WatchList` cannot become `Watch` —
-  taken by the single-object watch. The rule would have to read "drop the verb on
-  a prefixed family, keep it where the family is the receiver", which is a second
-  exception stacked on the omit-the-prefix one. Whether that is one convention or
-  two is the thing to settle before touching a single name.
+  **The bare `List` cannot follow.** `Client`'s own CRUD omits the noun, so
+  `List` has none to fall back on, and `WatchList` cannot become `Watch` —
+  taken by the single-object watch. The rule would have to read "drop the verb
+  where a noun is spoken, keep it where the noun is the receiver's own kind",
+  which is a second exception stacked on the omit-the-noun one. Whether that is
+  one convention or two is the thing to settle before touching a single name.
 
   Two more loose ends. Whether `Get` goes too (`GetOwner` → `Owner`), which reads
   well but gives the client the same spelling as `Object.Owner()` for a different
@@ -338,7 +339,7 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   current state, which is sound only because an `owned_by` edge is written at
   create and removed at collect, both of them logged writes to the child.
 
-  `depends_on` has neither property: `AddDependency`/`DependenciesRemove`
+  `depends_on` has neither property: `AddDependency`/`DeleteDependency`
   mutate edges freely, and `EdgesAdd`/`EdgesDelete` bump nothing, so an edge
   change is invisible to the tail. A scoped watch there needs the edge write to
   become a write to its source first — which is a change to what the write log

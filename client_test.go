@@ -2014,6 +2014,43 @@ func TestOwnedByIsWrittenInOnePlace(t *testing.T) {
 	assert.Equal(t, []string{"client.go:insertObject"}, sites)
 }
 
+// Source order is the convention godoc renders, so a member added in the wrong
+// place makes the file and the doc page disagree.
+func TestThePublicSurfacesAreListedAlphabetically(t *testing.T) {
+	for _, tc := range []struct {
+		file, iface string
+	}{
+		{"client.go", "Client"},
+		{"controller.go", "ControllerClient"},
+	} {
+		t.Run(tc.iface, func(t *testing.T) {
+			names := interfaceMethods(t, tc.file, tc.iface)
+			require.NotEmpty(t, names)
+			assert.IsIncreasing(t, names)
+		})
+	}
+}
+
+// interfaceMethods returns the named interface's methods in source order.
+func interfaceMethods(t *testing.T, file, iface string) []string {
+	t.Helper()
+	parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+	require.NoError(t, err)
+
+	var names []string
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		spec, ok := n.(*ast.TypeSpec)
+		if !ok || spec.Name.Name != iface {
+			return true
+		}
+		for _, m := range spec.Type.(*ast.InterfaceType).Methods.List {
+			names = append(names, m.Names[0].Name)
+		}
+		return false
+	})
+	return names
+}
+
 // relationName reads the relation constant out of a call argument, spelled bare
 // inside this package and qualified as storeapi.X everywhere else.
 func relationName(arg ast.Expr) string {
