@@ -91,7 +91,7 @@ func (bh *Beehive) gcCollect(ctx context.Context, id ObjectID) (deleted bool, er
 		}
 
 		// Read before the delete: edges.from_id is ON DELETE CASCADE. owned_by
-		// only: EdgesHasIncoming discounts depends_on from a deleting source.
+		// only: Edges().HasIncoming discounts depends_on from a deleting source.
 		owners, err := bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationOwnedBy)
 		if err != nil {
 			return err

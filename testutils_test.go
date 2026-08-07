@@ -466,7 +466,7 @@ func (s *fakeStore) ReconcileOwed() storeapi.ReconcileOwed { return fakeReconcil
 type fakeReconcileOwed struct{}
 
 func (fakeReconcileOwed) Decrement(context.Context, GroupKind, ObjectID, int64) error {
-	panic("not implemented: fakeStore.ReconcileOwedDecrement")
+	panic("not implemented: fakeStore.ReconcileOwed().Decrement")
 }
 
 func (fakeReconcileOwed) ListIDs(context.Context, GroupKind) ([]ObjectID, error) {
@@ -772,11 +772,11 @@ func (fakeObjects) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int)
 }
 
 func (fakeObjects) UpdateSpecByName(context.Context, GroupKind, string, []byte, int) (*RawObject, bool, error) {
-	panic("not implemented: ObjectsUpdateSpecByName")
+	panic("not implemented: fakeStore.Objects().UpdateSpecByName")
 }
 
 func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
-	panic("not implemented: fakeStore.UpdateStatus")
+	panic("not implemented: fakeStore.Objects().UpdateStatus")
 }
 
 func (fakeObjects) List(context.Context, GroupKind) ([]*RawObject, error) {
@@ -799,7 +799,7 @@ type objectsOverride struct {
 	listByIncomingEdge func(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error)
 	listIDs            func(context.Context, GroupKind) ([]ObjectID, error)
 	listUnsettledIDs   func(context.Context, GroupKind) ([]ObjectID, error)
-	objectsDelete      func(context.Context, ObjectID) error
+	delete             func(context.Context, ObjectID) error
 	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
 	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
 	updateStatus       func(context.Context, GroupKind, ObjectID, int64, []byte, int) error
@@ -813,8 +813,8 @@ func (o objectsOverride) Create(ctx context.Context, gk GroupKind, in storeapi.O
 }
 
 func (o objectsOverride) Delete(ctx context.Context, id ObjectID) error {
-	if o.objectsDelete != nil {
-		return o.objectsDelete(ctx, id)
+	if o.delete != nil {
+		return o.delete(ctx, id)
 	}
 	return o.Objects.Delete(ctx, id)
 }

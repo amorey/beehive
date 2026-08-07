@@ -78,7 +78,7 @@ tick it is the waker's only cadence and the clamp is gone.
 
 **The cursor write is floored at `wakePersistInterval` (1s).** `scan` persists on the way
 out whenever the watermark moved, which under a sustained stream is every pass —
-so a 10×-faster loop would have meant a 10×-faster `DriverCursorsSet`. Every
+so a 10×-faster loop would have meant a 10×-faster `DriverCursors().Set`. Every
 other cost here is a read competing for connection time; this one is a bare
 write competing for the write lock, which is what the commits themselves need.
 Gating it keeps the cursor write rate exactly what it was. The cursor is an

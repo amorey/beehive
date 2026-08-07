@@ -62,7 +62,7 @@ type waker struct {
 
 	// persisted is what the stored cursor row holds (noStoredCursor when none).
 	// Comparing against it keeps a pass from paying a round trip for a write
-	// DriverCursorsSet would discard anyway.
+	// DriverCursors().Set would discard anyway.
 	persisted int64
 
 	// persistFailures counts the current streak of failed cursor writes, so the

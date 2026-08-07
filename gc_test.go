@@ -143,7 +143,7 @@ type collectFakeStore struct {
 const collectedID ObjectID = 1
 
 func (s *collectFakeStore) Objects() storeapi.Objects {
-	return objectsOverride{Objects: s.fakeStore.Objects(), getMeta: s.getMetaObjects, objectsDelete: s.deleteObjects}
+	return objectsOverride{Objects: s.fakeStore.Objects(), getMeta: s.getMetaObjects, delete: s.deleteObjects}
 }
 
 func (s *collectFakeStore) getMetaObjects(_ context.Context, id ObjectID) (*RawObject, error) {

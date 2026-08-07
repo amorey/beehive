@@ -493,7 +493,7 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 
 func (c *clientImpl[Spec, Status]) Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error) {
 	return c.update(ctx, spec, func(ctx context.Context, b []byte, version int) (*RawObject, bool, error) {
-		// ObjectsUpdateSpec folds this client's kind into the write;
+		// Objects().UpdateSpec folds this client's kind into the write;
 		// hideWrongKind keeps a foreign id invisible.
 		raw, changed, err := c.bh.store.Objects().UpdateSpec(ctx, c.gk, id, b, version)
 		return raw, changed, c.hideWrongKind(err)
@@ -867,7 +867,7 @@ func (c *clientImpl[Spec, Status]) SchedulesGet(ctx context.Context, id ObjectID
 }
 
 func (c *clientImpl[Spec, Status]) Delete(ctx context.Context, id ObjectID) error {
-	// DeletionRequestsCreate bumps resource_version only on a real change, so
+	// DeletionRequests().Create bumps resource_version only on a real change, so
 	// an idempotent retry triggers no spurious watch diff. Kind-folded;
 	// hideWrongKind keeps a foreign id invisible.
 	res, err := c.bh.store.DeletionRequests().Create(ctx, c.gk, id)

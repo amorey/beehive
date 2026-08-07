@@ -41,7 +41,7 @@ const (
 // query as of the subscribe, the position they were read at, and what the log
 // grows by after it.
 type EventStream struct {
-	// Runs is the snapshot, newest-first like EventsList. Empty on a resume.
+	// Runs is the snapshot, newest-first like Events().List. Empty on a resume.
 	Runs []Event
 	// ResourceVersion is the position Runs was read at, and the value to hand
 	// back to WithEventsResumeFrom.

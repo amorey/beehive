@@ -145,7 +145,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   below the watermark, which would otherwise be retried only by a commit that may
   never come. Going
   idle **stops** the timer, or one already ready drives a pass nobody asked for.
-  The cursor persists via `Store.DriverCursorsSet`; it is an optimisation
+  The cursor persists via `Store.DriverCursors().Set`; it is an optimisation
   over the stale-dependents pass, never a guarantee. **Both store-wide reads
   report the retention horizon** beside their value rather than folded in — the
   abandon jump needs the bare mark — so a cursor below the boundary is warned about
@@ -223,7 +223,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **The event watch reads one object's log above a cursor, one reader per
   watch** (`eventswatch.go`). An extend re-samples `events.resource_version`, so
   "runs above the cursor" is exactly what changed and the old `seen`/`EventID`
-  diff is gone. `Events().Add`'s commit wakes it through `eventWriteHub` (keyed by
+  diff is gone. `ControllerClient.EventsAdd`'s commit wakes it through `eventWriteHub` (keyed by
   id, not kind); the floor tick covers a foreign writer. Nothing is shared — the
   read is already per object and already indexed — so there is no lease
   machinery, and no merge either: the stream is unbuffered, so a consumer that
@@ -363,8 +363,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `store.Objects().ListUnsettledIDs`), so no method carries its family in its
   name. A member with no family behind it sits on the root and carries the noun
   in the name, verb first (`GetLatestResourceVersion`, `ReclaimSpace`) — the same
-  `VerbNoun` shape `Client` uses. A family is earned by a **table**; a column on
-  `objects` belongs to `Objects` (`Objects().DeleteFinalizer`). Cardinality stays
+  `VerbNoun` shape `Client` uses. A family is earned by a **protocol worth its own
+  noun**, usually a table: `finalizers` is one column and one method, so it went to
+  `Objects` (`Objects().DeleteFinalizer`), while `reconcile_owed` and
+  `deletion_requested_at` are columns on `objects` that carry four methods each and
+  keep families of their own. Cardinality stays
   in the verb (`Get`/`Watch` for one, `List`/`WatchList` for many). On
   `Client`/`ControllerClient` the receiver is already its kind, so its own CRUD
   stays bare and its secondary nouns keep the `NounsVerb` prefix

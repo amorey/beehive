@@ -45,19 +45,19 @@ type Store = storeapi.Store
 // JSON plus Beehive-owned metadata.
 type RawObject = storeapi.RawObject
 
-// ObjectsCreateInput is the write shape ObjectsCreate accepts — only the fields a
+// ObjectsCreateInput is the write shape Objects().Create accepts — only the fields a
 // create honours.
 type ObjectsCreateInput = storeapi.ObjectsCreateInput
 
 // RawEvent is the untyped event-log row below the generic boundary.
 type RawEvent = storeapi.Event
 
-// EventsAddInput is the write shape EventsAdd accepts — only the fields a
+// EventsAddInput is the write shape Events().Add accepts — only the fields a
 // recorded observation carries.
 type EventsAddInput = storeapi.EventsAddInput
 
 // DeletionCascadeChild is one owned child of a deletion cascade, as
-// DeletionRequestsCreateFromOwner reports it.
+// DeletionRequests().CreateFromOwner reports it.
 type DeletionCascadeChild = storeapi.DeletionCascadeChild
 
 // Relation is the kind of edge in the edges table.
@@ -116,7 +116,7 @@ var ErrConcurrentNestedTx = storeapi.ErrConcurrentNestedTx
 // reports a generation greater than the object's current one.
 var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
 
-// ErrSchemaVersionDowngrade is returned by ObjectsUpdateSpec/UpdateStatus when the
+// ErrSchemaVersionDowngrade is returned by Objects().UpdateSpec/UpdateStatus when the
 // caller's schema version is lower than the one stamped on the row.
 var ErrSchemaVersionDowngrade = storeapi.ErrSchemaVersionDowngrade
 
@@ -271,7 +271,7 @@ const (
 )
 
 // EventSpec is the caller-supplied portion of an event, passed to
-// ControllerClient.EventsAdd. Consecutive emissions sharing (Category, Type,
+// ControllerClient.Events().Add. Consecutive emissions sharing (Category, Type,
 // Reason) coalesce into one run; Message and Detail are sampled (latest wins).
 type EventSpec struct {
 	Category string // independent timeline; "" = default

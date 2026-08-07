@@ -162,7 +162,7 @@ func (c *controllerClientImpl[Status]) FinalizersDelete(ctx context.Context, id 
 }
 
 // DependenciesAdd is one store call, not a composition: the edge and the durable
-// reconcile-owed stamp are indivisible inside EdgesAdd, so an edge can never
+// reconcile-owed stamp are indivisible inside Edges().Add, so an edge can never
 // commit without its wake. The enqueue below is the prompt half; the stamp is
 // the guarantee. It is gated on the store reporting the edge as new — which
 // bounds it to one enqueue per edge ever created — and routed by res.From

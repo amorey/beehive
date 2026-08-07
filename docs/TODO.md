@@ -150,7 +150,9 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   `OwnedObjectsList` → `OwnedObjects`, `OwnedObjectsListWatch` →
   `OwnedObjectsWatch`, `EventsList` → `Events`, `EdgesListIncoming` →
   `EdgesIncoming`: twenty distinct method names across `Client`,
-  `ControllerClient` and `Store`.
+  `ControllerClient` and `Store`. The `Store` half is reshaped since the families
+  moved onto types — there the question is now `Edges().ListIncoming` →
+  `Edges().Incoming`.
 
   **The argument is already in the naming ADR, applied to a different surface.**
   `Object`'s relation accessors dropped their verbs — `GetOwner`/`ListDependencies`

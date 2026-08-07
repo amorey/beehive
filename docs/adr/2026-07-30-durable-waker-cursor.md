@@ -39,8 +39,9 @@ approximate as it already was.**
 ### Cursor persistence, a required `Store` member
 
 ```go
-DriverCursorsGet(ctx context.Context, name string) (cursor int64, ok bool, err error)
-DriverCursorsSet(ctx context.Context, name string, cursor int64) error
+// Store.DriverCursors()
+Get(ctx context.Context, name string) (cursor int64, ok bool, err error)
+Set(ctx context.Context, name string, cursor int64) error
 ```
 
 This began as an optional `DriverCursorer` the waker type-asserted, so a `Store`
@@ -59,7 +60,7 @@ the way it can for `Get`/`GetOrCreate`.
 The sqlite implementation is `driver_cursors`, one row per driver name (one row
 today: `"dependency_waker"`), `WITHOUT ROWID` because the key is `TEXT` rather
 than the `INTEGER PRIMARY KEY`-aliases-the-rowid case `dependency_watermarks`
-makes its own rowid argument on. `DriverCursorsSet` is the same monotone,
+makes its own rowid argument on. `DriverCursors().Set` is the same monotone,
 self-suppressing upsert as `Dependencies().WatermarkSet`: a lower cursor is refused,
 and a cursor that hasn't advanced dirties no page — load-bearing at a 1s tick
 rate on a store that may otherwise be idle. Single-writer, and documented as
@@ -154,7 +155,7 @@ scheduled sit *above* it and are scanned on the next tick. The race survives
 only on the very first start of a fresh database, where there is nothing stored
 yet and the fallback is `max`, as before. That weakens the case for seeding
 synchronously in `Start` without removing it — and a synchronous seed would now
-read *two* rows (`ObjectWrites().MaxVersion` and `DriverCursorsGet`) inside
+read *two* rows (`ObjectWrites().MaxVersion` and `DriverCursors().Get`) inside
 `Start`'s critical section instead of one, which is the same hesitation that
 item already records, doubled.
 

@@ -50,7 +50,7 @@ abandoning startup, and `Start` already contracts to answer `start aborted` for
 it, so it tears the subscription back down and returns that error.
 
 `Start` also becomes a store *writer*: `seed` ends in `persist`, so a fresh
-store takes one `DriverCursorsSet` for the seed point. A store that refuses it
+store takes one `DriverCursors().Set` for the seed point. A store that refuses it
 warns and startup continues.
 
 ### run keeps its eager first pass
