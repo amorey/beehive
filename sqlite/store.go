@@ -1419,6 +1419,23 @@ func (s *sqliteStore) updateSpec(
 	return result, changed, err
 }
 
+// stampObserved writes the handshake alone: observed_generation and observed_at
+// under a fresh resource_version. updated_at tracks content and stays put.
+// Callers have proved the row exists in gk and have clamped observedGeneration.
+func (s *sqliteStore) stampObserved(ctx context.Context, c dbtx, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64) error {
+	rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
+	if err != nil {
+		return err
+	}
+	// No RETURNING: no row reported, and the caller's scoped read proved existence.
+	_, err = c.ExecContext(ctx, `
+		UPDATE objects
+		SET observed_generation = ?, observed_at = ?, resource_version = ?
+		WHERE id = ?`,
+		observedGeneration, now, rv, id)
+	return err
+}
+
 // checkObservedGeneration rejects a generation no object can hold. Cheap enough
 // to run before the transaction opens.
 func checkObservedGeneration(observedGeneration int64) error {
@@ -1479,19 +1496,7 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 				return nil
 			}
 			// The handshake advanced — watch-visible even with identical bytes.
-			// updated_at tracks content and stays put; observed_at records the
-			// handshake.
-			rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
-			if err != nil {
-				return err
-			}
-			// No RETURNING: no row reported, and the scoped read proved existence.
-			_, err = c.ExecContext(ctx, `
-				UPDATE objects
-				SET observed_generation = ?, observed_at = ?, resource_version = ?
-				WHERE id = ?`,
-				observedGeneration, now, rv, id)
-			return err
+			return s.stampObserved(ctx, c, gk, id, observedGeneration)
 		}
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
@@ -1499,9 +1504,10 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		// observedGeneration lands verbatim, unclamped: a stale reporter just
 		// overwrote the status, and its generation marking the object unsettled is
-		// what gets that content re-derived. Keyed on id alone: the kind boundary
-		// came from the scoped read in this transaction — keep the read if you move
-		// this statement.
+		// what gets that content re-derived. Not stampObserved, deliberately — that
+		// clamps, and routing through it would delete this behavior. Keyed on id
+		// alone: the kind boundary came from the scoped read in this transaction —
+		// keep the read if you move this statement.
 		_, err = c.ExecContext(ctx, `
 			UPDATE objects
 			SET status = ?, schema_version_status = ?, observed_generation = ?, observed_at = ?,
