@@ -43,6 +43,14 @@ const (
 	// Free pages the GC sweeper releases per tick (~4MB/30s at ~3.7µs a page).
 	// Not an option: there is no measurement a caller could tune it against.
 	freePagesPerSweep = 1000
+	// Timelines one event-retention sweep may trim. The store applies the same
+	// number when a sweep names none; both are sized against gcBudgetInterval.
+	eventCapPerSweep = 256
+	// The cadence both budgets above were sized against. A longer WithGCInterval
+	// scales them up rather than slowing the work down — for the event cap that
+	// is the difference between a bounded log and one that sits over its cap. See
+	// docs/adr/2026-08-06-driver-cadences-are-configurable.md.
+	gcBudgetInterval = 30 * time.Second
 	// defaultWakeScanMinInterval floors the gap between two wake-driven scans.
 	// It is what a chain hop costs, and what bounds the loop's duty cycle under
 	// a sustained write stream. See
@@ -65,8 +73,14 @@ const (
 	// Floors the gap between two wake-driven drains, so a write stream cannot
 	// make its kind's tailer hold the single connection back from the writers.
 	defaultWatchScanMinInterval = 100 * time.Millisecond
-	// The first retry after a failed tail step; it doubles up to the floor.
+	// The first retry after a failed tail step; it doubles up to watchRetryMax.
 	watchRetryBase = 100 * time.Millisecond
+	// watchRetryMax caps that ladder. Its own constant rather than the floor: the
+	// floor is what a healthy quiet kind costs, which is the right ceiling only
+	// while it stays seconds — an embedder that lengthens it to spare an idle
+	// laptop would otherwise be lengthening error recovery with it. See
+	// docs/adr/2026-08-06-driver-cadences-are-configurable.md.
+	watchRetryMax = 30 * time.Second
 )
 
 type beehiveState uint8
@@ -233,13 +247,24 @@ func (bh *Beehive) gcSweeperRun(ctx context.Context) {
 	})
 }
 
+// gcBudget scales a per-sweep work budget sized against gcBudgetInterval to the
+// configured cadence, so what a sweeper does per unit time holds however long
+// the interval is. Never below the unscaled budget: a shorter interval already
+// buys the rate back by sweeping more often.
+func (bh *Beehive) gcBudget(perSweep int) int {
+	if bh.gcInterval <= gcBudgetInterval {
+		return perSweep
+	}
+	return perSweep * int(bh.gcInterval/gcBudgetInterval)
+}
+
 // eventRetentionSweep trims the event log to the configured retention. No-op unless a
 // bound is set; a failed sweep is retried on the next tick.
 func (bh *Beehive) eventRetentionSweep(ctx context.Context) {
 	if bh.eventRetentionPerTimeline <= 0 && bh.eventRetentionMaxAge <= 0 {
 		return
 	}
-	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerTimeline, bh.eventRetentionMaxAge); err != nil {
+	if _, err := bh.store.EventsSweep(ctx, bh.eventRetentionPerTimeline, bh.eventRetentionMaxAge, bh.gcBudget(eventCapPerSweep)); err != nil {
 		bh.log().Warn("event retention sweep failed; retry next sweep", "err", err)
 	}
 }
@@ -277,7 +302,7 @@ func (bh *Beehive) freePagesSweep(ctx context.Context) {
 	if !ok {
 		return
 	}
-	released, err := releaser.FreePagesRelease(ctx, freePagesPerSweep)
+	released, err := releaser.FreePagesRelease(ctx, bh.gcBudget(freePagesPerSweep))
 	if err != nil {
 		bh.log().Warn("free-page release failed; retry next sweep", "err", err)
 		return

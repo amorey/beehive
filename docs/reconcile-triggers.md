@@ -102,13 +102,20 @@ embedder, not a write, and it is case 15.
 
 | Driver | Scope | Cadence | Can it be turned off? |
 |---|---|---|---|
-| Owed pass | per kind | 30s | no |
+| Owed pass | per kind | `WithOwedPassInterval`, 30s | no; a non-positive value is rejected |
 | GC sweeper | global | `WithGCInterval`, 30s | no; a non-positive value is rejected |
 | Dependency waker | global | a commit wake; no tick at all | yes, by an unexported option |
-| Stale-dependents pass | global | 60s | no |
+| Stale-dependents pass | global | `WithStaleDependentsInterval`, 60s | no; a non-positive value is rejected |
 | Full pass | per kind | `WithFullPassInterval`, off | yes; it is off by default |
 
 The full pass is not a coverage mechanism. Section E explains why.
+
+**Every cadence in this document is the default, not a constant.** Each pull
+driver above is a backstop for the push beside it, so what an interval bounds is
+how long a *lost* push costs — which is why they are configurable at all, and
+why an embedder that lengthened one should read the numbers below as that
+embedder's recovery window.
+See [the cadences ADR](adr/2026-08-06-driver-cadences-are-configurable.md).
 
 ## 2. The durable records
 
@@ -200,7 +207,7 @@ dispatch is harmless and intended.
 
 **Pull:** `reconciler.enqueueUnsettled` calls `ObjectsListUnsettledIDs`, which
 selects `observed_generation IS NULL OR observed_generation < generation`. The owed
-pass runs it every 30 seconds.
+pass runs it on `WithOwedPassInterval`, 30 seconds by default.
 
 **Restart:** covered. `reconciler.run` calls `enqueueOwedPass` before its workers
 start. It is not gated on `startupFullPass`. A write made after `Register` but
@@ -295,13 +302,13 @@ another process, or through the embedder's own `Store`, is not enqueued either �
 but that is an [unsupported](adr/2026-08-05-one-process-one-beehive-sole-writer.md)
 shape rather than a covered one.
 
-**Pull:** `reconciler.enqueueReconcileOwed` calls `ReconcileOwedListIDs`, every 30
-seconds. `ReconcileOwedDecrement` drains the count in `typedController.reconcile`.
+**Pull:** `reconciler.enqueueReconcileOwed` calls `ReconcileOwedListIDs`, on
+`WithOwedPassInterval`. `ReconcileOwedDecrement` drains the count in `typedController.reconcile`.
 It subtracts the whole count observed at load, not one.
 
 A listing that names an object already parked on its backoff alarm no longer
 dispatches it: the alarm absorbs the add, so the ladder holds at every rung. That
-is what makes `WithMaxRetryInterval` mean what it says above 30 seconds.
+is what makes `WithMaxRetryInterval` mean what it says above the owed-pass cadence.
 
 **Restart:** covered. The stamp is durable and is drained at startup without a gate.
 A crash between the commit and the dispatch loses the push and keeps the stamp. That
@@ -354,7 +361,7 @@ trigger here; case 8 finds it in practice but promises nothing about it.
 See [the ADR](adr/2026-08-05-the-waker-is-wake-driven.md).
 
 A failed page holds the cursor, and the retry — `driver.Backoff` from 100ms up to
-the stale-dependents cadence — reads the same range again. A failed edges lookup
+`wakeRetryMax`, 30 seconds — reads the same range again. A failed edges lookup
 does the same. The self-edge is skipped. A wake that arrives during a reconcile
 is held by the `workQueue` dirty bit, and `done` dispatches it again.
 
@@ -478,8 +485,8 @@ dependents failed to observe the move, because that answer is a comparison again
 each dependent's watermark, and those watermarks move under other transactions.
 
 **Pull:** `staleDependents.sweep` calls `DependentsListStaleSince`, paged to
-exhaustion, every 60 seconds. The sweep stamps each finding's `reconcile_owed`
-before it enqueues the finding. Thus a finding outlives the queue. The `through`
+exhaustion, on `WithStaleDependentsInterval`, 60 seconds by default. The sweep
+stamps each finding's `reconcile_owed` before it enqueues the finding. Thus a finding outlives the queue. The `through`
 bound is the mark read before the scan. That bound is what keeps a sweep finite
 under sustained writes.
 
@@ -530,8 +537,9 @@ collected directly by `gcCollect`. The routing is correctness, not speed.
 `gcCollect` cannot clear a finalizer, so calling it on a registered kind would never
 make progress.
 
-The GC sweeper runs every 30 seconds. `WithGCInterval` rejects a non-positive value.
-Thus every error path has a next tick.
+The GC sweeper runs on `WithGCInterval`, 30 seconds by default, and rejects a
+non-positive value. Thus every error path has a next tick. A client-only kind is
+the one level of a cascade that costs a whole interval: every other route pushes.
 
 **Restart:** covered. `driver.Run` sweeps once before its first tick.
 

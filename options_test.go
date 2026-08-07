@@ -130,6 +130,60 @@ func TestOwedPassIntervalOptionDispatch(t *testing.T) {
 	require.NoError(t, withOwedPassInterval(time.Second)("unrelated"))
 }
 
+// The three promoted intervals, through the doors a caller uses. The owed pass
+// is per kind, so Register overrides what New set; the other two are global and
+// ignore a reconciler target rather than half-applying.
+func TestPromotedIntervalsDispatchAtNewAndRegister(t *testing.T) {
+	bh, err := New(&fakeStore{},
+		WithOwedPassInterval(5*time.Minute),
+		WithStaleDependentsInterval(6*time.Minute),
+		WithWatchFloorInterval(10*time.Minute))
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Minute, bh.owedPassInterval)
+	assert.Equal(t, 6*time.Minute, bh.staleDependentsInterval)
+	assert.Equal(t, 10*time.Minute, bh.watchFloorInterval)
+
+	gk := GroupKind{Kind: "Widget"}
+	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{},
+		WithOwedPassInterval(time.Minute),
+		WithStaleDependentsInterval(time.Minute),
+		WithWatchFloorInterval(time.Minute))
+	require.NoError(t, err)
+
+	r, ok := bh.reconcilerFor(gk)
+	require.True(t, ok)
+	assert.Equal(t, time.Minute, r.owedPassInterval, "one kind can drain on its own cadence")
+	assert.Equal(t, 6*time.Minute, bh.staleDependentsInterval, "global: a per-kind target is ignored")
+	assert.Equal(t, 10*time.Minute, bh.watchFloorInterval)
+}
+
+// TestWithOwedPassIntervalRejectsNonPositive pins the newest mandatory interval.
+// The owed pass is what makes convergence a guarantee — a lost push is found
+// nowhere else — and its cost is bounded by what is outstanding rather than by
+// the object count, so "rarely" is expressible and "never" is not. The
+// unexported form still disables it, for tests that want a push on its own.
+func TestWithOwedPassIntervalRejectsNonPositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		t.Run(d.String(), func(t *testing.T) {
+			bh := &Beehive{owedPassInterval: time.Minute}
+			err := WithOwedPassInterval(d)(bh)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), "WithOwedPassInterval", "name the option that was misused")
+			assert.Equal(t, time.Minute, bh.owedPassInterval, "a rejected option must not have written")
+
+			// Checked before the target switch, like the three above it.
+			require.ErrorIs(t, WithOwedPassInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, WithOwedPassInterval(d)("unrelated"), ErrInvalidOption)
+
+			_, err = New(&fakeStore{}, WithOwedPassInterval(d))
+			require.ErrorIs(t, err, ErrInvalidOption)
+
+			require.NoError(t, withOwedPassInterval(d)(bh))
+			assert.Equal(t, d, bh.owedPassInterval, "the unexported form still turns the tick off")
+		})
+	}
+}
+
 func TestWithGCIntervalDispatch(t *testing.T) {
 	bh := &Beehive{}
 	require.NoError(t, WithGCInterval(5*time.Second)(bh))
@@ -177,16 +231,16 @@ func TestWatchFloorIntervalRejectsNonPositive(t *testing.T) {
 	for _, d := range []time.Duration{0, -time.Second} {
 		t.Run(d.String(), func(t *testing.T) {
 			bh := &Beehive{watchFloorInterval: time.Minute}
-			err := withWatchFloorInterval(d)(bh)
+			err := WithWatchFloorInterval(d)(bh)
 			require.ErrorIs(t, err, ErrInvalidOption)
-			assert.Contains(t, err.Error(), "withWatchFloorInterval", "name the option that was misused")
+			assert.Contains(t, err.Error(), "WithWatchFloorInterval", "name the option that was misused")
 			assert.Equal(t, time.Minute, bh.watchFloorInterval, "a rejected option must not have written")
 
 			// Checked before the target switch, like the two above it.
-			require.ErrorIs(t, withWatchFloorInterval(d)(&reconciler{}), ErrInvalidOption)
-			require.ErrorIs(t, withWatchFloorInterval(d)("unrelated"), ErrInvalidOption)
+			require.ErrorIs(t, WithWatchFloorInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, WithWatchFloorInterval(d)("unrelated"), ErrInvalidOption)
 
-			_, err = New(&fakeStore{}, withWatchFloorInterval(d))
+			_, err = New(&fakeStore{}, WithWatchFloorInterval(d))
 			require.ErrorIs(t, err, ErrInvalidOption)
 		})
 	}
@@ -201,16 +255,16 @@ func TestStaleDependentsIntervalRejectsNonPositive(t *testing.T) {
 	for _, d := range []time.Duration{0, -time.Second} {
 		t.Run(d.String(), func(t *testing.T) {
 			bh := &Beehive{staleDependentsInterval: time.Minute}
-			err := withStaleDependentsInterval(d)(bh)
+			err := WithStaleDependentsInterval(d)(bh)
 			require.ErrorIs(t, err, ErrInvalidOption)
-			assert.Contains(t, err.Error(), "withStaleDependentsInterval", "name the option that was misused")
+			assert.Contains(t, err.Error(), "WithStaleDependentsInterval", "name the option that was misused")
 			assert.Equal(t, time.Minute, bh.staleDependentsInterval, "a rejected option must not have written")
 
 			// Checked before the target switch, like the two above it.
-			require.ErrorIs(t, withStaleDependentsInterval(d)(&reconciler{}), ErrInvalidOption)
-			require.ErrorIs(t, withStaleDependentsInterval(d)("unrelated"), ErrInvalidOption)
+			require.ErrorIs(t, WithStaleDependentsInterval(d)(&reconciler{}), ErrInvalidOption)
+			require.ErrorIs(t, WithStaleDependentsInterval(d)("unrelated"), ErrInvalidOption)
 
-			_, err = New(&fakeStore{}, withStaleDependentsInterval(d))
+			_, err = New(&fakeStore{}, WithStaleDependentsInterval(d))
 			require.ErrorIs(t, err, ErrInvalidOption)
 		})
 	}

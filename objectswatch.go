@@ -98,13 +98,14 @@ func (bh *Beehive) watchFloor() time.Duration {
 
 // watchBackoff is the retry ladder every watch path climbs after a failed read:
 // the tailer's, and a subscriber's own relation load and resume replay. Capped
-// at the floor interval, which is what a healthy quiet kind already costs, so a
-// failing read settles at a cadence the store is sized for.
+// at watchRetryMax rather than at the floor: a failing read should settle at a
+// cadence the store is sized for, and the floor is a cadence the *embedder*
+// sizes — for battery, not for recovery.
 //
 // One statement, three callers: a tailer and its own subscribers backing off on
 // different curves would be a tuning accident, not a decision.
 func (bh *Beehive) watchBackoff() driver.Backoff {
-	return driver.Backoff{Base: watchRetryBase, Max: bh.watchFloor()}
+	return driver.Backoff{Base: watchRetryBase, Max: watchRetryMax}
 }
 
 // WatchList streams changes to every object of this client's kind. See

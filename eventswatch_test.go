@@ -196,7 +196,7 @@ func TestEventsWatchResumeBelowTheHorizonIsRefused(t *testing.T) {
 
 	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Old"}))
 	require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Newer"}))
-	_, err = store.EventsSweep(ctx, 1, 0) // "Old" goes, unread
+	_, err = store.EventsSweep(ctx, 1, 0, 0) // "Old" goes, unread
 	require.NoError(t, err)
 
 	_, err = client.EventsWatch(ctx, obj.ID, WithEventsResumeFrom(checkpoint))
@@ -221,7 +221,7 @@ func TestEventsWatchHorizonIgnoresClientSideFilters(t *testing.T) {
 	for _, reason := range []string{"Unwanted", "Newer"} {
 		require.NoError(t, cc.EventsAdd(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
 	}
-	_, err = store.EventsSweep(ctx, 1, 0) // "Unwanted" goes — a run this reader filtered out
+	_, err = store.EventsSweep(ctx, 1, 0, 0) // "Unwanted" goes — a run this reader filtered out
 	require.NoError(t, err)
 
 	_, err = client.EventsWatch(ctx, obj.ID, WithEventReason("Wanted"), WithEventsResumeFrom(checkpoint))
@@ -246,7 +246,7 @@ func TestEventsWatchHorizonIsPerTimeline(t *testing.T) {
 		require.NoError(t, cc.EventsAdd(ctx, obj.ID,
 			EventSpec{Category: "chatty", Type: EventNormal, Reason: reason}))
 	}
-	_, err = store.EventsSweep(ctx, 1, 0) // trims chatty's older run, quiet keeps its one
+	_, err = store.EventsSweep(ctx, 1, 0, 0) // trims chatty's older run, quiet keeps its one
 	require.NoError(t, err)
 
 	_, err = client.EventsWatch(ctx, obj.ID, WithEventCategory("quiet"), WithEventsResumeFrom(checkpoint))
@@ -387,7 +387,7 @@ func TestEventsWatchDeliversWithoutTicking(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	bh := newTestBeehive(t, newClientTestStore(t), withWatchFloorInterval(time.Hour))
+	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)

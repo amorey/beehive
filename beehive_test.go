@@ -118,6 +118,55 @@ func TestSweepFreePages(t *testing.T) {
 	})
 }
 
+// eventSweepStore records the retention arguments each sweep passes down.
+type eventSweepStore struct {
+	Store
+	budget chan int
+}
+
+func (s *eventSweepStore) EventsSweep(_ context.Context, _ int, _ time.Duration, capBudget int) (int, error) {
+	select {
+	case s.budget <- capBudget:
+	default:
+	}
+	return 0, nil
+}
+
+// The sweeper's per-sweep budgets are sized against gcBudgetInterval, so a
+// longer WithGCInterval has to buy proportionally more work per sweep rather
+// than the same work at a lower rate. For the event cap that is the difference
+// between a bounded log and one that sits over its cap indefinitely.
+func TestGCBudgetsScaleWithTheInterval(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		interval time.Duration
+		factor   int
+	}{
+		{time.Second, 1}, // shorter than the base: already at rate, sweeping more often
+		{30 * time.Second, 1},
+		{5 * time.Minute, 10},
+		{45 * time.Second, 1}, // truncated, never rounded up
+	} {
+		t.Run(tc.interval.String(), func(t *testing.T) {
+			// Two stores, because the free-page drain is a capability the sweeper
+			// type-asserts for: an embedded Store interface would not carry it.
+			pages := &freePagesStore{Store: &fakeStore{}, called: make(chan int, 4)}
+			pagesBH, err := New(pages, WithGCInterval(tc.interval))
+			require.NoError(t, err)
+			pagesBH.freePagesSweep(ctx)
+
+			events := &eventSweepStore{Store: &fakeStore{}, budget: make(chan int, 4)}
+			eventsBH, err := New(events, WithGCInterval(tc.interval), WithEventRetention(10, 0))
+			require.NoError(t, err)
+			eventsBH.eventRetentionSweep(ctx)
+
+			assert.Equal(t, freePagesPerSweep*tc.factor, recv(t, pages.called))
+			assert.Equal(t, eventCapPerSweep*tc.factor, recv(t, events.budget))
+		})
+	}
+}
+
 // owedClearStore records the keep set each reclaim sweep passes down.
 type owedClearStore struct {
 	Store

@@ -55,12 +55,20 @@ with those columns) and trims each by a seek. On a 2048-run log with nothing to
 trim: **5.9ms → 0.48ms**. `TestEventsSweepSelectsCandidatesByIndex` pins the
 plan, since a temp B-tree there would silently restore the sort.
 
-`eventCapBudget` bounds the timelines one sweep trims. The scoped statements are
-seeks, but an unbounded backlog of them is still an unbounded hold on the write
+A budget bounds the timelines one sweep trims. The scoped statements are seeks,
+but an unbounded backlog of them is still an unbounded hold on the write
 connection. Retention is therefore progressive across sweeps, which the watch
 contract already tolerates: the horizon only ever rises, and the cap was never
 tight to begin with — it is enforced on the GC interval, so a burst sits above
 it until the next sweep either way.
+
+The budget is a parameter on `EventsSweep`, not a constant, because it is work
+per *sweep* against a cap the caller thinks of per unit time: the GC loop scales
+it with `WithGCInterval`, so a sweeper on a long cadence still trims at the same
+rate rather than leaving the log over its cap indefinitely. `eventCapBudget`
+(256) is what an implementation applies when the caller names none, and it is
+the number the GC loop scales from.
+→ [the cadences ADR](2026-08-06-driver-cadences-are-configurable.md).
 
 ### Both bounds stay off by default
 

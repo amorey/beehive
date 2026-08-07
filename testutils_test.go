@@ -205,8 +205,8 @@ func fast(opts ...Option) []Option {
 		WithGCInterval(fastTick),
 		withWakeScanMinInterval(0),
 		withMinRequeueInterval(fastTick),
-		withStaleDependentsInterval(staleDependentsTick),
-		withWatchFloorInterval(fastTick),
+		WithStaleDependentsInterval(staleDependentsTick),
+		WithWatchFloorInterval(fastTick),
 	}, opts...)
 }
 
@@ -216,7 +216,7 @@ func parked(opts ...Option) []Option {
 	return fast(append([]Option{
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
-		withStaleDependentsInterval(time.Hour),
+		WithStaleDependentsInterval(time.Hour),
 		withDependencyWakerOff(),
 		withoutGCSweeper(),
 	}, opts...)...)
@@ -460,7 +460,7 @@ func (s *fakeStore) EventsMaxVersion(context.Context, ObjectID) (int64, error) {
 func (s *fakeStore) EventsGetLatest(context.Context, ObjectID, string) (*RawEvent, error) {
 	panic("not implemented: fakeStore.EventsGetLatest")
 }
-func (s *fakeStore) EventsSweep(context.Context, int, time.Duration) (int, error) {
+func (s *fakeStore) EventsSweep(context.Context, int, time.Duration, int) (int, error) {
 	panic("not implemented: fakeStore.EventsSweep")
 }
 func (s *fakeStore) EdgesAdd(context.Context, ObjectID, ObjectID, Relation) (storeapi.EdgesAddResult, error) {
