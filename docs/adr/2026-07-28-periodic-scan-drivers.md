@@ -111,9 +111,10 @@ still lets the other through, and `enqueueFrom`'s log names which lost its pass.
 
 `enqueueAll` reaches an object nothing recorded as owing anything: process-scoped
 state a restart invalidated (a liveness condition reads as "verifying" until a
-controller in *this* process rewrites it). It is opt-in because its cost scales
-with the object count, and because the startup pass already covers that ground
-once per process.
+controller in *this* process rewrites it; a connection the reconcile itself
+opens). It is opt-in because its cost scales with the object count, and the
+*periodic* form is additionally the one nothing may depend on, because the startup
+pass already covers that ground once per process.
 
 ### GC routes rather than collects
 
@@ -267,12 +268,17 @@ Deletion-pending work is not resumed here: the GC sweeper's own unconditional
 startup pass routes it.
 
 So the two unconditional steps, the owed drain and the GC sweep, are the whole of
-what startup guarantees, and that is deliberate: **no reconcile may depend on either
-full pass.** Both scale with the object count rather than with what is outstanding,
-which disqualifies them as a correctness mechanism — a system whose convergence rests
-on a sweep converges only while the sweep stays affordable. It also makes the two
-defaults one decision rather than two: the periodic full pass was always off, and the
-startup one now matches it, so a hole cannot hide behind "well, startup catches it".
+what startup guarantees for a kind that opts into neither pass, and that is
+deliberate: **no reconcile may depend on the periodic full pass.** Its cost scales
+with the object count rather than with what is outstanding *and* it repeats forever,
+which disqualifies it as a correctness mechanism — a system whose convergence rests
+on a recurring sweep converges only while the sweep stays affordable. It also keeps
+both defaults off, so a hole cannot hide behind "well, the sweep catches it".
+
+The startup pass carries a rule of its own: it costs O(objects) *once per process*,
+so a kind whose reconcile establishes in-process state may depend on it, and for
+that kind it is the only thing that reconverges an object after a restart. See
+[the ADR](2026-08-07-the-startup-pass-may-be-depended-on.md).
 The dependency waker's restart behaviour used to be the open item here, for exactly
 that reason — the pass that covered it was never entitled to. It is now carried by
 the stale-dependents pass, whose cost is bounded by the dependency graph rather than

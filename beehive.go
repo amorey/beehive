@@ -31,8 +31,10 @@ import (
 
 const (
 	defaultOwedPassInterval = 30 * time.Second
-	// Both full passes scale with the object count, so both are opt-in and no
-	// reconcile may depend on either; convergence is carried by the owed pass.
+	// Both full passes scale with the object count, so both are opt-in. No
+	// reconcile may depend on the periodic one; a kind whose reconcile holds
+	// in-process state may depend on the startup one. See
+	// docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md.
 	defaultFullPassInterval time.Duration = 0
 	defaultStartupFullPass                = false
 	defaultGCInterval                     = 30 * time.Second
