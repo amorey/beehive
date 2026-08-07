@@ -16,4 +16,5 @@ work we have decided to do.
 
 ## Index
 
-- [A controller settles its generation without writing status](2026-08-07-set-observed-generation.md)
+Empty. The last spec shipped as
+[`SetObservedGeneration`](../adr/2026-07-27-generation-handshake-and-noop-writes.md).
