@@ -5217,6 +5217,40 @@ func TestSetConditionsScoped(t *testing.T) {
 	assert.Empty(t, got.Conditions)
 }
 
+// breakConditionLivenessRead puts a 2 in conditions.liveness, which scans into a
+// sql.NullBool as an error. Dropping and re-adding the column is what makes the
+// write possible at all — it takes the CHECK (0, 1) with it — and keeps the
+// column present so the SELECT still prepares, so the fault surfaces per row in
+// the scan loop rather than at QueryContext. Only Conditions().Set's gate read
+// scans liveness on a write path, which is the branch this reaches.
+func breakConditionLivenessRead(t *testing.T, store *sqliteStore) {
+	t.Helper()
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`ALTER TABLE conditions DROP COLUMN liveness`,
+		`ALTER TABLE conditions ADD COLUMN liveness INTEGER`,
+		`UPDATE conditions SET liveness = 2`,
+	} {
+		_, err := store.db.ExecContext(ctx, stmt)
+		require.NoError(t, err)
+	}
+}
+
+// The gate read's scan fault must fail the write rather than read as "no such
+// condition", which would silently rewrite a condition already stored.
+func TestSetConditionsGateScanError(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	obj := newConditionObject(t, store, "gate-scan")
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"}))
+	breakConditionLivenessRead(t, store)
+
+	require.Error(t, store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Ready", Status: "False"}))
+}
+
 func TestDeleteCondition(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()

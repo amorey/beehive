@@ -1659,13 +1659,12 @@ func (s *sqliteStore) loadForConditionSetChunk(
 			UpdatedAt: fromMillis(updatedAt.Int64),
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
+	// No row at all means no object: the LEFT JOIN keeps one even with no
+	// conditions. A read fault outranks it — it proves nothing about the object.
+	if err = rows.Err(); err == nil && !gated {
+		err = storeapi.ErrNotFound // bare, like scanObject's
 	}
-	if !gated {
-		return storeapi.ErrNotFound // bare, like scanObject's
-	}
-	return nil
+	return err
 }
 
 // bumpObject advances id's resource_version — the visibility half of the
