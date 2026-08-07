@@ -1,8 +1,8 @@
 # The stale-dependents pass scans from a cursor over target versions
 
 - **Status:** Accepted — implemented in `waker.go` (`staleDependents`),
-  `sqlite/store.go` (`DependentsListStaleSince`, `ReconcileOwedStamp`,
-  `ResourceVersionsMaxIssued`), `reconciler.go`.
+  `sqlite/store.go` (`Dependencies().ListStaleSince`, `ReconcileOwed().Stamp`,
+  `GetLatestResourceVersion`), `reconciler.go`.
 - **Date:** 2026-08-03, amended 2026-08-04 — routes 2 and 4 are latency, not
   divergence, and the reconciler's compensating stamp is removed.
 
@@ -39,8 +39,8 @@ gone quiet. Four routes reach that state:
    ran.** The enqueue was in memory. Nothing failed, so nothing was recorded.
 2. **The reconcile succeeded and the watermark write failed.** `reconciler.go`
    logs the error and continues.
-3. **`EdgesAdd` cleared the watermark for a new edge whose target is quiet.**
-   Already covered by `EdgesAdd`'s own `reconcile_owed` stamp.
+3. **`Edges().Add` cleared the watermark for a new edge whose target is quiet.**
+   Already covered by `Edges().Add`'s own `reconcile_owed` stamp.
 4. **The process was killed between a reconcile's owed decrement and its
    watermark write.** These are two statements, not one transaction. The count
    is gone and the object is settled by its status write.
@@ -50,7 +50,7 @@ that wrong. Both are gated on `reconcileErr == nil`, so the reconcile succeeded;
 it observed the store as of `load.Cursor`, which the store reads in the same
 statement as the object. A lost watermark write therefore leaves the watermark
 *low*, and `reconciled_against` is read in exactly one place —
-`DependentsListStaleSince`'s `t.resource_version > c.reconciled_against` — where
+`Dependencies().ListStaleSince`'s `t.resource_version > c.reconciled_against` — where
 lower selects more. The failure over-reports staleness; it cannot under-report
 it.
 
@@ -72,7 +72,7 @@ remain get a named mechanism each.
 
 ### The bounded scan
 
-`DependentsListStaleSince` lists the dependents of targets written above a
+`Dependencies().ListStaleSince` lists the dependents of targets written above a
 cursor, then filters on the watermark as before. It is ordered by
 `(target resource_version, target id, dependent id)` and returns the position of
 its last row.
@@ -84,11 +84,11 @@ state.
 
 The `CROSS JOIN`s pin the join order. Without them the planner reads the whole
 graph and the cursor saves nothing.
-`TestDependentsListStaleSinceDrivesFromTheVersionIndex` holds that.
+`TestDependencies().ListStaleSinceDrivesFromTheVersionIndex` holds that.
 
 Each sweep reads a mark **before** it scans, and scans no higher. The mark comes
-from `ResourceVersionsMaxIssued`, which reads `resource_version_seq`. It must not
-come from `ObjectWritesMaxVersionAll`: retention lowers that value, and an idle
+from `GetLatestResourceVersion`, which reads `resource_version_seq`. It must not
+come from `ObjectWrites().MaxVersionAll`: retention lowers that value, and an idle
 store past its retention window reads 0. A mark that falls compares wrongly
 against a stored position.
 
@@ -104,7 +104,7 @@ its whole fan-out listed and stamped again on every sweep.
 
 The cursor moves only when a sweep reaches the end. A failed page abandons the
 sweep and holds the cursor, so the next tick reads the same range again. A
-re-read is harmless: the stamp accumulates and `ReconcileOwedDecrement` subtracts
+re-read is harmless: the stamp accumulates and `ReconcileOwed().Decrement` subtracts
 the whole count observed at load.
 
 A tick where nothing has been issued since the last sweep skips the listing
@@ -136,12 +136,12 @@ paid every 60 s before this change. The per-sweep saving is untouched.
 
 ### Mechanism 2: the pass stamps what it finds
 
-`ReconcileOwedStamp` increments `reconcile_owed` for a page of refs in one
+`ReconcileOwed().Stamp` increments `reconcile_owed` for a page of refs in one
 statement. The pass stamps each page before it enqueues that page, so a crash
 between the two costs a spare reconcile, which is idempotent.
 
 **This stamp is not what makes the cursor sound.** Route 1 is covered by
-mechanism 1, routes 2 and 4 need no cover, and route 3 by `EdgesAdd`. With the
+mechanism 1, routes 2 and 4 need no cover, and route 3 by `Edges().Add`. With the
 current
 `workQueue`, removing this stamp would not strand any dependent: `add` marks an
 in-flight id dirty rather than dropping it, `done` re-queues it, and the retry
@@ -169,12 +169,12 @@ finding through the owed pass. The queue folds the duplicate.
 
 - **`reconcile_owed` has two producers, where the contract said it should have
   one.** `storeapi.Store` carried the note "there is deliberately no standalone
-  `reconcile_owed` increment… add one only when a producer other than `EdgesAdd`
+  `reconcile_owed` increment… add one only when a producer other than `Edges().Add`
   exists." This record is that condition being met once, by the stale-dependents
   pass. The owed pass is this count's consumer, not a second producer.
 - **The reconciler's compensating stamp was removed.** An earlier revision of
-  this record had `reconciler.go` call `ReconcileOwedStamp` when
-  `DependencyWatermarksSet` failed, to cover route 2. It bought nothing once
+  this record had `reconciler.go` call `ReconcileOwed().Stamp` when
+  `Dependencies().WatermarkSet` failed, to cover route 2. It bought nothing once
   route 2 was shown not to be a strand, and it was a durable write attempted
   against the store that had just failed the write it compensated for. The
   failure is logged and skipped on `ctx.Err() != nil`, since a cancelled write
@@ -190,7 +190,7 @@ finding through the owed pass. The queue folds the duplicate.
   `reconcile_owed` (`waker.go`), so in the most common wake path there is no
   count for a rollback to restore.
 - **A stamped dependent whose reconcile keeps failing retries on the owed pass's
-  cadence, not only on its backoff ladder.** `ReconcileOwedDecrement` is gated on
+  cadence, not only on its backoff ladder.** `ReconcileOwed().Decrement` is gated on
   success, so a failing dependent keeps the count the sweep stamped. The owed pass
   lists it every `owedPassInterval` and calls `work.add`, which consults only the
   queued-now set — an id parked on a backoff alarm is not in it, so the add
@@ -203,7 +203,7 @@ finding through the owed pass. The queue folds the duplicate.
   above `withOwedPassInterval`, where the ladder is effectively capped at the
   owed-pass cadence for any object carrying a standing stamp.
 
-  The mechanism is not new — `EdgesAdd`'s stamp has always left a count standing
+  The mechanism is not new — `Edges().Add`'s stamp has always left a count standing
   through a failing reconcile — but this change widens the population from
   objects with a non-converging edge set to any dependent the sweep has found. It
   is distinct from the `requeueNow` cost recorded in
@@ -216,12 +216,12 @@ finding through the owed pass. The queue folds the duplicate.
   Merging them is the expected end state and is deliberately not done here.
 - **`DependentsListStale`, the unbounded form, is removed.** The cursor form is
   the only staleness listing on `storeapi.Store`. Its tests were ported onto
-  `DependentsListStaleSince` through a shared `staleIDs` oracle, and the two that
+  `Dependencies().ListStaleSince` through a shared `staleIDs` oracle, and the two that
   only restated the old shape — paging by dependent id, and one row per dependent
   — were replaced: the second by
-  `TestDependentsListStaleSinceReturnsAPairPerMovedTarget`, which pins the
+  `TestDependencies().ListStaleSinceReturnsAPairPerMovedTarget`, which pins the
   opposite contract. Earlier records name the old method; it was never renamed,
-  and `DependentsListStaleSince` is where its contract now lives.
+  and `Dependencies().ListStaleSince` is where its contract now lives.
 - **A process-local cursor needs no scoping and no repair path.** A persisted one
   would need both. It would have to be keyed by the registered kind set, because
   a cursor earned while a kind had no controller says nothing about that kind's

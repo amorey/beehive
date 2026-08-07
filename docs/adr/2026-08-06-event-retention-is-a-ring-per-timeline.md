@@ -27,7 +27,7 @@ size: inside the window the log grows with reconcile rate, since a controller
 emitting a distinct `(type, reason)` per reconcile appends a run per reconcile.
 The ring keeps the log proportional to the object count instead, which is the
 failure mode an event log meets first. Dropping the ring would collapse the
-window function, the `events_horizon` key and `EventsListSince`'s `category`
+window function, the `events_horizon` key and `Events().ListSince`'s `category`
 parameter into something simpler — and would leave no bound that survives a
 flapping controller.
 
@@ -62,7 +62,7 @@ contract already tolerates: the horizon only ever rises, and the cap was never
 tight to begin with — it is enforced on the GC interval, so a burst sits above
 it until the next sweep either way.
 
-The budget is a parameter on `EventsSweep`, not a constant, because it is work
+The budget is a parameter on `Events().Sweep`, not a constant, because it is work
 per *sweep* against a cap the caller thinks of per unit time: the GC loop scales
 it with `WithGCInterval`, so a sweeper on a long cadence still trims at the same
 rate rather than leaving the log over its cap indefinitely. `eventCapBudget`
@@ -90,7 +90,7 @@ on a default: `WithEventRetention`'s godoc now states the unit, the partition,
 the cutoff and the enforcement granularity, which is what was missing.
 
 Turning the ring on by default remains available, and would want the sweep to be
-O(over-cap) first — a per-timeline run counter maintained by `EventsAdd` would
+O(over-cap) first — a per-timeline run counter maintained by `Events().Add` would
 do it, at the cost of a table and a write in the hot event path. Not built,
 because nothing today pays the O(size) tick: the sweep is a no-op unless a bound
 is set.

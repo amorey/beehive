@@ -8,7 +8,7 @@
 
 The write log is trimmed by retention (24h by default), and what a sweep removed
 is recorded per kind in `object_writes_horizon`. The per-kind reads report it —
-`ObjectWritesListSince` returns `trimmedThrough`, `ObjectWritesMaxVersion` folds
+`ObjectWrites().ListSince` returns `trimmedThrough`, `ObjectWrites().MaxVersion` folds
 the horizon in — which is how `objectTailer` ends a subscriber below the boundary
 with `ErrWatchTooOld`.
 
@@ -24,10 +24,10 @@ report, not the wake.
 
 **Report the horizon on both store-wide reads, and use it for nothing else.**
 
-`ObjectWritesMaxVersionAll` returns `(at, trimmedThrough)`. `at` keeps its bare
+`ObjectWrites().MaxVersionAll` returns `(at, trimmedThrough)`. `at` keeps its bare
 `MAX(resource_version)` semantics — `abandonIfOvertaken` depends on a trimmed log
 reading *below* the watermark — so the horizon rides beside it rather than folded
-in. `ObjectWritesListSinceAll` carries the horizon as a trailing column on the
+in. `ObjectWrites().ListSinceAll` carries the horizon as a trailing column on the
 page's own statement.
 
 `noteTrim` warns once per boundary. The resume point is unchanged: see "the
@@ -46,7 +46,7 @@ a boundary that spans many pages to one line.
 
 ### The list read is one statement, and needs no transaction
 
-`ObjectWritesListSince` is wrapped in `Within` because it attaches row images and
+`ObjectWrites().ListSince` is wrapped in `Within` because it attaches row images and
 must answer for one instant. The store-wide read carries no images, and this is
 the waker's whole quiet pass — the ~21µs `BenchmarkWakerScanRateUnderSustainedWrites`
 prices, run per commit. A `BEGIN`/`COMMIT` pair per page, plus a second statement
@@ -61,7 +61,7 @@ means entries really were trimmed unread.
 
 An empty page carries no row to carry the horizon, and that is exactly the case a
 stalled waker hits once retention has removed *every* entry above its cursor — the
-loss it most needs to report. So `noteTrimIdle` reads `ObjectWritesMaxVersionAll`
+loss it most needs to report. So `noteTrimIdle` reads `ObjectWrites().MaxVersionAll`
 on its own there.
 
 **Nothing is cached across that read.** Two drafts tried: keyed on the watermark,
@@ -86,7 +86,7 @@ any kind, and a kind whose `trimmed_through` exceeds W had entries deleted unrea
 No false positive, and no true gap escaping under a shallower kind.
 
 It says nothing about the range being *empty*, and the difference is not academic:
-`ObjectWritesSweep`'s count bound caps each kind to its newest N entries, so a
+`ObjectWrites().Sweep`'s count bound caps each kind to its newest N entries, so a
 chatty kind can be trimmed through 1000 while a quiet one still holds an unread
 entry at 500. A store-wide maximum of 1000 proves entries below it were deleted —
 not which ones. **Skipping to it would drop that surviving entry for good.**

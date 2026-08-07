@@ -1,6 +1,6 @@
 # The Store contract is grouped into sub-APIs reached through accessors
 
-- **Status:** Draft — not implemented.
+- **Status:** Implemented — `internal/storeapi`, `sqlite/store.go`, and every caller.
 - **Date:** 2026-08-07
 - **Issue:** [#93](https://github.com/amorey/beehive/issues/93)
 

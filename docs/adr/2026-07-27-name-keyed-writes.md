@@ -71,14 +71,14 @@ waiting for GC is the caller's only way forward.
 ### `DeleteByName` is `GetOrCreate`'s remove-side partner
 
 It is the one name-keyed write that needs no client-side `Within`: the store
-resolves and marks in a single statement via `DeletionRequestsCreateByName`, which folds
-the name into the `UPDATE`'s `WHERE` exactly as `DeletionRequestsCreate` folds in the
+resolves and marks in a single statement via `DeletionRequests().CreateByName`, which folds
+the name into the `UPDATE`'s `WHERE` exactly as `DeletionRequests().Create` folds in the
 kind.
 
 That is why `markForDeletion` takes the caller's **whole row predicate** rather than
 an id plus an extra clause. One statement template, with the key supplied per caller:
-`id = ?` plus the kind scope for `DeletionRequestsCreate`, a bare `id = ?` for the
-`DeletionRequestsCreateFromOwner` cascade, and the group/kind/name triple for the name
+`id = ?` plus the kind scope for `DeletionRequests().Create`, a bare `id = ?` for the
+`DeletionRequests().CreateFromOwner` cascade, and the group/kind/name triple for the name
 path. Keying it a new way is a change at the call site, not a second copy of the
 statement.
 

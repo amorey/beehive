@@ -989,9 +989,9 @@ func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
-// ResourceVersionsMaxIssued reads the sequence itself (contract on
+// GetLatestResourceVersion reads the sequence itself (contract on
 // storeapi.Store). One row, always present: the migration seeds it.
-func (s *sqliteStore) ResourceVersionsMaxIssued(ctx context.Context) (int64, error) {
+func (s *sqliteStore) GetLatestResourceVersion(ctx context.Context) (int64, error) {
 	var rv int64
 	err := s.conn(ctx).QueryRowContext(ctx,
 		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)

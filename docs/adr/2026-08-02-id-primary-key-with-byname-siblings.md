@@ -16,7 +16,7 @@ It also created two problems.
 
 **The API became asymmetric.** Only CRUD moved to the name. The rest of `Client`
 stayed keyed on the id: `Watch`, `Requeue`, `SchedulesGet`, `SchedulesWatch`,
-`EventsList`, `EventsGetLatest`, `EventsWatch`, `OwnersGet`, `DependenciesList`,
+`Events().List`, `Events().GetLatest`, `EventsWatch`, `OwnersGet`, `DependenciesList`,
 `DependentsList`, `OwnedList` and `OwnedObjectsList`. These calls address rows in
 `edges` and `events`, or entries in the work queue. All of those are keyed on
 `objects.id`, and the 2026-07-30 record keeps them that way for ABA safety and for
@@ -71,15 +71,15 @@ semantics.
 
 ### Nothing below `Client` changes
 
-`storeapi.Store` already exposes `ObjectsGetByName`, `ObjectsUpdateSpecByName` and
-`DeletionRequestsCreateByName`. The 2026-07-30 record kept those names because
+`storeapi.Store` already exposes `Objects().GetByName`, `Objects().UpdateSpecByName` and
+`DeletionRequests().CreateByName`. The 2026-07-30 record kept those names because
 there the id really is the key and the name really is the qualified variant. This
 change makes `Client` agree with the store instead of inverting it. Each `ByName`
 method maps to the store method of the same name. No schema, no migration, no
 store interface change.
 
 Atomicity is unchanged. A `ByName` write resolves and writes inside one
-transaction, never two store calls. `ObjectsUpdateSpecByName` still reads before
+transaction, never two store calls. `Objects().UpdateSpecByName` still reads before
 it writes, because the generation handshake compares stored bytes against the
 incoming bytes. `Within` supplies the atomicity, not the statement count.
 
@@ -96,7 +96,7 @@ recreate under the same name is a different id. Thus the stream ends at `Deleted
 
 A name-keyed `Watch` was rejected. It would have to re-resolve the name after
 each delete, and the poll filters write-log entries by id before the batched
-`ObjectsListByIDs` read. Filtering by name instead would make a single-object
+`Objects().ListByIDs` read. Filtering by name instead would make a single-object
 watch pay for the whole kind's churn. A name-keyed watch also could not state a
 gap-free `ResourceVersion` contract across the re-resolve.
 

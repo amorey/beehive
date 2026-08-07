@@ -8,7 +8,7 @@
 
 `EventsWatch` was the one watch surface that never followed the object watches
 onto a cursor. It polled every second, re-listed the object's log when
-`EventsMaxVersion` moved, and diffed the listing against a `seen` map keyed by
+`Events().MaxVersion` moved, and diffed the listing against a `seen` map keyed by
 `EventID`. A subscriber learned of a write on the next tick rather than at
 commit, its snapshot arrived through the channel mixed in with everything after
 it, and `WithEventRetention` could trim runs out from under it with nothing to
@@ -19,7 +19,7 @@ say so.
 ### The log already had a cursor
 
 `events.resource_version` is drawn from `resource_version_seq`, and **an extend
-re-samples it** — `EventsAdd`'s `UPDATE` takes a fresh version the same way its
+re-samples it** — `Events().Add`'s `UPDATE` takes a fresh version the same way its
 `INSERT` does. So every write leaves its run above every version the log has
 handed out, and one query is the whole tail:
 
@@ -28,7 +28,7 @@ SELECT … FROM events WHERE object_id = ? AND resource_version > ? ORDER BY res
 ```
 
 served by the existing `idx_events_object_rv`. Every row it returns is new or
-extended; nothing else can move. `EventsListSince` is that query, and the `seen`
+extended; nothing else can move. `Events().ListSince` is that query, and the `seen`
 map, the `EventID` diff and the full re-listing went with it.
 
 ### The reader is per watch, not shared
@@ -78,7 +78,7 @@ each timeline independently. An object-wide horizon would let a chatty category
 refuse every resume on a quiet one — routine, not rare, for exactly the consumer
 this is for.
 
-`EventsSweep` records it **before** each delete, from the same predicate in the
+`Events().Sweep` records it **before** each delete, from the same predicate in the
 same transaction (`INSERT … SELECT … GROUP BY … ON CONFLICT`). `RETURNING` would
 give the same answer while materialising every deleted row in Go and holding a
 half-read cursor on the single connection between two statements of one
@@ -90,7 +90,7 @@ The same rule where the horizon runs out. `events` and `events_horizon` both
 cascade off `objects`, so a physical delete takes every unread run *and the
 record that they existed*, leaving an empty page and a zero horizon — the read
 implying "no events" about an object whose whole log was deleted.
-`EventsListSince` probes `objects` when it finds neither rows nor a horizon and
+`Events().ListSince` probes `objects` when it finds neither rows nor a horizon and
 returns `ErrNotFound`, which ends the stream. Ids are never reused, so nothing is
 lost by ending it, and a caller blocked on that channel is waiting for something
 that cannot happen.
@@ -108,7 +108,7 @@ stream needs somewhere to report the failures that are not the caller's
 cancellation, and an event log has no change type to carry one — the naming ADR
 is explicit that a watch over a log streams the value itself.
 
-`EventsSnapshot` reads the runs and the position in one transaction: two reads
+`Events().Snapshot` reads the runs and the position in one transaction: two reads
 cannot answer "these runs, as of this position" — whichever order they run in, a
 write between them is either delivered twice or dropped. `Event` gained
 `ResourceVersion`, without which a caller cannot checkpoint what it was
@@ -128,7 +128,7 @@ cursor. That is what makes `ErrWatchTooOld` reachable on a live stream and not
 only on a resume, and it is the cheaper contract: a buffer would only move the
 threshold.
 
-`Store.EventsAdd` returns `error` alone. The push path builds its delta from a
+`Store.Events().Add` returns `error` alone. The push path builds its delta from a
 cursor rather than from the write's own result, so the write-shapes exception
 `TODO.md` held open for it closes, and both branches lose `RETURNING` and a row
 decode with it.

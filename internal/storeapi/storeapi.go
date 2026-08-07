@@ -364,26 +364,12 @@ func (r ObjectRef) GroupKind() GroupKind {
 type Store interface {
 	io.Closer
 
-	// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that an object is owed a pass.
-	ReconcileOwed() ReconcileOwed
-
-	// DeletionRequests is the deletion-request lifecycle over objects.deletion_requested_at.
-	DeletionRequests() DeletionRequests
-
-	// Events is the per-object event log, aggregated into runs.
-	Events() Events
-
-	// Edges is the owned_by and depends_on edge table.
-	Edges() Edges
-
-	// ObjectWrites is the append-only object write log.
-	ObjectWrites() ObjectWrites
-
-	// Objects is the objects table.
-	Objects() Objects
-
 	// Conditions is the conditions table.
 	Conditions() Conditions
+
+	// DeletionRequests is the deletion-request lifecycle over
+	// objects.deletion_requested_at.
+	DeletionRequests() DeletionRequests
 
 	// Dependencies is the dependency-watermark table and the staleness scan
 	// derived from it.
@@ -392,7 +378,62 @@ type Store interface {
 	// DriverCursors is the per-driver scan-position table.
 	DriverCursors() DriverCursors
 
-	unmigrated
+	// Edges is the owned_by and depends_on edge table.
+	Edges() Edges
+
+	// Events is the per-object event log, aggregated into runs.
+	Events() Events
+
+	// ObjectWrites is the append-only object write log.
+	ObjectWrites() ObjectWrites
+
+	// Objects is the objects table.
+	Objects() Objects
+
+	// ReconcileOwed is the objects.reconcile_owed count, a durable stamp that
+	// an object is owed a pass.
+	ReconcileOwed() ReconcileOwed
+
+	// Within runs fn inside a single transaction, committing on nil error and
+	// rolling back otherwise. Store calls made with the ctx passed to fn join
+	// the transaction — use that ctx for every call fn makes; any other ctx
+	// deadlocks a single-connection backend.
+	//
+	// A nested Within is a rollback boundary: it joins the transaction, only
+	// the outermost commits, and an error from the nested fn MUST unwind that
+	// fn's writes and queued AfterCommit hooks even if the outer caller
+	// swallows the error (sqlite uses SAVEPOINT).
+	//
+	// A nested Within entered from a goroutine other than the enclosing
+	// frame's owner MUST be refused with ErrConcurrentNestedTx, never
+	// serialised; deep nesting on one goroutine must be accepted. A transaction
+	// ctx belongs to one goroutine — the refusal is a tripwire, not a lock.
+	// The commit check is exact: a backend must refuse to commit while any
+	// nested frame is still open.
+	Within(ctx context.Context, fn func(ctx context.Context) error) error
+
+	// AfterCommit registers fn to run once ctx's transaction has committed.
+	// Rule: fn runs iff the transaction committed AND the frame it was
+	// registered against did not unwind. No transaction on ctx, or
+	// registration after a successful commit (including from inside a running
+	// hook), runs fn inline. Hooks run in registration order.
+	//
+	// fn receives a context detached from the transaction (deadline,
+	// cancellation and values are inherited). fn must not panic: hooks run in
+	// sequence and nothing recovers.
+	AfterCommit(ctx context.Context, fn func(ctx context.Context))
+
+	// GetLatestResourceVersion returns the highest resource version issued. It
+	// reads the sequence, not a table, so retention cannot lower it. It moves
+	// for an event write too, so it is a "did anything change" answer, not a
+	// log position to scan from.
+	GetLatestResourceVersion(ctx context.Context) (int64, error)
+
+	// ReclaimSpace returns up to maxPages of space freed by deleted rows to the
+	// OS and reports how many it released — a report, not a guarantee; a
+	// backend may release fewer, including none, and one that reclaims nothing
+	// returns 0. Non-positive maxPages releases nothing.
+	ReclaimSpace(ctx context.Context, maxPages int) (int, error)
 }
 
 // Dependencies is the dependency-watermark table: what each dependent was last
@@ -791,51 +832,4 @@ type Conditions interface {
 	// gk: wrong kind → ErrWrongKind, missing id → ErrNotFound. Returns no row;
 	// read conditions back with Objects().Get.
 	Set(ctx context.Context, gk GroupKind, id ObjectID, cond Condition) error
-}
-
-// unmigrated holds the families not yet reached through an accessor. It shrinks
-// as each one moves and is deleted once empty — nothing should be added to it.
-// See docs/specs/2026-08-07-grouped-store-api.md.
-type unmigrated interface {
-
-	// Within runs fn inside a single transaction, committing on nil error and
-	// rolling back otherwise. Store calls made with the ctx passed to fn join
-	// the transaction — use that ctx for every call fn makes; any other ctx
-	// deadlocks a single-connection backend.
-	//
-	// A nested Within is a rollback boundary: it joins the transaction, only
-	// the outermost commits, and an error from the nested fn MUST unwind that
-	// fn's writes and queued AfterCommit hooks even if the outer caller
-	// swallows the error (sqlite uses SAVEPOINT).
-	//
-	// A nested Within entered from a goroutine other than the enclosing
-	// frame's owner MUST be refused with ErrConcurrentNestedTx, never
-	// serialised; deep nesting on one goroutine must be accepted. A transaction
-	// ctx belongs to one goroutine — the refusal is a tripwire, not a lock.
-	// The commit check is exact: a backend must refuse to commit while any
-	// nested frame is still open.
-	Within(ctx context.Context, fn func(ctx context.Context) error) error
-
-	// AfterCommit registers fn to run once ctx's transaction has committed.
-	// Rule: fn runs iff the transaction committed AND the frame it was
-	// registered against did not unwind. No transaction on ctx, or
-	// registration after a successful commit (including from inside a running
-	// hook), runs fn inline. Hooks run in registration order.
-	//
-	// fn receives a context detached from the transaction (deadline,
-	// cancellation and values are inherited). fn must not panic: hooks run in
-	// sequence and nothing recovers.
-	AfterCommit(ctx context.Context, fn func(ctx context.Context))
-
-	// ResourceVersionsMaxIssued returns the highest resource version issued. It
-	// reads the sequence, not a table, so retention cannot lower it. It moves
-	// for an event write too, so it is a "did anything change" answer, not a
-	// log position to scan from.
-	ResourceVersionsMaxIssued(ctx context.Context) (int64, error)
-
-	// ReclaimSpace returns up to maxPages of space freed by deleted rows to the
-	// OS and reports how many it released — a report, not a guarantee; a
-	// backend may release fewer, including none, and one that reclaims nothing
-	// returns 0. Non-positive maxPages releases nothing.
-	ReclaimSpace(ctx context.Context, maxPages int) (int, error)
 }

@@ -114,7 +114,7 @@ time rather than ~13ms.
 
 ### A resumed seed reports a backlog
 
-`seed` already reads `ObjectWritesMaxVersionAll`, so it knows whether the cursor
+`seed` already reads `ObjectWrites().MaxVersionAll`, so it knows whether the cursor
 it resumed from sits below the mark. Reporting `scanMore` there costs nothing
 and keeps a restart with a backlog from waiting a floor for its first page.
 

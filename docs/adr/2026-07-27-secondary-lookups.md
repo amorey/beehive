@@ -21,8 +21,8 @@ spec and status. A one-to-many join would repeat that JSON once per edge.
 Both run the same query. Eager just attaches the result to the object and batches it
 across a list.
 
-The store primitives are `EdgesListOutgoingByRelation` for a single object, and
-`EdgesGroupOutgoingByID` / `EdgesGroupIncomingByID` for many. The batched pair return
+The store primitives are `Edges().ListOutgoingByRelation` for a single object, and
+`Edges().GroupOutgoingByID` / `Edges().GroupIncomingByID` for many. The batched pair return
 `map[id][]ObjectRef` rather than a slice, which is why they are named `Group…ByID`
 rather than `List…`; one `edgesByIDs` helper serves both, with the two columns
 swapped. The unfiltered `EdgesListOutgoing` stays for GC.
@@ -33,9 +33,9 @@ leaving a way to pay for queries nobody used.
 ## `owned` is the inverse of `owner`
 
 `OwnersGet` / `LoadOwner` read the *outgoing* `owned_by` edge
-(`EdgesListOutgoingByRelation` / `EdgesGroupOutgoingByID`).
+(`Edges().ListOutgoingByRelation` / `Edges().GroupOutgoingByID`).
 `OwnedList` / `LoadOwned` / `Object.Owned` read the *incoming* `owned_by` edges
-(`EdgesListIncoming` / `EdgesGroupIncomingByID`) — the owner's children — exactly as
+(`Edges().ListIncoming` / `Edges().GroupIncomingByID`) — the owner's children — exactly as
 `dependents` inverts `dependencies` over `depends_on`.
 
 `owner` is single (`WithOwner` sets one), so `fetchOwnerRef` takes the first
@@ -65,7 +65,7 @@ It returns the decoded `[]*Object[Spec, Status]` children of *this client's kind
 where `OwnedList` returns untyped refs across every owned kind.
 
 It is deliberately not a fifth lazy lookup. The kind filter and the row read fold
-into one store primitive, `ObjectsListByIncomingEdge(gk, toID, relation)`, so neither
+into one store primitive, `Objects().ListByIncomingEdge(gk, toID, relation)`, so neither
 the Go-side `ref.Kind` filter nor the `Get` per child that the untyped shape forces on
 callers ever happens. Its contract otherwise follows `OwnedList`'s, and it takes
 `List`'s `LoadOption`s through the same `loadListRelated` — a list read whose children
@@ -87,7 +87,7 @@ between them could drop the conditions of a row already scanned. Keying off the 
 also avoids paying for the edges semi-join twice, and an empty result skips the second
 round trip entirely.
 
-`ObjectsList` supplies a kind tail. `ObjectsListByIncomingEdge` supplies a kind tail
+`Objects().List` supplies a kind tail. `Objects().ListByIncomingEdge` supplies a kind tail
 plus `o.id IN (SELECT from_id FROM edges …)` — a **semi-join, not a join**. Written as
 a join, the planner drives from `idx_objects_kind`, which already satisfies
 `ORDER BY o.id`, and probes `edges` once per object *of the kind*. Written as

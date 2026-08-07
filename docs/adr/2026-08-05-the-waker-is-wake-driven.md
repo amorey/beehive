@@ -11,7 +11,7 @@ it. That left the tick a heartbeat with nothing to find. In a single-process
 beehive a lost wake is close to impossible by construction — the subscription is
 registered before the seed read, the hub closes only at stop, and one slot per
 receiver means a burst cannot drop one — so essentially every tick was a quiet
-pass: one `ObjectWritesListSinceAll` that comes back empty, ~21µs by
+pass: one `ObjectWrites().ListSinceAll` that comes back empty, ~21µs by
 `BenchmarkWakerScanRateUnderSustainedWrites`. 86,400 queries a day of insurance
 against an event the push path makes very hard to arrange.
 
@@ -52,7 +52,7 @@ worth attempting. It stops the moment the write lands.
 The retry ladder had to become a **delay** for that to be affordable. It counted
 persists sat out, which was sound under a tick that was going to run anyway;
 wake-driven, the only thing that carries a persist attempt is a pass, and a pass
-costs an `ObjectWritesListSinceAll`. A count of 60 would mean 60 scans of a store
+costs an `ObjectWrites().ListSinceAll`. A count of 60 would mean 60 scans of a store
 that is already refusing its writes — the heartbeat this ADR removes, reinstated
 in the one condition where the store can least afford it. `persistRetry` is a
 `driver.Backoff` from the persist floor to a minute, and `persistWait` re-arms

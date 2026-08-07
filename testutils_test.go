@@ -363,7 +363,7 @@ func (s *fakeStore) AfterCommit(ctx context.Context, fn func(context.Context)) {
 
 // ResourceVersionsMaxIssued answers 0: the stale-dependents driver reads it every
 // tick, so a panic would break every Start.
-func (s *fakeStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+func (s *fakeStore) GetLatestResourceVersion(context.Context) (int64, error) {
 	return 0, nil
 }
 

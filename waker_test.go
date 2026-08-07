@@ -1689,7 +1689,7 @@ type staleListErrorStore struct {
 	issued int64
 }
 
-func (s *staleListErrorStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+func (s *staleListErrorStore) GetLatestResourceVersion(context.Context) (int64, error) {
 	return s.issued, nil
 }
 
@@ -1715,7 +1715,7 @@ type staleSweepStore struct {
 	stamped   [][]ObjectRef
 }
 
-func (s *staleSweepStore) ResourceVersionsMaxIssued(context.Context) (int64, error) {
+func (s *staleSweepStore) GetLatestResourceVersion(context.Context) (int64, error) {
 	return s.issued, s.issuedErr
 }
 

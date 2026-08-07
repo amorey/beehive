@@ -9,7 +9,7 @@ The waker promises that a write reaches its dependents on the next commit. Two
 things had to be in place before that promise could hold, and neither was when
 `Start` returned:
 
-- **The watermark.** `seed` read `ObjectWritesMaxVersionAll` — and the stored
+- **The watermark.** `seed` read `ObjectWrites().MaxVersionAll` — and the stored
   cursor — on the waker's own goroutine,
   whenever the runtime first scheduled it. A write committed between `Start`
   returning and that read landed *below* the watermark, and no scan read it.
@@ -60,7 +60,7 @@ seed; now the seed is already done, so it is an ordinary scan from the watermark
 `prime` took — or, when prime's read failed, the seed retried at once.
 
 It was tempting to skip it: on a caught-up seed it spends an
-`ObjectWritesListSinceAll` that comes back empty. A decision function answering
+`ObjectWrites().ListSinceAll` that comes back empty. A decision function answering
 "how long before the first pass" from what the seed found was written, reviewed,
 and removed again. It bought ~21µs and one scan-floor window of first-wake
 latency, once per process, and it cost a second copy of decisions `pass` already

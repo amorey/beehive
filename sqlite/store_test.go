@@ -3813,7 +3813,7 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 	ctx := context.Background()
 	obj := newKindObject(t, store, clientOnlyGK)
 	require.NoError(t, store.ReconcileOwedIncrement(ctx, obj.ID))
-	before, err := store.ResourceVersionsMaxIssued(ctx)
+	before, err := store.GetLatestResourceVersion(ctx)
 	require.NoError(t, err)
 	writesBefore, _, err := store.ObjectWrites().ListSinceAll(ctx, 0, 100)
 	require.NoError(t, err)
@@ -3821,7 +3821,7 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 	_, err = store.ReconcileOwed().Sweep(ctx, nil)
 	require.NoError(t, err)
 
-	after, err := store.ResourceVersionsMaxIssued(ctx)
+	after, err := store.GetLatestResourceVersion(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "the reclaim issues no resource version")
 	writesAfter, _, err := store.ObjectWrites().ListSinceAll(ctx, 0, 100)
@@ -3928,7 +3928,7 @@ func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
 	ctx := context.Background()
 	newRefObject(t, store)
 
-	issued, err := store.ResourceVersionsMaxIssued(ctx)
+	issued, err := store.GetLatestResourceVersion(ctx)
 	require.NoError(t, err)
 	require.Positive(t, issued, "a create takes a version")
 
@@ -3938,7 +3938,7 @@ func TestResourceVersionsMaxIssuedNeverFalls(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, logged, "the log is empty, so its max is back to 0")
 
-	after, err := store.ResourceVersionsMaxIssued(ctx)
+	after, err := store.GetLatestResourceVersion(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, issued, after, "the sequence is unmoved by retention")
 }
@@ -6535,7 +6535,7 @@ func TestDependentsListStaleSincePagesInsideAFanOut(t *testing.T) {
 // markNow is the pre-scan mark a sweep would read.
 func markNow(t *testing.T, store *sqliteStore) int64 {
 	t.Helper()
-	mark, err := store.ResourceVersionsMaxIssued(context.Background())
+	mark, err := store.GetLatestResourceVersion(context.Background())
 	require.NoError(t, err)
 	return mark
 }

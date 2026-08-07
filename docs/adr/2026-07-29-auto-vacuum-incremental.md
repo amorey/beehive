@@ -14,7 +14,7 @@ Until this decision every file Beehive wrote was `auto_vacuum=NONE`, and would h
 stayed there.
 
 Free space genuinely accumulates here. `gcCollect` removes collected object rows and
-their edges, and `EventsSweep` trims the event log on the GC sweeper's cadence, so a
+their edges, and `Events().Sweep` trims the event log on the GC sweeper's cadence, so a
 long-lived store whose object count churns holds its high-water page count for the
 life of the file. Nothing is *incorrect* about that — SQLite reuses free pages for
 later inserts — but the file only ever grows.

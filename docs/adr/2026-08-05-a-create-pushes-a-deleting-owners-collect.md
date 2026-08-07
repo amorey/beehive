@@ -6,18 +6,18 @@
 ## Context
 
 `WithOwner` writes an `owned_by` edge in the create's transaction. Nothing checked
-the owner's lifecycle: `insertObject` read none of it, and `EdgesAdd` verifies only
+the owner's lifecycle: `insertObject` read none of it, and `Edges().Add` verifies only
 that both endpoints exist. So a child created against an owner that is already
 deletion-pending — and whose cascade has already listed its children — was born live
 and unmarked under a finalizing owner. Its edge counts as a live claim in
-`EdgesHasIncoming`, which discounts only deletion-pending `depends_on` sources, so
+`Edges().HasIncoming`, which discounts only deletion-pending `depends_on` sources, so
 the owner could not be collected.
 
-Nothing else reaches that owner. `EdgesAdd` bumps no `resource_version` and appends
+Nothing else reaches that owner. `Edges().Add` bumps no `resource_version` and appends
 no write-log entry, so no cursor sees the edge; the waker reads only `depends_on`;
 and the child's own `gcCollect` returns at once because the child is not finalizing.
 The owner waited for `deletionPendingSweep` to re-list it, at which point
-`DeletionRequestsCreateFromOwner` — which is built to be re-run — picks the child up.
+`DeletionRequests().CreateFromOwner` — which is built to be re-run — picks the child up.
 
 So this was a latency gap, not a strand: one GC interval, on a sweeper
 `WithGCInterval` refuses to disable, and visible as a plainly stuck deletion-pending
@@ -25,12 +25,12 @@ owner.
 
 ## Decision
 
-Report the target's lifecycle from `EdgesAdd` and push the owner when it is already
+Report the target's lifecycle from `Edges().Add` and push the owner when it is already
 deleting. `gcCollect` re-cascades and marks the new child, so the end state is the
 sweep's, one interval earlier.
 
 **The gate is the owner's `deletion_requested_at`,** read by the endpoint-existence
-join `EdgesAdd` already performs — one widened `SELECT`, no second read, no new
+join `Edges().Add` already performs — one widened `SELECT`, no second read, no new
 store method. `EdgesAddResult` gains `To` and `ToDeleting`; `To` is what routes the
 push, since edges are cross-kind and the owner need not share the child's kind.
 

@@ -81,7 +81,7 @@ func BenchmarkStaleDependentsSweep(b *testing.B) {
 					// above the cursor and the sweep has exactly one target in
 					// scope. Its dependents stay stale afterwards, but every
 					// later iteration's cursor sits above them.
-					from, err := store.ResourceVersionsMaxIssued(ctx)
+					from, err := store.GetLatestResourceVersion(ctx)
 					require.NoError(b, err)
 					target := ids[i%len(ids)]
 					_, _, err = store.Objects().UpdateSpec(ctx, clientTestGK, target, benchSpec(), 0)
@@ -96,7 +96,7 @@ func BenchmarkStaleDependentsSweep(b *testing.B) {
 			b.Run("quiet", func(b *testing.B) {
 				store, _ := benchStaleGraph(b, objects)
 				sd := sweeperOver(store)
-				mark, err := store.ResourceVersionsMaxIssued(ctx)
+				mark, err := store.GetLatestResourceVersion(ctx)
 				require.NoError(b, err)
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
@@ -249,7 +249,7 @@ func benchStaleGraph(b *testing.B, objects int) (Store, []ObjectID) {
 
 	// After the edges: EdgesAdd clears the watermark it finds, and the mark has
 	// to cover the versions the creates issued.
-	mark, err := store.ResourceVersionsMaxIssued(ctx)
+	mark, err := store.GetLatestResourceVersion(ctx)
 	require.NoError(b, err)
 	err = store.Within(ctx, func(ctx context.Context) error {
 		for _, id := range ids {

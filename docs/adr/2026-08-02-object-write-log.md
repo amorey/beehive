@@ -7,13 +7,13 @@
 
 ## Context
 
-`ObjectWritesListSince` used to read live rows — `SELECT id, resource_version
+`ObjectWrites().ListSince` used to read live rows — `SELECT id, resource_version
 FROM objects WHERE resource_version > ?`. It carried the name of a log without
 being one, and a deleted row was simply absent from it.
 
 Four costs followed. A watch could not see a delete in the cursor, so it kept a
 map of every object it had reported, with the decoded body, and probed
-`ObjectsListIDs` on each quiet tick to find rows by absence: memory O(objects in
+`Objects().ListIDs` on each quiet tick to find rows by absence: memory O(objects in
 the kind). A watch could not resume, because no durable position survived a
 disconnect. A subscriber could not tell when the initial state was complete,
 since the snapshot arrived as `Added` changes indistinguishable from later ones.
@@ -49,7 +49,7 @@ transaction and taking the `resource_version` that write was assigned.
   create still reports `Added`: the surviving entry is the later update, but the
   object was absent from the snapshot, and a controller stamping status right
   after a create makes that the common case rather than a corner. One batched
-  `ObjectsListByIDs` reads what a batch names — per-object reads would be
+  `Objects().ListByIDs` reads what a batch names — per-object reads would be
   serialized round trips on a single connection, which is what made the old full
   listing competitive.
 - **Retention is per kind and bounded by default** (`WithWriteLogRetention`,
@@ -73,7 +73,7 @@ transaction and taking the `resource_version` that write was assigned.
   its whole log age out, and the horizon converges onto exactly where every live
   tail is parked, so `<=` would end every established watcher on every idle kind.
   A real gap ends the stream with `ErrWatchTooOld` on a terminal `Failed` change.
-- **`ObjectWritesMaxVersion` folds the horizon in**, so the position only ever
+- **`ObjectWrites().MaxVersion` folds the horizon in**, so the position only ever
   rises and the tick gate is `>` rather than `!=`. Without the fold, a kind
   trimmed empty reports 0 against a tail parked higher and lists on every tick —
   on the kind that writes least.

@@ -8,7 +8,7 @@
 ## Context
 
 The waker's scan watermark (`waker.watermark`) was in-memory only. `seed` took
-`ObjectWritesMaxVersion` at startup, so every restart discarded whatever interval
+`ObjectWrites().MaxVersion` at startup, so every restart discarded whatever interval
 the process had been down for: writes committed while nothing was running sat
 below the new watermark and were never scanned by this driver. That was not a
 correctness gap — [the dependency-watermarks ADR](2026-07-29-dependency-watermarks.md)
@@ -60,7 +60,7 @@ The sqlite implementation is `driver_cursors`, one row per driver name (one row
 today: `"dependency_waker"`), `WITHOUT ROWID` because the key is `TEXT` rather
 than the `INTEGER PRIMARY KEY`-aliases-the-rowid case `dependency_watermarks`
 makes its own rowid argument on. `DriverCursorsSet` is the same monotone,
-self-suppressing upsert as `DependencyWatermarksSet`: a lower cursor is refused,
+self-suppressing upsert as `Dependencies().WatermarkSet`: a lower cursor is refused,
 and a cursor that hasn't advanced dirties no page — load-bearing at a 1s tick
 rate on a store that may otherwise be idle. Single-writer, and documented as
 such in the migration comment: nothing in this project documents or tests two
@@ -70,7 +70,7 @@ keep true rather than a gap to close.
 ### Seed clamps rather than trusts or resets
 
 `seed` reads the stored cursor and takes `min(stored, max)` against
-`ObjectWritesMaxVersion`, never the stored value outright. `max` is a max over
+`ObjectWrites().MaxVersion`, never the stored value outright. `max` is a max over
 *live* rows, so deleting the highest-versioned object legitimately lowers it
 below a cursor the waker really did process — a stored cursor above `max` is
 therefore not evidence of a swapped or truncated database. Clamping down costs
@@ -89,7 +89,7 @@ the next tick and the persisted cursor carries it across restarts.
 **There is deliberately no second bound on how far behind a cursor may be before
 `seed` abandons it.** An earlier revision had one, keyed on `max - stored`, and
 it was wrong in a way no tuning fixes: that distance is in `resource_version`
-units, and `EventsAdd` draws from the same sequence without writing anything
+units, and `Events().Add` draws from the same sequence without writing anything
 this scan reads. A store logging events at any rate inflates the gap by an
 unbounded factor against the object rows actually behind it, so the threshold
 fires on backlogs that were a few ticks of work and throws away a cursor that
@@ -154,7 +154,7 @@ scheduled sit *above* it and are scanned on the next tick. The race survives
 only on the very first start of a fresh database, where there is nothing stored
 yet and the fallback is `max`, as before. That weakens the case for seeding
 synchronously in `Start` without removing it — and a synchronous seed would now
-read *two* rows (`ObjectWritesMaxVersion` and `DriverCursorsGet`) inside
+read *two* rows (`ObjectWrites().MaxVersion` and `DriverCursorsGet`) inside
 `Start`'s critical section instead of one, which is the same hesitation that
 item already records, doubled.
 

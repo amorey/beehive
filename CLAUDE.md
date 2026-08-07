@@ -115,14 +115,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   durable.** A successful reconcile stamps
   `dependency_watermarks.reconciled_against` with the write cursor as of its
   *load*; the stale-dependents pass finds every dependent a target has moved
-  past, so any lost wake costs latency, never divergence. `EdgesAdd` *clears*
+  past, so any lost wake costs latency, never divergence. `Edges().Add` *clears*
   the watermark on a new `depends_on` edge; the `reconcile_owed` stamp on that
   same edge is what guarantees the dependent a pass. A **failed** watermark write
   needs no compensating record: it leaves the watermark low, and low only
   over-reports staleness.
   → [ADR](docs/adr/2026-07-29-dependency-watermarks.md)
 - **The stale-dependents pass scans from a cursor over target
-  `resource_version`** (`DependentsListStaleSince`), so its cost is what
+  `resource_version`** (`Dependencies().ListStaleSince`), so its cost is what
   changed, not the size of the graph. **The cursor is process-local and never
   persisted**, so every process re-derives once and recovers a wake lost in
   memory. **A lost watermark write is not a strand**: `reconciled_against` is
@@ -132,10 +132,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   pass *also* stamps `reconcile_owed` for what it finds before enqueuing, so a
   finding outlives the queue; that stamp is what a persisted cursor would need,
   and it is not load-bearing today. The cursor moves only when a sweep reaches
-  the end. **`reconcile_owed` has two producers** — `EdgesAdd` and this pass;
+  the end. **`reconcile_owed` has two producers** — `Edges().Add` and this pass;
   the owed pass is its consumer, not a third. → [ADR](docs/adr/2026-08-03-stale-dependents-cursor.md)
 - **The dependency waker scans the write log from a watermark**
-  (`ObjectWritesListSinceAll`, paged, store-wide — an edge can point at a
+  (`ObjectWrites().ListSinceAll`, paged, store-wide — an edge can point at a
   client-only kind). Cost is bounded by what changed. **A commit is the only
   thing that wakes it**: an idle waker arms no timer and issues no query, so a
   dependency chain propagates per commit. Two conditions re-arm its one timer,
@@ -167,9 +167,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Client watches return a snapshot and subscribe to their kind's shared
   tailer** (`objectswatch.go`). One tailer per kind owns the cursor, so reads scale
   with watched kinds, not watch count: a quiet read costs one
-  `ObjectWritesMaxVersion` (which folds in the horizon so it only rises — gate on
+  `ObjectWrites().MaxVersion` (which folds in the horizon so it only rises — gate on
   `>`, not `!=`), a busy one reads the entries above the cursor and then one
-  batched `ObjectsListByIDs`, draining until a page comes back short. A commit
+  batched `Objects().ListByIDs`, draining until a page comes back short. A commit
   wakes it (`signalKindWritten`, `AfterCommit`), and the same signal wakes the
   dependency waker, which subscribes across every kind rather than to one; the
   emit table is derived from the store's write-log call sites, **not** from the public verbs — conditions
@@ -205,7 +205,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   ownership from current state.** Never from the log: a create's entry is
   appended *before* its `owned_by` edge, in the same transaction, so a
   denormalised `owner_id` would be NULL on the write that matters most. The
-  tailer resolves a page's owners in one `EdgesGroupOutgoingByID` beside the
+  tailer resolves a page's owners in one `Edges().GroupOutgoingByID` beside the
   batched object read; a collected child has no edges left, so it takes its owner
   off the delete entry's row image. **The lookup's gate (`ownerScoped`) is set
   before a scoped subscriber registers and is never cleared** — a change
@@ -223,12 +223,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **The event watch reads one object's log above a cursor, one reader per
   watch** (`eventswatch.go`). An extend re-samples `events.resource_version`, so
   "runs above the cursor" is exactly what changed and the old `seen`/`EventID`
-  diff is gone. `EventsAdd`'s commit wakes it through `eventWriteHub` (keyed by
+  diff is gone. `Events().Add`'s commit wakes it through `eventWriteHub` (keyed by
   id, not kind); the floor tick covers a foreign writer. Nothing is shared — the
   read is already per object and already indexed — so there is no lease
   machinery, and no merge either: the stream is unbuffered, so a consumer that
   stops reading pins the cursor, which is what makes `ErrWatchTooOld` reachable
-  live. `EventsSnapshot` reads runs and position in one transaction, because two
+  live. `Events().Snapshot` reads runs and position in one transaction, because two
   reads either drop a write or deliver it twice. **A read must not imply an
   absence it cannot vouch for**: `events_horizon` records what retention trimmed,
   per `(object, category)` to match the ring cap's partition, and a resume below
@@ -274,8 +274,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   ids, which are never reused.
   → [ADR](docs/adr/2026-08-02-id-primary-key-with-byname-siblings.md)
 - **A store write takes only what it honours and returns only what a caller
-  reads.** `ObjectsCreate` takes `ObjectsCreateInput`; only it and the
-  `ObjectsUpdateSpec*` mutators return a row; `EventsAdd` takes
+  reads.** `Objects().Create` takes `ObjectsCreateInput`; only it and the
+  `Objects().UpdateSpec*` mutators return a row; `Events().Add` takes
   `EventsAddInput`. → [ADR](docs/adr/2026-07-30-store-write-shapes.md)
 - **A nested `Within` is a real rollback boundary** (SAVEPOINT): an error
   unwinds that frame's writes and queued hooks even if the caller swallows it. A
@@ -296,10 +296,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   their RESTRICT — from both the client delete and the cascade's marked children.
   **A create under an owner that is already deleting pushes that owner**, whose
   re-cascade is what marks the new child — gated on the owner's
-  `deletion_requested_at`, which `EdgesAdd` now reports.
+  `deletion_requested_at`, which `Edges().Add` now reports.
   **The sweeper also reclaims `reconcile_owed` for kinds with no reconcile loop**,
   which nothing else drains — safe because the count is redundant with the
-  dependency watermark `EdgesAdd` clears, so a cursor-0 sweep in a later process
+  dependency watermark `Edges().Add` clears, so a cursor-0 sweep in a later process
   re-derives it. The clear is no-emit.
   → [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
   [ADR](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md),
@@ -326,7 +326,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   quarantines its row rather than killing the read.
   → [ADR](docs/adr/2026-07-27-schema-version-migration.md)
 - **Every new `depends_on` edge stamps an owed reconcile** (`reconcile_owed`),
-  atomically with the edge inside `EdgesAdd`, drained by the owed pass. The
+  atomically with the edge inside `Edges().Add`, drained by the owed pass. The
   declaration also enqueues the source at commit, gated on
   `ReconcileOwedStamped` and routed by `EdgesAddResult.From` (the edge is
   cross-kind). The edge push is throttled; the spec write's is not.
@@ -338,7 +338,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   → [ADR](docs/adr/2026-07-27-secondary-lookups.md)
 - **Events are an append-only log, aggregated into runs** per (object,
   category), extended when `(type, reason)` matches. Reads live on `Client`.
-  "Event" means this log and nothing else. `Store.EventsAdd` returns `error`
+  "Event" means this log and nothing else. `Store.Events().Add` returns `error`
   alone — the watch builds its delta from a cursor, not from the write's result.
   **Retention runs in the GC sweeper and is off by default**: a cap of *runs*
   per timeline, which trims only the timelines a candidate query finds over it
@@ -358,15 +358,21 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 
 ## Conventions
 
-- **Methods are `NounsVerbQualifier`, noun first and plural** (`ObjectsGet`,
-  `EdgesListIncoming`): one prefix per family, cardinality in the verb
-  (`Get`/`Watch` for one, `List`/`WatchList` for many). Drop the prefix when the
-  family is the receiver itself — `Client`'s own CRUD stays bare; on
-  `ControllerClient` a column on the object's row is bare (`UpdateStatus`), a
-  table of its own is prefixed. List interface members alphabetically. `Err*`,
+- **The noun names a type, and the method is a bare verb.** On `Store` each
+  family is a sub-API reached through an accessor (`store.Edges().Add`,
+  `store.Objects().ListUnsettledIDs`), so no method carries its family in its
+  name. A member with no family behind it sits on the root and carries the noun
+  in the name, verb first (`GetLatestResourceVersion`, `ReclaimSpace`) — the same
+  `VerbNoun` shape `Client` uses. A family is earned by a **table**; a column on
+  `objects` belongs to `Objects` (`Objects().DeleteFinalizer`). Cardinality stays
+  in the verb (`Get`/`Watch` for one, `List`/`WatchList` for many). On
+  `Client`/`ControllerClient` the receiver is already its kind, so its own CRUD
+  stays bare and its secondary nouns keep the `NounsVerb` prefix
+  (`ConditionsSet`, `EventsAdd`). List interface members alphabetically. `Err*`,
   `With*` and external-interface methods are exempt. A watch over a change
   stream returns `<-chan NounChange`; a watch over a gauge or a log streams the
-  value itself. → [ADR](docs/adr/2026-07-27-noun-verb-naming.md)
+  value itself. → [ADR](docs/adr/2026-07-27-noun-verb-naming.md),
+  [spec](docs/specs/2026-08-07-grouped-store-api.md)
 - **Whitebox tests**: tests go in `package beehive`, so they reach unexported
   machinery.
 - **Test files mirror source files, not features.** Shared helpers and fakes go

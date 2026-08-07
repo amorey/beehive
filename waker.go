@@ -688,7 +688,7 @@ func (sd *staleDependents) sweep(ctx context.Context) {
 	// target written while the sweep runs sits above the mark, so the next sweep
 	// finds it — and the scan stays finite under sustained writes. Taking the
 	// highest target the scan returned instead would skip exactly those targets.
-	mark, err := sd.bh.store.ResourceVersionsMaxIssued(ctx)
+	mark, err := sd.bh.store.GetLatestResourceVersion(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.WarnContext(ctx, "reading the resource version failed; the next pass retries", "err", err)

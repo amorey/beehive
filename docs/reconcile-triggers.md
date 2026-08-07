@@ -77,7 +77,7 @@ replaces an owned child each pass would drive the owner, with the floor bypassed
 [the create's](adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md).
 
 The dropped dependency is gated on *both* endpoints: the target because only a
-deletion-pending one was blocked, and the source because `EdgesHasIncoming`
+deletion-pending one was blocked, and the source because `Edges().HasIncoming`
 discounts an edge from a deletion-pending source, so dropping one lifts nothing.
 → [its ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md). The deletion
 mark reads the same pair from the other side — it *is* the source's mark, so only
@@ -123,11 +123,11 @@ There are five durable records. A sixth mechanism records nothing at all.
 
 | Record | Where it lives | Listed by | Driver |
 |---|---|---|---|
-| The spec has not converged | `generation` and `observed_generation` | `ObjectsListUnsettledIDs` | owed pass |
-| A wake is owed | `reconcile_owed` | `ReconcileOwedListIDs` | owed pass |
-| A delete was requested | `deletion_requested_at` | `DeletionRequestsList` | GC sweeper |
-| An object changed | a row in `object_writes` | `ObjectWritesListSinceAll` | dependency waker |
-| A dependency moved | `dependency_watermarks.reconciled_against` and the target's `resource_version` | `DependentsListStaleSince` | stale-dependents pass |
+| The spec has not converged | `generation` and `observed_generation` | `Objects().ListUnsettledIDs` | owed pass |
+| A wake is owed | `reconcile_owed` | `ReconcileOwed().ListIDs` | owed pass |
+| A delete was requested | `deletion_requested_at` | `DeletionRequests().List` | GC sweeper |
+| An object changed | a row in `object_writes` | `ObjectWrites().ListSinceAll` | dependency waker |
+| A dependency moved | `dependency_watermarks.reconciled_against` and the target's `resource_version` | `Dependencies().ListStaleSince` | stale-dependents pass |
 | *(none)* | in memory only | — | `workQueue` |
 
 **Two of these records are predicates. One is a cursor. The difference matters.**
@@ -196,7 +196,7 @@ argument is shared.
 **Push:** the write itself, at commit. `clientImpl.signalSpecWritten` registers an
 `AfterCommit` hook that enqueues the row. The hook is gated on the store reporting
 that the write changed the object. That is the `changed` value the two
-`ObjectsUpdateSpec*` mutators return. A create always changes the object. A
+`Objects().UpdateSpec*` mutators return. A create always changes the object. A
 byte-identical update changes nothing and enqueues nothing.
 See [the ADR](adr/2026-07-31-a-spec-write-enqueues-its-own-object.md).
 
@@ -212,7 +212,7 @@ followed by its `UpdateStatus`, in one outer `Within`, commits a settled row and
 still enqueues. The signal reports the write, not the final state. The extra
 dispatch is harmless and intended.
 
-**Pull:** `reconciler.enqueueUnsettled` calls `ObjectsListUnsettledIDs`, which
+**Pull:** `reconciler.enqueueUnsettled` calls `Objects().ListUnsettledIDs`, which
 selects `observed_generation IS NULL OR observed_generation < generation`. The owed
 pass runs it on `WithOwedPassInterval`, 30 seconds by default.
 
@@ -236,7 +236,7 @@ Tests: `TestIntegrationCreateTriggersReconcile`,
 
 ### 2. Spec update
 
-`ObjectsUpdateSpec` bumps `generation`. The bump is suppressed when the bytes are
+`Objects().UpdateSpec` bumps `generation`. The bump is suppressed when the bytes are
 equal at the same schema version. That is what stops a controller re-applying its
 own spec from waking itself forever.
 
@@ -274,7 +274,7 @@ Case 7 is a companion to case 5. It records nothing and covers nothing on its ow
 
 **Record:** `reconcile_owed` on the dependent.
 
-Every `depends_on` edge that `EdgesAdd` creates increments the dependent's
+Every `depends_on` edge that `Edges().Add` creates increments the dependent's
 `reconcile_owed`. Self-edges are excluded. The increment is in the same statement
 sequence as the edge insert. Thus the two cannot come apart.
 
@@ -309,8 +309,8 @@ another process, or through the embedder's own `Store`, is not enqueued either �
 but that is an [unsupported](adr/2026-08-05-one-process-one-beehive-sole-writer.md)
 shape rather than a covered one.
 
-**Pull:** `reconciler.enqueueReconcileOwed` calls `ReconcileOwedListIDs`, on
-`WithOwedPassInterval`. `ReconcileOwedDecrement` drains the count in `typedController.reconcile`.
+**Pull:** `reconciler.enqueueReconcileOwed` calls `ReconcileOwed().ListIDs`, on
+`WithOwedPassInterval`. `ReconcileOwed().Decrement` drains the count in `typedController.reconcile`.
 It subtracts the whole count observed at load, not one.
 
 A listing that names an object already parked on its backoff alarm no longer
@@ -338,9 +338,9 @@ write, inside that write's transaction.
 1. `object_writes` says which objects changed.
 2. `edges` says which objects depend on them.
 
-`waker.scan` calls `ObjectWritesListSinceAll` above a watermark. The read is
+`waker.scan` calls `ObjectWrites().ListSinceAll` above a watermark. The read is
 store-wide, not per kind, because a `depends_on` edge can point at a kind that no
-per-kind query can name. `dependentsWake` then calls `EdgesGroupIncomingByID` with
+per-kind query can name. `dependentsWake` then calls `Edges().GroupIncomingByID` with
 `RelationDependsOn`. One query resolves a whole page. Each dependent is enqueued
 under its own kind.
 
@@ -375,7 +375,7 @@ is held by the `workQueue` dirty bit, and `done` dispatches it again.
 **A drain gives up once case 8 has overtaken it.** One pass reads at most
 `wakeScanPagesPerPass` pages; a pass that spends the whole budget is a drain, and a
 run of them unbroken for `staleDependentsInterval` jumps the watermark to
-`ObjectWritesMaxVersionAll` instead of paging on. Case 8's first sweep of the
+`ObjectWrites().MaxVersionAll` instead of paging on. Case 8's first sweep of the
 process covers every dependent in the store, so past that point the pages left
 would wake work it has already found. The skipped range reaches its dependents
 through case 8. Anything but a full budget — a short page, an empty one, a failure —
@@ -384,7 +384,7 @@ See [the ADR](adr/2026-08-05-the-waker-abandons-an-overtaken-drain.md).
 
 **Restart:** covered by case 8. This mechanism resumes rather than always reseeding.
 `seed` reads a cursor the waker persisted in `driver_cursors` and resumes there,
-instead of at `ObjectWritesMaxVersionAll`. It runs inside `Start`, before any caller
+instead of at `ObjectWrites().MaxVersionAll`. It runs inside `Start`, before any caller
 can write, and a resume below the mark is what arms the first pass back — so a change
 committed while the process was down is scanned without waiting for a commit. A cursor
 older than the write log's retention is warned about once, naming the skipped span:
@@ -406,17 +406,17 @@ because its own generation never moved. The cost is time, never divergence.
 See [the ADR](adr/2026-07-30-durable-waker-cursor.md).
 
 **What bumps a target's `resource_version`**, and thus wakes its dependents, is
-wider than a spec change. The full list is `ObjectsCreate`, `ObjectsUpdateSpec`, the
-content and handshake-only paths of `ObjectsUpdateStatus`, `ConditionsSet`,
-`ConditionsDelete`, `FinalizersDelete`, `markForDeletion`, and the cascade mark.
-`EventsAdd` is the one write that does not bump it. That is by design.
+wider than a spec change. The full list is `Objects().Create`, `Objects().UpdateSpec`, the
+content and handshake-only paths of `Objects().UpdateStatus`, `Conditions().Set`,
+`Conditions().Delete`, `Objects().DeleteFinalizer`, `markForDeletion`, and the cascade mark.
+`Events().Add` is the one write that does not bump it. That is by design.
 
 This list is scoped to writes on a target that can still be depended on.
-`ObjectsDelete` also draws a version and appends a write-log entry, but a physical
+`Objects().Delete` also draws a version and appends a write-log entry, but a physical
 delete removes the row, and `edges.to_id` is `ON DELETE RESTRICT` — so a deleted
 target structurally cannot have a live `depends_on` edge pointing at it left to wake.
 RESTRICT only refuses the delete, though — the edges that did exist are cleared by
-`gcCollect`, which calls `EdgesDeleteFinalizingDependsOn` immediately before the
+`gcCollect`, which calls `Edges().DeleteFinalizingDependsOn` immediately before the
 delete. Those dependents lose their wake and need none: each is deletion-pending
 itself, so cases 9 and 11 carry it and a dependency wake would produce no reconcile.
 The write-log entry it leaves is bookkeeping, not a wake; the actual notification for
@@ -437,7 +437,7 @@ this reason.
 
 This is a companion to case 5. It is not a coverage mechanism of its own.
 
-`EdgesAdd` clears the dependent's `dependency_watermarks` row when it creates a new
+`Edges().Add` clears the dependent's `dependency_watermarks` row when it creates a new
 `depends_on` edge. A cursor recorded over a smaller dependency set cannot speak for
 a target that was just added. If the row stayed, it would report convergence to case
 8's scan until the stamped pass runs. An absent row already means stale. Thus
@@ -451,7 +451,7 @@ saw the new target. Case 5's unconditional stamp closes the hole. Recorded owed 
 survives a pass. Invalidated derived state does not.
 See [the ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md).
 
-**Record:** none. The mechanism *un*-records, inside `sqliteStore.EdgesAdd`, in the
+**Record:** none. The mechanism *un*-records, inside `sqliteStore.Edges().Add`, in the
 same statement sequence as the edge and the stamp.
 
 **Push and pull:** both are case 5's. Case 8's scan reads the absent row until case
@@ -481,7 +481,7 @@ failed seed, a process with no waker, a write nobody published — a second
 process, or one issued straight to the `Store` — or a defect in the wake path.
 
 **Record:** `dependency_watermarks.reconciled_against`, written by
-`Store.DependencyWatermarksSet`. `typedController.reconcile` writes it on every
+`Store.Dependencies().WatermarkSet`. `typedController.reconcile` writes it on every
 successful pass of an object that has dependencies. The value is the write cursor as
 of the pass's *load*. It is never the end of the pass.
 
@@ -491,7 +491,7 @@ the moment it cannot trust. A commit knows the target moved. It does not know wh
 dependents failed to observe the move, because that answer is a comparison against
 each dependent's watermark, and those watermarks move under other transactions.
 
-**Pull:** `staleDependents.sweep` calls `DependentsListStaleSince`, paged to
+**Pull:** `staleDependents.sweep` calls `Dependencies().ListStaleSince`, paged to
 exhaustion, on `WithStaleDependentsInterval`, 60 seconds by default. The sweep
 stamps each finding's `reconcile_owed` before it enqueues the finding. Thus a finding outlives the queue. The `through`
 bound is the mark read before the scan. That bound is what keeps a sweep finite
@@ -524,7 +524,7 @@ on the first pass after its kind is registered. The kind filter applies to the
 `TestStaleDependentsSweepLeavesADurableFinding`,
 `TestALostWatermarkStillFindsAnUnobservedChange`,
 `TestReconcileRecordsCursorFromTheLoad`,
-`TestDependentsListStaleSinceTreatsMissingWatermarkAsStale`.
+`TestDependencies().ListStaleSinceTreatsMissingWatermarkAsStale`.
 
 ## C. Deletion-derived
 
@@ -537,7 +537,7 @@ client-only object is marked and left to the sweeper: `deletionAdvance` collects
 directly, and running that from a commit hook would put the whole subtree below it
 on the caller's goroutine.
 
-**Pull:** `Beehive.deletionPendingSweep` calls `DeletionRequestsList`, which is
+**Pull:** `Beehive.deletionPendingSweep` calls `DeletionRequests().List`, which is
 kind-agnostic. `deletionAdvance` routes each result. A registered kind is
 **enqueued**, so its controller can clear finalizers. A client-only kind is
 collected directly by `gcCollect`. The routing is correctness, not speed.
@@ -568,7 +568,7 @@ the store so no push is issued), `TestDeletionRequestsCreateIsIdempotent`.
 
 ### 10. Cascade to owned children
 
-`gcCollect` marks the children with `DeletionRequestsCreateFromOwner`, then enqueues
+`gcCollect` marks the children with `DeletionRequests().CreateFromOwner`, then enqueues
 the ones it marked in a single commit hook. Thus a cascade advances one level per
 commit, for as long as the levels are registered kinds; a client-only level costs a
 sweep, and the pushes below it wait on that level's own collect.
@@ -591,7 +591,7 @@ Tests: `TestCascadePushesEachMarkedChild`, `TestCascadePushesOnlyNewlyMarkedChil
 
 ### 11. A blocked collect retries by staying in the listing
 
-A collect is blocked when finalizers are still pending, or when `EdgesHasIncoming`
+A collect is blocked when finalizers are still pending, or when `Edges().HasIncoming`
 reports a referrer under RESTRICT. Four routes lead out of one, and **each of them
 pushes**:
 
@@ -602,7 +602,7 @@ pushes**:
    edges before deleting it — after that the owner is unnameable, since
    `edges.from_id` is `ON DELETE CASCADE` — and enqueues the deletion-pending ones
    at commit. Two filters, both load-bearing: the relation, because
-   `EdgesHasIncoming` already discounts a `depends_on` edge from a deletion-pending
+   `Edges().HasIncoming` already discounts a `depends_on` edge from a deletion-pending
    source, so those targets are not blocked; and the owner's own
    `deletion_requested_at`, because a live owner was never blocked and pushing one
    would spin. →
@@ -612,12 +612,12 @@ pushes**:
    which is why the write reports the lifted block itself, as
    `EdgesDeleteResult.Unblocked`. Two filters, both load-bearing: the target's
    `deletion_requested_at`, because a live target was never blocked; and the
-   *source's*, because `EdgesHasIncoming` discounts an edge from a deletion-pending
+   *source's*, because `Edges().HasIncoming` discounts an edge from a deletion-pending
    source, so a finalizing dependent releasing its refs lifts nothing. →
    [the ADR](adr/2026-08-05-a-dropped-dependency-pushes-its-target.md).
 
 4. **The last live referrer was marked deletion-pending.** That mark is what makes
-   `EdgesHasIncoming` discount the edge, so it lifts the block itself and reports
+   `Edges().HasIncoming` discount the edge, so it lifts the block itself and reports
    what it lifted: `DeletionRequestResult.Unblocked` for a client delete,
    `DeletionCascadeResult.Unblocked` for the children a cascade marks. Read inside
    the mark's own transaction, so the state it reports is the state it made. Same
@@ -632,7 +632,7 @@ either, and `gcCollect` re-checks the block itself. The sweep remains the route
 after a crash.
 
 Every block is temporary by construction. The one block that was not is a finalizer
-on a client-only kind, which no `FinalizersDelete` can reach. That is now rejected at
+on a client-only kind, which no `Objects().DeleteFinalizer` can reach. That is now rejected at
 create time. Thus a sweep always has a route to progress.
 
 Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
@@ -642,8 +642,8 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 `TestDependenciesDeleteSkipsClientOnlyTarget`,
 `TestIntegrationDroppedDependencyCollectsWithoutASweep`,
 `TestIntegrationDroppedDependencyCollectsWithoutThePush`,
-`TestFinalizersDeletePushesTheCollect`,
-`TestFinalizersDeletePushesNothingOtherwise`,
+`TestObjects().DeleteFinalizerPushesTheCollect`,
+`TestObjects().DeleteFinalizerPushesNothingOtherwise`,
 `TestIntegrationClearedFinalizerCollectsWithoutASweep`,
 `TestIntegrationClearedFinalizerCollectsWithoutThePush`,
 `TestPhysicalDeletePushesItsOwner`, `TestPhysicalDeletePushBeatsAPendingAlarm`,
@@ -671,15 +671,15 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 ### 12. A create under a deleting owner
 
 `Create` and `GetOrCreate` write the `owned_by` edge inside the insert's
-transaction, and `EdgesAdd` reports whether the owner was deletion-pending when it
+transaction, and `Edges().Add` reports whether the owner was deletion-pending when it
 landed. If it was, its cascade may already have run past this child — and nothing
 else would find it: an edge bumps no `resource_version`, the waker reads only
 `depends_on`, and the child's own collect returns at once because the child is not
 deleting. So `insertObject` enqueues the *owner*, whose next `gcCollect` re-runs
-`DeletionRequestsCreateFromOwner` and marks the child.
+`DeletionRequests().CreateFromOwner` and marks the child.
 
 The gate is the owner's `deletion_requested_at`, read by the endpoint check
-`EdgesAdd` already performs. A live owner was waiting on nothing, and pushing one
+`Edges().Add` already performs. A live owner was waiting on nothing, and pushing one
 would spin — the same reasoning as case 11's route 2, and the same reason the gate
 is not merely an optimisation.
 
@@ -703,7 +703,7 @@ shutdown.
 That is true for the two cases that matter. A reconcile that failed on an
 unconverged spec leaves the object unsettled, which is section A. A reconcile that
 failed while servicing a wake keeps its `reconcile_owed` count, because
-`ReconcileOwedDecrement` runs only on success, which is case 5. A retry for a
+`ReconcileOwed().Decrement` runs only on success, which is case 5. A retry for a
 *settled* object with neither record has nothing to recover it.
 
 ### 13. `Result.RequeueAfter`
@@ -744,7 +744,7 @@ Tests: `TestClientRequeue`, `TestClientRequeueNoController`,
 Each item below looks like a trigger. None of them is one.
 
 - **The full pass is not a coverage mechanism.** `enqueueAll` calls
-  `ObjectsListIDs` and dispatches every object of the kind. It runs once at startup
+  `Objects().ListIDs` and dispatches every object of the kind. It runs once at startup
   under `WithStartupFullPass`, and on a timer under `WithFullPassInterval`. Both are
   off by default. Its job is the one thing no owed-work listing can express:
   re-confirming state that belongs to a *process* rather than to the store. An
@@ -760,7 +760,7 @@ Each item below looks like a trigger. None of them is one.
   waker skips the self-edge on purpose. A spec write already leaves the object
   unsettled, and a status write came from the pass that just ran. Test:
   `TestWakerSkipsTheSelfEdge`.
-- **`EventsAdd` wakes no reconcile.** It bumps no object `resource_version` and
+- **`Events().Add` wakes no reconcile.** It bumps no object `resource_version` and
   appends no write-log entry, which is what makes it the one write that is safe
   inside a dependency cycle. It does wake the object's own event readers, through
   a hub of its own — that is a watch delivery, not a trigger.
@@ -776,7 +776,7 @@ Each item below looks like a trigger. None of them is one.
   for its subscriber. It enqueues no reconcile.
 - **An object of a client-only kind is never reconciled.** It has no reconcile loop.
   An unsettled spec on one is inert. Only its deletion is acted on, by the sweeper.
-- **A queued id whose row is gone is a successful no-op**, not a retry. `ObjectsGet`
+- **A queued id whose row is gone is a successful no-op**, not a retry. `Objects().Get`
   returns `ErrNotFound` and the worker drops the item. Test:
   `TestTypedControllerReconcileMissingIDIsTerminal`.
 - **An undecodable row is quarantined**, not retried. It is skipped as a successful

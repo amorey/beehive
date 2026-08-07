@@ -68,7 +68,7 @@ Harness: `modernc.org/sqlite`, `SetMaxOpenConns(1)`, in-memory, 100k objects wit
 | query | before | after | delta |
 |---|---|---|---|
 | `SELECT from_id FROM edges WHERE to_id=? AND relation=?` (edges only) | 166 ms | 108 ms | **−35%** |
-| `EdgesListIncoming` (the real shape — joins `objects`) | 379 ms | 305 ms | **−20%** |
+| `Edges().ListIncoming` (the real shape — joins `objects`) | 379 ms | 305 ms | **−20%** |
 | database page count | 21276 | 17576 | **−17%** |
 
 **Quote the −20%, not the −35%, for anything beehive runs.** Every real consumer
@@ -78,9 +78,9 @@ reachable only by a caller that wants ids and nothing else. The page-count figur
 likewise scales with spec payload size: it is the `edges` table roughly halving,
 measured against 400-byte specs.
 
-Helped: `EdgesListIncoming` in the dependency waker, the batched
-`EdgesGroupIncomingByID` / `EdgesGroupOutgoingByID` loaders, and
-`ObjectsListByIncomingEdge`. Also the GC cascade's `EdgesHasIncoming`, but for a
+Helped: `Edges().ListIncoming` in the dependency waker, the batched
+`Edges().GroupIncomingByID` / `Edges().GroupOutgoingByID` loaders, and
+`Objects().ListByIncomingEdge`. Also the GC cascade's `Edges().HasIncoming`, but for a
 smaller reason — its `edges` side becomes covering, while the
 `deletion_requested_at` subquery it also runs rides the partial
 `idx_objects_deleting` and was already cheap (3 ms / 200 calls at 50k objects);
@@ -99,16 +99,16 @@ after and diffing:
 | statement | before | after |
 |---|---|---|
 | `EdgesListOutgoing` | `COVERING INDEX sqlite_autoindex_edges_1` | `PRIMARY KEY` |
-| `EdgesListOutgoingByRelation` | `COVERING INDEX sqlite_autoindex_edges_1` | `PRIMARY KEY` |
-| `EdgesAdd` wake-stamp probe | `COVERING INDEX sqlite_autoindex_edges_1` | `PRIMARY KEY` |
-| `EdgesDelete` | `INDEX sqlite_autoindex_edges_1` | `PRIMARY KEY` |
-| `EdgesListIncoming` | `INDEX idx_edges_to` | `COVERING INDEX idx_edges_to` |
-| `ObjectsListByIncomingEdge` | `INDEX idx_edges_to` | `COVERING INDEX idx_edges_to` |
-| `EdgesHasIncoming` | `INDEX idx_edges_to` | `COVERING INDEX idx_edges_to` |
+| `Edges().ListOutgoingByRelation` | `COVERING INDEX sqlite_autoindex_edges_1` | `PRIMARY KEY` |
+| `Edges().Add` wake-stamp probe | `COVERING INDEX sqlite_autoindex_edges_1` | `PRIMARY KEY` |
+| `Edges().Delete` | `INDEX sqlite_autoindex_edges_1` | `PRIMARY KEY` |
+| `Edges().ListIncoming` | `INDEX idx_edges_to` | `COVERING INDEX idx_edges_to` |
+| `Objects().ListByIncomingEdge` | `INDEX idx_edges_to` | `COVERING INDEX idx_edges_to` |
+| `Edges().HasIncoming` | `INDEX idx_edges_to` | `COVERING INDEX idx_edges_to` |
 
 The outgoing side losing `COVERING` is a wash by construction, not a regression:
 the automatic index those statements used *is* the table now, so the same key
-search runs against one B-tree instead of two. `EdgesDelete` was the one statement
+search runs against one B-tree instead of two. `Edges().Delete` was the one statement
 not already covering, so it gains outright.
 
 ### The covering property is now invisible in the schema
@@ -145,7 +145,7 @@ Three commits on `refactor/refs--without-rowid`, built red/green:
 1. Tightened `TestDeletionRequestsCreateFromOwnerUsesRefsIndex` to assert `COVERING`. Red,
    failing with `SEARCH r USING INDEX idx_edges_to (to_id=? AND relation=?)`.
 2. `) STRICT, WITHOUT ROWID;` plus the migration comments. Green, full suite clean.
-3. Reworded the `EdgesAdd` wake-stamp comment in `sqlite/store.go` (and its twin in
+3. Reworded the `Edges().Add` wake-stamp comment in `sqlite/store.go` (and its twin in
    CLAUDE.md), which had described the probe as "a covering probe on the edges
    primary key" — accurate before, wrong once the primary key *is* the table.
 

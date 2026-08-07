@@ -9,7 +9,7 @@
 `storeapi.RawObject` mirrors a whole `objects` row. It is the shape every read
 returns, and it was also the shape every write spoke in — on both sides of the call.
 
-**On the way in.** `ObjectsCreate` took a `*RawObject`. The `INSERT` bound six of its
+**On the way in.** `Objects().Create` took a `*RawObject`. The `INSERT` bound six of its
 eighteen fields — group, kind, name, spec, `schema_version_spec`, finalizers — and
 ignored the rest. Some of the twelve are defensible: `ID`, `ResourceVersion`,
 `CreatedAt` and `UpdatedAt` are store-assigned, `Generation` starts at 1 and
@@ -21,7 +21,7 @@ which fields are honoured and which are decoration.
 assembled it through `scanWritten`, which calls `attachConditions`. So each write
 paid an indexed query on the `conditions` table to build a value that, for six of the
 seven mutators, no caller ever read: `controllerClientImpl` discarded the row from
-`UpdateStatus`, `ConditionsSet`, `ConditionsDelete` and `FinalizersDelete`, and
+`UpdateStatus`, `Conditions().Set`, `Conditions().Delete` and `Objects().DeleteFinalizer`, and
 `clientImpl.Delete`/`DeleteByName` discarded it from both deletion entry points. The
 waste was worst exactly where the least happened — the content no-op branches, which
 did no write at all and still assembled a row to report it.
@@ -30,23 +30,23 @@ Both halves were deferred for the same reason: `type Store = storeapi.Store` and
 `type RawObject = storeapi.RawObject` are exported aliases, so either change breaks
 an interface an application could implement outside this repo. That cost is paid once
 per break, not once per fix, which is why these landed together — with the
-kind-scoping of `ReconcileOwedDecrement`, which had been waiting on the same table.
+kind-scoping of `ReconcileOwed().Decrement`, which had been waiting on the same table.
 
 ## Decision
 
-**A write takes a shape built for writing.** `ObjectsCreate(ctx, gk, ObjectsCreateInput)`
+**A write takes a shape built for writing.** `Objects().Create(ctx, gk, ObjectsCreateInput)`
 replaces the `*RawObject` parameter. The `GroupKind` moves out to its own argument,
 matching every other kind-scoped call in the interface, and `ObjectsCreateInput`
 carries exactly the four remaining fields the `INSERT` binds: `Finalizers`, `Name`,
 `Spec`, `SpecVersion`. Seeding a status is now a compile error rather than a silent
 discard.
 
-**A write returns what its caller reads, and nothing more.** `ObjectsCreate` and
-`ObjectsUpdateSpec` keep returning the row, because `Client.Create`, `Update` and
+**A write returns what its caller reads, and nothing more.** `Objects().Create` and
+`Objects().UpdateSpec` keep returning the row, because `Client.Create`, `Update` and
 `GetOrCreate` hand it to the user, who has no other way to see
 the store-assigned id, version and timestamps. Every other mutator returns `error`,
 plus a `bool` where whether the write landed is not otherwise derivable
-(`DeletionRequestsCreate`, `DeletionRequestsCreateByName`). The `RETURNING`
+(`DeletionRequests().Create`, `DeletionRequests().CreateByName`). The `RETURNING`
 clauses behind them are gone: `bumpObject`, the finalizer rewrite, both status
 writes and `markForDeletion` now `Exec`. Each had already read its row under a kind
 scope inside the same transaction, so `RETURNING` was never what proved the row
@@ -63,21 +63,21 @@ query. A probe built on the read-path row readers would have kept the conditions
 saving and thrown the rest away.
 
 `checkObjectScoped` is the general form of that, not a one-off for the deletion pair:
-**a write that reports no row reads no row.** Both condition mutators and `EventsAdd`
+**a write that reports no row reads no row.** Both condition mutators and `Events().Add`
 gate on kind through it too, which is what stops a corrupt `finalizers` blob from
 failing a write that never touches finalizers — the inconsistency that gave the rule
-away, since `DeletionRequestsCreate` already tolerated such a row.
+away, since `DeletionRequests().Create` already tolerated such a row.
 
 **A write that needs part of a row reads part of a row**, which is the same rule one
 step further in. Three writes genuinely need row *content* and used to load all 17
-columns to get it: `ObjectsUpdateStatus` reads four (`generation`,
-`observed_generation`, `schema_version_status`, `status`), `FinalizersDelete` reads
+columns to get it: `Objects().UpdateStatus` reads four (`generation`,
+`observed_generation`, `schema_version_status`, `status`), `Objects().DeleteFinalizer` reads
 the list and whether the object is deletion-pending — as a bool, computed in SQL, so
-the clock never leaves SQLite — and `ConditionsSet` reads the stored condition. All
+the clock never leaves SQLite — and `Conditions().Set` reads the stored condition. All
 three go through `selectScoped`, the generalisation of `checkObjectScoped`: the
 caller names its columns, the helper prepends the gate's own two and decides
 `ErrNotFound`/`ErrWrongKind`, so scope is settled in one place while the select list
-stays beside the variables it fills. `ConditionsSet` folds further — its gate and
+stays beside the variables it fills. `Conditions().Set` folds further — its gate and
 its no-op comparison key on the same object, so one `LEFT JOIN` from `objects` to
 `conditions` answers both, one round trip instead of two on the hottest write in the
 system. The drift these lists could have with `objectColumns` is not a correctness
@@ -93,7 +93,7 @@ already-pending path a pure read. That is safe because the two statements sit in
 caller's transaction on a single connection, and because every `where` this helper
 takes keys on a unique column, so the subquery can never hand one value to two rows.
 
-**`ObjectsUpdateSpec` loses its `changed` bool**, which is where the two halves of the
+**`Objects().UpdateSpec` loses its `changed` bool**, which is where the two halves of the
 rule pull against each other. It passes the derivability test — the returned row has
 no before-state, so a caller genuinely cannot reconstruct "was this a no-op" from it —
 and fails the one that matters, which is that nobody reads it. Both call sites spelled
@@ -115,11 +115,11 @@ being cross-checked against anyway.
 from two mutators. A missing `conditions` table can therefore no longer fail a status
 write, a deletion mark, or a condition write — `TestNonConditionWriteAssemblyError`
 pins that inversion, having previously asserted the opposite for three of them. For
-the same reason `DeletionRequestsCreate` no longer decodes the row it stamps, so an
+the same reason `DeletionRequests().Create` no longer decodes the row it stamps, so an
 undecodable blob on that row cannot fail the mark; it still fails the probe, which
 is what `TestDeletionRequestsCreateDoesNotScanTheRowItMarks` covers.
 
-Tests that read a mutator's return now re-read with `ObjectsGet`. That is a little
+Tests that read a mutator's return now re-read with `Objects().Get`. That is a little
 more ceremony per test and it is the honest shape: it asks the store what is stored,
 rather than trusting a value the write handed back.
 
@@ -137,15 +137,15 @@ returns a row iff a public `Client` write returns that object to the user.** Tha
 makes the next mutator's shape decidable instead of a judgement call, and it is why
 the line falls where the callers put it rather than somewhere chosen for tidiness.
 
-One consequence worth naming: `ObjectsCreate` returns a row but does *not* assemble
+One consequence worth naming: `Objects().Create` returns a row but does *not* assemble
 conditions for it, because a condition references an object id and the id was minted
 by the `INSERT` that returned the row — so the row provably has none, and `nil` is
 what assembling would have produced. `scanWritten` is therefore reached from
-`ObjectsUpdateSpec` only.
+`Objects().UpdateSpec` only.
 
-## `EventsAdd` takes an input shape too (2026-08-06)
+## `Events().Add` takes an input shape too (2026-08-06)
 
-`EventsAdd` kept taking `Event`, the read shape, and read five of its eleven fields:
+`Events().Add` kept taking `Event`, the read shape, and read five of its eleven fields:
 `Category`, `Type`, `Reason`, `Message`, `Detail`. It now takes `EventsAddInput`
 carrying exactly those five. The dropped fields — `ID`, `ObjectID`, `Count`,
 `FirstAt`, `LastAt`, `ResourceVersion` — were all store-assigned, so nothing was
@@ -154,7 +154,7 @@ exception cost was the rule's decidability, on the same interface that had just 
 narrowed for it.
 
 It was deferred once as a break to ride along with the next one, and skipped a window
-(`EventsMaxVersion`, 2026-07-31) doing so. Waiting again would have made the next
+(`Events().MaxVersion`, 2026-07-31) doing so. Waiting again would have made the next
 break the third an external backend pays for the same rule, which is the argument
 against holding it any longer.
 
