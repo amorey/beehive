@@ -173,15 +173,11 @@ func (r *eventReader) start(ctx context.Context) error {
 // about — where another kind's id is ErrNotFound for good, an id belonging to
 // one kind for life.
 func (r *eventReader) checkKind(ctx context.Context) error {
-	raw, err := r.bh.store.Objects().GetMeta(ctx, r.id)
-	if errors.Is(err, ErrNotFound) {
-		return nil
-	}
-	if err != nil {
+	if _, err := r.bh.store.Objects().GetMeta(ctx, r.id); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil
+		}
 		return err
-	}
-	if raw.Group != r.gk.Group || raw.Kind != r.gk.Kind {
-		return fmt.Errorf("%w: %d belongs to another kind", ErrNotFound, r.id)
 	}
 	r.resolved = true
 	return nil

@@ -1918,6 +1918,18 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 	return watchFixtureWith(t)
 }
 
+// foreignObject registers a second kind on bh and creates one object of it, for
+// the reads that take an id whatever kind holds it. The ControllerClient comes
+// back because only a controller writes that object's events.
+func foreignObject(t *testing.T, ctx context.Context, bh *Beehive) (ObjectID, ControllerClient[cStatus]) {
+	t.Helper()
+	gk := GroupKind{Kind: "Other"}
+	cc, err := Register(bh, gk, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	obj := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, gk), uniqueName(), cSpec{Val: "foreign"})
+	return obj.ID, cc
+}
+
 // watchFixtureWith is watchFixture with extra options on the beehive.
 func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], ControllerClient[cStatus]) {
 	t.Helper()
