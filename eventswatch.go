@@ -96,9 +96,10 @@ func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID,
 		cfg:     resolveEvents(opts),
 		written: written,
 		out:     make(chan Event),
+		// max: the sweeper gates on > 0, so an unenforced bound reports unset.
 		stream: &EventStream{Retention: EventRetention{
-			PerTimeline: c.bh.eventRetentionPerTimeline,
-			MaxAge:      c.bh.eventRetentionMaxAge,
+			PerTimeline: max(0, c.bh.eventRetentionPerTimeline),
+			MaxAge:      max(0, c.bh.eventRetentionMaxAge),
 		}},
 		gate:  rategate.NewSingle(c.bh.watchScanMinInterval),
 		retry: c.bh.watchBackoff(),

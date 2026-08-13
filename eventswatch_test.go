@@ -442,6 +442,10 @@ func TestWatchEventsReportsTheRetentionBound(t *testing.T) {
 		{"unset", nil, EventRetention{}},
 		{"count only", []Option{WithEventRetention(20, 0)}, EventRetention{PerTimeline: 20}},
 		{"age only", []Option{WithEventRetention(0, time.Hour)}, EventRetention{MaxAge: time.Hour}},
+		// A negative bound is unenforced — the sweeper gates on > 0 — so the
+		// field reports it as unset rather than handing back a negative cap.
+		{"negative", []Option{WithEventRetention(-5, -time.Hour)}, EventRetention{}},
+		{"negative count, real age", []Option{WithEventRetention(-5, time.Hour)}, EventRetention{MaxAge: time.Hour}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
