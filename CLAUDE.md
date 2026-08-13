@@ -240,8 +240,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   it is refused rather than answered; a *collected* object ends its streams with
   `ErrNotFound`, since its log and its horizon cascade away together. The horizon
   is only as good as the sweep's `last_at` clock, and it errs toward
-  over-reporting.
-  → [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md)
+  over-reporting. **All three reads take an id and are not kind-scoped** —
+  `ListEvents`, `GetLatestEvent`, `WatchEvents` — because `events` has no kind
+  column to scope by; the reader's probe (`checkExists`) only latches that a row
+  is there, which is what keeps "not created yet" apart from "collected". The
+  write is the asymmetry: `AddEvent` stays kind-scoped. `WatchEvents` still needs
+  a registered controller for the *client's* kind, a property of the caller and
+  not of the target.
+  → [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md),
+  [ADR](docs/adr/2026-08-13-the-event-reads-take-an-id.md)
 - **`Spec`/`Status` separation is structural.** Only
   `Controller`/`ControllerClient` writes status.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on
