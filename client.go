@@ -263,8 +263,9 @@ type Client[Spec, Status any] interface {
 	// extend re-samples ResourceVersion, so a run that grew is delivered again
 	// carrying its latest state. WithEventsResumeFrom starts above a position
 	// instead of snapshotting; one retention has passed is ErrWatchTooOld and
-	// one above the log's head is ErrWatchTooNew. Requires a registered
-	// controller.
+	// one above the log's head is ErrWatchTooNew. The stream reports the
+	// configured EventRetention, so a caller holding runs in memory can bound
+	// its own list. Requires a registered controller.
 	WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 	// WatchList is Watch over every object of this client's kind: the same
 	// snapshot-and-stream contract, tailer and errors. See Watch.

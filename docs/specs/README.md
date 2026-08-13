@@ -14,5 +14,9 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-Nothing is in flight right now. The last spec shipped as
-[`SetObservedGeneration`](../adr/2026-07-27-generation-handshake-and-noop-writes.md).
+Two specs sit on their own branches and are not indexed here until they land:
+one gives the object watches the `EventStream` shape, the other drops
+`WatchEvents`' kind check.
+
+The last spec shipped as
+[`EventStream.Retention`](../adr/2026-08-06-event-retention-is-a-ring-per-timeline.md).

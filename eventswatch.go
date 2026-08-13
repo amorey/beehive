@@ -49,6 +49,10 @@ type EventStream struct {
 	// Events delivers the runs above ResourceVersion, oldest-first, until ctx
 	// ends or the stream fails. Closed exactly once.
 	Events <-chan Event
+	// Retention is the bound the sweeper enforces on this log, so a consumer
+	// holding runs in memory can size its own list from it. Zero fields mean
+	// unbounded; it is process configuration, fixed for the stream's life.
+	Retention EventRetention
 
 	failed atomic.Pointer[error]
 }
@@ -92,11 +96,15 @@ func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID,
 		cfg:     resolveEvents(opts),
 		written: written,
 		out:     make(chan Event),
-		stream:  &EventStream{},
-		gate:    rategate.NewSingle(c.bh.watchScanMinInterval),
-		retry:   c.bh.watchBackoff(),
-		floor:   c.bh.watchFloor(),
-		now:     time.Now,
+		// max: the sweeper gates on > 0, so an unenforced bound reports unset.
+		stream: &EventStream{Retention: EventRetention{
+			PerTimeline: max(0, c.bh.eventRetentionPerTimeline),
+			MaxAge:      max(0, c.bh.eventRetentionMaxAge),
+		}},
+		gate:  rategate.NewSingle(c.bh.watchScanMinInterval),
+		retry: c.bh.watchBackoff(),
+		floor: c.bh.watchFloor(),
+		now:   time.Now,
 
 		pageCap:       defaultEventPageCap,
 		pagesPerDrain: defaultEventPagesPerDrain,

@@ -1915,6 +1915,12 @@ func (s *pollProbeStore) eventsMaxVersion(ctx context.Context, id ObjectID) (int
 // watches need something that can write to a log.
 func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], ControllerClient[cStatus]) {
 	t.Helper()
+	return watchFixtureWith(t)
+}
+
+// watchFixtureWith is watchFixture with extra options on the beehive.
+func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], ControllerClient[cStatus]) {
+	t.Helper()
 	store := &pollProbeStore{
 		Store:        newClientTestStore(t),
 		polled:       make(chan struct{}, 256),
@@ -1925,7 +1931,7 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 		byIDs:        make(chan []ObjectID, 256),
 		tailed:       make(chan struct{}, 256),
 	}
-	bh := newTestBeehive(t, store, fast()...)
+	bh := newTestBeehive(t, store, fast(opts...)...)
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	return store, bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc
