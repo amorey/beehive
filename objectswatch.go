@@ -61,6 +61,37 @@ func (f *streamFail) Err() error {
 
 func (f *streamFail) fail(err error) { f.failed.Store(&err) }
 
+// ObjectStream is a live view of one object: its state as of the subscribe, the
+// position that state was read at, and the changes above it.
+type ObjectStream[Spec, Status any] struct {
+	// Object is the current state, or nil when the id holds nothing yet. Nil on
+	// a resume.
+	Object *Object[Spec, Status]
+	// ResourceVersion is the position Object was read at, and the value to hand
+	// back to WithResumeFrom.
+	ResourceVersion int64
+	// Changes delivers the changes above ResourceVersion, ascending by resource
+	// version, until ctx ends or the stream fails. Closed exactly once.
+	Changes <-chan ObjectChange[Spec, Status]
+
+	*streamFail
+}
+
+// ObjectListStream is ObjectStream over many objects: a kind, or one owner's
+// children of a kind.
+type ObjectListStream[Spec, Status any] struct {
+	// Objects is the snapshot. Empty on a resume.
+	Objects []*Object[Spec, Status]
+	// ResourceVersion is the position Objects is complete as of, and the value
+	// to hand back to WithResumeFrom.
+	ResourceVersion int64
+	// Changes delivers the changes above ResourceVersion, ascending by resource
+	// version, until ctx ends or the stream fails. Closed exactly once.
+	Changes <-chan ObjectChange[Spec, Status]
+
+	*streamFail
+}
+
 // WatchOption configures one watch call. A distinct type from Option: these are
 // meaningful only here, and dispatching them on a Beehive or a controller would
 // silently accept nonsense.

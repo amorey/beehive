@@ -4036,3 +4036,17 @@ func TestStreamFailReportsTheStoredFailure(t *testing.T) {
 	f.fail(ErrWatchTooOld)
 	assert.ErrorIs(t, f.Err(), ErrWatchTooOld)
 }
+
+func TestBothStreamShapesReportOneSharedFailure(t *testing.T) {
+	assert.NoError(t, (&ObjectStream[cSpec, cStatus]{}).Err(), "a zero stream reports no failure")
+	assert.NoError(t, (&ObjectListStream[cSpec, cStatus]{}).Err(), "a zero stream reports no failure")
+
+	// The shape Watch builds: one slot, two values over it.
+	slot := &streamFail{}
+	list := &ObjectListStream[cSpec, cStatus]{streamFail: slot}
+	one := &ObjectStream[cSpec, cStatus]{streamFail: list.streamFail}
+
+	slot.fail(ErrStopped)
+	assert.ErrorIs(t, list.Err(), ErrStopped)
+	assert.ErrorIs(t, one.Err(), ErrStopped, "the adapted value shares the slot it was built from")
+}
