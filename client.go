@@ -278,7 +278,7 @@ type Client[Spec, Status any] interface {
 	// Assumes the one owner WithOwner can express, as GetOwner and Owner() do: a
 	// child carrying several owned_by edges — reachable only through a direct
 	// Store call — streams to one of them. See docs/TODO.md.
-	WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (*ObjectListStream[Spec, Status], error)
 	// WatchSchedule streams id's schedule as a gauge: the current value, then
 	// a new Schedule whenever it changes. Unlike the other watches it reports
 	// in-memory state as the work queue moves it — no polling, emits only on

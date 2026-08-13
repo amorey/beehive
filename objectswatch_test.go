@@ -604,7 +604,7 @@ func TestWatchOwnedObjectsSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
 	mustCreate(t, ctx, client, "orphan", cSpec{})
 
-	snap, _, err := client.WatchOwnedObjects(ctx, owner.ID)
+	snap, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	require.Len(t, snap.Objects, 1)
@@ -622,12 +622,12 @@ func TestWatchOwnedObjectsDeliversALaterChild(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	_, ch, err := client.WatchOwnedObjects(ctx, owner.ID)
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	child := mustCreate(t, ctx, client, "child", cSpec{Val: "a"}, WithOwner(owner.ID))
 
-	ev := recv(t, ch)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Added, ev.Type)
 	assert.Equal(t, child.ID, ev.Object.ID)
 }
@@ -642,7 +642,7 @@ func TestWatchOwnedObjectsIgnoresWhatItDoesNotOwn(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	other := mustCreate(t, ctx, client, "other", cSpec{})
 
-	_, ch, err := client.WatchOwnedObjects(ctx, owner.ID)
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
@@ -650,7 +650,7 @@ func TestWatchOwnedObjectsIgnoresWhatItDoesNotOwn(t *testing.T) {
 	// Written last, so anything ahead of it in the stream is a leak.
 	mine := mustCreate(t, ctx, client, "mine", cSpec{}, WithOwner(owner.ID))
 
-	ev := recv(t, ch)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, mine.ID, ev.Object.ID, "only the owner's own child is delivered")
 }
 
@@ -664,18 +664,18 @@ func TestWatchOwnedObjectsReportsACollectedChild(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	child := mustCreate(t, ctx, client, "child", cSpec{Val: "final"}, WithOwner(owner.ID))
 
-	_, ch, err := client.WatchOwnedObjects(ctx, owner.ID)
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, child.ID))
-	pending := recv(t, ch)
+	pending := recv(t, stream.Changes)
 	require.Equal(t, Modified, pending.Type, "the deletion request is an ordinary write")
 
 	gone, err := bh.gcCollect(ctx, child.ID)
 	require.NoError(t, err)
 	require.True(t, gone)
 
-	ev := recv(t, ch)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Deleted, ev.Type)
 	assert.Equal(t, child.ID, ev.Object.ID)
 	assert.Equal(t, "final", ev.Object.Spec.Val, "the row image carries the final state")
@@ -697,12 +697,12 @@ func TestWatchOwnedObjectsReportsAnUndecodableCollectedChild(t *testing.T) {
 	_, err = store.Edges().Add(ctx, poison.ID, owner.ID, RelationOwnedBy)
 	require.NoError(t, err)
 
-	_, ch, err := client.WatchOwnedObjects(ctx, owner.ID)
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, store.Objects().Delete(ctx, poison.ID))
 
-	ev := recv(t, ch)
+	ev := recv(t, stream.Changes)
 	require.Equal(t, Deleted, ev.Type, "the removal went unreported")
 	assert.Equal(t, poison.ID, ev.ID)
 	assert.Nil(t, ev.Object, "the body is quarantined, the removal is not")
@@ -717,7 +717,7 @@ func TestWatchOwnedObjectsResumesFromAPosition(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	other := mustCreate(t, ctx, client, "other", cSpec{})
 
-	snap, _, err := client.WatchOwnedObjects(ctx, owner.ID)
+	snap, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	// All of this lands in the gap the resume below has to replay.
@@ -730,14 +730,14 @@ func TestWatchOwnedObjectsResumesFromAPosition(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, gone)
 
-	_, ch, err := client.WatchOwnedObjects(ctx, owner.ID, WithResumeFrom(snap.ResourceVersion))
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID, WithResumeFrom(snap.ResourceVersion))
 	require.NoError(t, err)
 
-	first := recv(t, ch)
+	first := recv(t, stream.Changes)
 	assert.Equal(t, Added, first.Type)
 	assert.Equal(t, mine.ID, first.Object.ID, "the siblings outside the scope are not replayed")
 
-	second := recv(t, ch)
+	second := recv(t, stream.Changes)
 	assert.Equal(t, Deleted, second.Type)
 	assert.Equal(t, doomed.ID, second.ID)
 }
@@ -782,7 +782,7 @@ func TestWatchOwnedObjectsLeavesAnUnaskedRelationUnloaded(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	first := mustCreate(t, ctx, client, "first", cSpec{}, WithOwner(owner.ID))
 
-	snap, ch, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadDependencies()))
+	snap, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadDependencies()))
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
 	require.Equal(t, first.ID, snap.Objects[0].ID)
@@ -791,7 +791,7 @@ func TestWatchOwnedObjectsLeavesAnUnaskedRelationUnloaded(t *testing.T) {
 
 	mustCreate(t, ctx, client, "second", cSpec{}, WithOwner(owner.ID))
 
-	ev := recv(t, ch)
+	ev := recv(t, snap.Changes)
 	_, _, err = ev.Object.Owner()
 	assert.ErrorIs(t, err, ErrNotLoaded, "and so does the stream, or one call answers two ways")
 }
@@ -806,14 +806,14 @@ func TestWatchOwnedObjectsLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	snap, ch, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadOwner()))
+	snap, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadOwner()))
 	require.NoError(t, err)
 	require.Empty(t, snap.Objects)
 	before := store.relationReads.Load()
 
 	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
 
-	ev := recv(t, ch)
+	ev := recv(t, snap.Changes)
 	require.Equal(t, child.ID, ev.Object.ID)
 	got, ok, err := ev.Object.Owner()
 	require.NoError(t, err, "the relation the watch asked for is loaded")
@@ -833,7 +833,7 @@ func TestAScopedWatchSurvivesAFailedOwnerRead(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	_, ch, err := client.WatchOwnedObjects(ctx, owner.ID)
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	store.broken.Store(true)
@@ -841,7 +841,7 @@ func TestAScopedWatchSurvivesAFailedOwnerRead(t *testing.T) {
 	waitClosed(t, chanAfter(store.failed, 1), "the drain that cannot read owners")
 
 	store.broken.Store(false)
-	ev := recv(t, ch)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, child.ID, ev.Object.ID)
 }
 
@@ -854,11 +854,11 @@ func TestWatchOwnedObjectsOverAChildlessOwnerStaysQuiet(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	snap, ch, err := client.WatchOwnedObjects(ctx, owner.ID)
+	snap, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.Empty(t, snap.Objects)
 	assert.NotZero(t, snap.ResourceVersion)
-	assert.NotNil(t, ch)
+	assert.NotNil(t, snap.Changes)
 }
 
 // The tail reads what the log says changed, not the whole kind. That is the
@@ -3513,6 +3513,43 @@ func TestASingleObjectStreamReportsTheFailureToo(t *testing.T) {
 
 	waitClosed(t, closedWhenDrained(stream.Changes), "the single-object stream to end")
 	assert.ErrorIs(t, stream.Err(), ErrStopped)
+}
+
+// All three entry points report a terminal failure the same way. They differ in
+// what they scope the tail to, never in how they end.
+func TestEveryWatchShapeReportsItsFailureAlike(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, "owner", cSpec{})
+	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
+
+	one, err := client.Watch(ctx, child.ID)
+	require.NoError(t, err)
+	list, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	owned, err := client.WatchOwnedObjects(ctx, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, owned.Objects, 1, "the scope holds before the failure")
+
+	require.NoError(t, bh.stop(ctx))
+
+	for _, tc := range []struct {
+		name    string
+		changes <-chan ObjectChange[cSpec, cStatus]
+		err     func() error
+	}{
+		{"Watch", one.Changes, one.Err},
+		{"WatchList", list.Changes, list.Err},
+		{"WatchOwnedObjects", owned.Changes, owned.Err},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			waitClosed(t, closedWhenDrained(tc.changes), "the stream to end on stop")
+			assert.ErrorIs(t, tc.err(), ErrStopped)
+		})
+	}
 }
 
 // The failure is stored before the channel closes, so the close is the whole

@@ -111,17 +111,15 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 		ids[k] = obj.ID
 
 		for range watchersPerKind {
-			var ch <-chan ObjectChange[cSpec, cStatus]
+			var stream *ObjectListStream[cSpec, cStatus]
 			var err error
 			if scoped {
-				_, ch, err = clients[k].WatchOwnedObjects(ctx, ownerID)
+				stream, err = clients[k].WatchOwnedObjects(ctx, ownerID)
 			} else {
-				var stream *ObjectListStream[cSpec, cStatus]
-				if stream, err = clients[k].WatchList(ctx); err == nil {
-					ch = stream.Changes
-				}
+				stream, err = clients[k].WatchList(ctx)
 			}
 			require.NoError(b, err)
+			ch := stream.Changes
 			watchers.Add(1)
 			// Drain, or the fan-out coalesces into a slot nobody empties and
 			// the benchmark measures a backlog rather than a write path.
