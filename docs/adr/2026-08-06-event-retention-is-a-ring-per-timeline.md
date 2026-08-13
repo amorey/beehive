@@ -113,3 +113,24 @@ timelines is exactly right (`TestEventsWatchHorizonIsPerTimeline`).
 `maxAge` remains a flat cutoff over the table where the cap partitions, and it
 reads a run's *end*, so a run that keeps being extended never ages out. That is
 the recency-window semantics; it is not a second size bound.
+
+## The bound is readable from the stream
+
+`EventStream.Retention` reports the configured bounds. A watch consumer that
+holds runs in memory grows past what the store keeps unless it caps its own
+list, and to cap it correctly it needs this number — without it on the stream,
+callers hardcode a mirror of the server's config that goes silently wrong when
+the config changes.
+
+It is a readout of the option, not a per-stream fact, and it is deliberately not
+a prune signal: the stream stays "the snapshot, and what grows above it", and
+what a trim can actually cost a reader is already answered by the horizon and
+`ErrWatchTooOld`. An unenforced bound reads zero — the sweeper gates on `> 0`,
+so a negative configured value is reported as unset, and the field says what is
+enforced rather than what was passed.
+
+It sits on the stream rather than on `Client` because the caller who needs the
+number is the one already holding the struct that grows, so the bound and the
+position it bounds arrive together. `ListEvents` has the same gap and no
+additive place to put it; a `Client` accessor would be the answer, and would
+read this same configuration rather than a second copy of it.

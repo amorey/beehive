@@ -356,7 +356,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   **Retention runs in the GC sweeper and is off by default**: a cap of *runs*
   per timeline, which trims only the timelines a candidate query finds over it
   (bounded per sweep, so it is progressive), plus an optional flat `maxAge`
-  cutoff across every timeline.
+  cutoff across every timeline. **`EventStream.Retention` reports that
+  configuration**, clamped to what the sweeper's `> 0` gates enforce, so a
+  consumer bounds its own in-memory list without mirroring the config; a prune
+  is still never delivered.
   → [ADR](docs/adr/2026-07-27-events-api.md),
   [ADR](docs/adr/2026-08-05-events-get-a-cursor-and-a-commit-wake.md),
   [ADR](docs/adr/2026-08-06-event-retention-is-a-ring-per-timeline.md)
