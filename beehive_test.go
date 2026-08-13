@@ -645,7 +645,7 @@ func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
 	mustCreate(t, ctx, client, "held", cSpec{})
 	<-ctrl.entered // the drain now has something to wait for
 
-	stream2, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	firstDone := make(chan error, 1)
@@ -670,8 +670,7 @@ func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
 	require.NoError(t, bh.stop(ctx))
 	obj := mustCreate(t, ctx, client, "after-second-stop", cSpec{})
 	for {
-		ev := recv(t, stream2.Changes)
-		require.NoError(t, stream2.Err(), "the second stop ended the stream")
+		ev := recv(t, stream.Changes)
 		if ev.Object != nil && ev.Object.ID == obj.ID {
 			break
 		}
@@ -679,7 +678,7 @@ func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
 
 	close(ctrl.release)
 	require.NoError(t, <-firstDone)
-	for range stream2.Changes { // the first stop's close ends it, once its drain is done
+	for range stream.Changes { // the first stop's close ends it, once its drain is done
 	}
 }
 

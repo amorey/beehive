@@ -397,9 +397,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   key you pass trails (`GetByName`); an adjectival one leads
   (`GetLatestEvent`, `HasIncomingEdges`). List interface members
   alphabetically. `Err*`, `With*` and external-interface methods are exempt, as
-  are `Object`'s relation accessors. A watch over a change stream returns
-  `<-chan NounChange`; a watch over a gauge or a log streams the value itself.
-  → [ADR](docs/adr/2026-08-07-verb-noun-on-the-client-surfaces.md)
+  are `Object`'s relation accessors. A watch returns a **stream value** whose
+  channel field carries what it streams — `NounChange` over a change stream,
+  the value itself over a log — plus an `Err()` for why it ended; `WatchSchedule`
+  is the exception, a gauge with no failure to report, so it returns the bare
+  channel.
+  → [ADR](docs/adr/2026-08-07-verb-noun-on-the-client-surfaces.md),
+  [ADR](docs/adr/2026-08-13-a-stream-reports-its-failure-beside-itself.md)
 - **Whitebox tests**: tests go in `package beehive`, so they reach unexported
   machinery.
 - **Test files mirror source files, not features.** Shared helpers and fakes go

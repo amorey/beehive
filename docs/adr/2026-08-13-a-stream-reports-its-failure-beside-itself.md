@@ -44,8 +44,12 @@ which is worse than the `Failed` change it replaced.
 
 So `streamFail` is allocated once per subscribe and **embedded by pointer** in
 every stream value built from that call. Embedding it by value re-creates the
-bug and still compiles, which is why `TestASingleObjectStreamReportsTheFailureToo`
-exists: it fails with a copied slot.
+bug and still compiles, which is why the `Watch` row of
+`TestEveryWatchShapeReportsItsFailureAlike` exists: it fails with a copied slot.
+
+`objectTailer` carries the same slot **by value** — it is never copied, and its
+subscribers reach it through the one pointer they hold — which is what makes
+`tailer.Err()` and a stream's `Err()` one mechanism rather than two lookalikes.
 
 The alternative — passing the destination stream into `tailStream` — keeps both
 structs flat like `EventStream`, but moves the invariant into three call sites
@@ -72,7 +76,12 @@ so godoc shows a promoted `Err` either way).
   stream whose `Err()` is set: the snapshot's guarantee is void, so there is
   nothing to subscribe to.
 - **`EventStream` keeps its own inline slot.** Converting it to `streamFail` is
-  a tidy-up with no caller-visible effect; there is no bug behind it.
+  a tidy-up with no caller-visible effect; there is no bug behind it, and its
+  `Err` godoc names a different sentinel set (`ErrNotFound` for a collected
+  object), which a promoted method would have to carry somewhere else.
+- **The stream goroutine captures the slot, not the stream.** Capturing the
+  stream would pin its snapshot — every decoded object, with eager relations —
+  for the stream's whole life, which the old shape did not do.
 - **A dead tailer is now released promptly** on failure, since no subscriber
   parks delivering a terminal change. Presence in the registry still is not
   health — the window between a reset and the last release is real, and

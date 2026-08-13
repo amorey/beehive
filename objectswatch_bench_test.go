@@ -119,13 +119,12 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 				stream, err = clients[k].WatchList(ctx)
 			}
 			require.NoError(b, err)
-			ch := stream.Changes
 			watchers.Add(1)
 			// Drain, or the fan-out coalesces into a slot nobody empties and
 			// the benchmark measures a backlog rather than a write path.
 			go func() {
 				defer watchers.Done()
-				for range ch {
+				for range stream.Changes {
 				}
 			}()
 		}

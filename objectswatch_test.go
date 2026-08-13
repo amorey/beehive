@@ -70,10 +70,10 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the snapshot reports the object")
-	require.Equal(t, obj.ID, snap.Objects[0].ID)
+	require.Len(t, stream.Objects, 1, "the snapshot reports the object")
+	require.Equal(t, obj.ID, stream.Objects[0].ID)
 
 	// The next two listings fail. Only a tick that has something to list reaches
 	// them, so give it a change to find.
@@ -81,7 +81,7 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Modified, ev.Type, "the stream survives the failed polls and reports the change")
 	assert.Equal(t, "b", ev.Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch tail step failed", "the skipped reads are reported")
@@ -103,9 +103,9 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
+	require.Len(t, stream.Objects, 1, "the object is in the snapshot, not the stream")
 
 	// A real change is the barrier. Many ticks pass while the object is untouched;
 	// if any of them re-sent it, that Modified would arrive carrying the old spec
@@ -113,7 +113,7 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Modified, ev.Type)
 	assert.Equal(t, "b", ev.Object.Spec.Val, "the only delivery after the snapshot is the real change")
 }
@@ -134,13 +134,13 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "gone"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
+	require.Len(t, stream.Objects, 1, "the object is in the snapshot, not the stream")
 
 	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Deleted, ev.Type)
 	require.NotNil(t, ev.Object)
 	assert.Equal(t, obj.ID, ev.Object.ID)
@@ -196,10 +196,10 @@ func TestWatchSingleObjectIsKindScoped(t *testing.T) {
 	// The barrier is this client's own object: it is created after the foreign one,
 	// so anything the foreign id produced would have to arrive first.
 	mine := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "mine", cSpec{Val: "mine"})
-	mineSnap, err := NewClient[cSpec, cStatus](bh, clientTestGK).WatchList(ctx)
+	mineStream, err := NewClient[cSpec, cStatus](bh, clientTestGK).WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, mineSnap.Objects, 1)
-	require.Equal(t, mine.ID, mineSnap.Objects[0].ID)
+	require.Len(t, mineStream.Objects, 1)
+	require.Equal(t, mine.ID, mineStream.Objects[0].ID)
 
 	select {
 	case ev := <-stream.Changes:
@@ -221,9 +221,9 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.Watch(ctx, obj.ID)
+	stream, err := client.Watch(ctx, obj.ID)
 	require.NoError(t, err)
-	require.NotNil(t, snap.Object, "the object is in the snapshot, not the stream")
+	require.NotNil(t, stream.Object, "the object is in the snapshot, not the stream")
 
 	// A change to find, and a read that fails while it tries. Wait for ticks that
 	// come *after* the failure is armed, so the recovery below is the stream
@@ -235,7 +235,7 @@ func TestWatchSingleObjectSurvivesAReadFailure(t *testing.T) {
 	waitClosed(t, chanAfter(store.polled, 2), "polls while the read fails")
 	store.getErr.Store(false)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Modified, ev.Type)
 	assert.Equal(t, "b", ev.Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch tail step failed", "the skipped read is reported")
@@ -254,9 +254,9 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
+	require.Len(t, stream.Objects, 1, "the object is in the snapshot, not the stream")
 
 	// A write moves the position, so every tick from here reaches the tail's
 	// listing — which now fails.
@@ -270,7 +270,7 @@ func TestWatchSurvivesADeleteCheckFailure(t *testing.T) {
 	// A real change proves the stream is still live and still tailing.
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
-	assert.Equal(t, "b", recv(t, snap.Changes).Object.Spec.Val)
+	assert.Equal(t, "b", recv(t, stream.Changes).Object.Spec.Val)
 	assert.Contains(t, buf.String(), "watch tail step failed")
 }
 
@@ -326,9 +326,9 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the object is in the snapshot, not the stream")
+	require.Len(t, stream.Objects, 1, "the object is in the snapshot, not the stream")
 
 	// Remove the row outright and stop reading: the next poll tails the delete
 	// entry, builds the tombstone from its row image, and parks in the send.
@@ -337,7 +337,7 @@ func TestWatchAbandonsATombstoneSendOnCancel(t *testing.T) {
 	waitClosed(t, chanAfter(store.tailed, 1), "the tail that observes the removal")
 	cancel()
 
-	waitClosed(t, closedWhenDrained(snap.Changes), "the stream to close on cancellation")
+	waitClosed(t, closedWhenDrained(stream.Changes), "the stream to close on cancellation")
 }
 
 // A removal is reported even when the row image will not decode, with a nil
@@ -395,9 +395,9 @@ func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
 	store, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the create is in the snapshot")
+	require.Len(t, stream.Objects, 1, "the create is in the snapshot")
 	drainProbe(store.listed)
 
 	// An event write bumps the shared sequence and no objects row.
@@ -410,7 +410,7 @@ func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
 	default:
 	}
 	select {
-	case ev := <-snap.Changes:
+	case ev := <-stream.Changes:
 		t.Fatalf("an event write is not an object change, got %+v", ev)
 	default:
 	}
@@ -438,13 +438,13 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 	watched := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "watched"})
 	newer := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "newer"})
 
-	snap, err := client.Watch(ctx, watched.ID)
+	stream, err := client.Watch(ctx, watched.ID)
 	require.NoError(t, err)
-	require.NotNil(t, snap.Object)
+	require.NotNil(t, stream.Object)
 	drainProbe(store.byIDs)
 
 	require.NoError(t, client.Delete(ctx, watched.ID))
-	pending := recv(t, snap.Changes)
+	pending := recv(t, stream.Changes)
 	require.Equal(t, Modified, pending.Type, "the deletion request is an ordinary write")
 	assert.NotNil(t, pending.Object.DeletionRequestedAt)
 
@@ -456,7 +456,7 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, gone, "the row is finalizer-free, so the collect removes it")
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Deleted, ev.Type)
 	assert.Equal(t, watched.ID, ev.Object.ID)
 	assert.Equal(t, "watched", ev.Object.Spec.Val, "the row image carries the final state")
@@ -464,7 +464,7 @@ func TestWatchSingleObjectReportsTheDeleteLifecycle(t *testing.T) {
 	// The other object's write is read by the kind's shared tailer — the filter
 	// is on the fan-out, not on the read — but it is never delivered here.
 	select {
-	case ev := <-snap.Changes:
+	case ev := <-stream.Changes:
 		t.Fatalf("a single-object watch delivered another object: %+v", ev)
 	default:
 	}
@@ -491,17 +491,17 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
 	t.Run("list watch", func(t *testing.T) {
-		snap, err := client.WatchList(ctx)
+		stream, err := client.WatchList(ctx)
 		require.NoError(t, err)
-		require.Len(t, snap.Objects, 1)
-		assert.Equal(t, obj.ID, snap.Objects[0].ID)
+		require.Len(t, stream.Objects, 1)
+		assert.Equal(t, obj.ID, stream.Objects[0].ID)
 	})
 
 	t.Run("single-object watch", func(t *testing.T) {
-		snap, err := client.Watch(ctx, obj.ID)
+		stream, err := client.Watch(ctx, obj.ID)
 		require.NoError(t, err)
-		require.NotNil(t, snap.Object)
-		assert.Equal(t, obj.ID, snap.Object.ID)
+		require.NotNil(t, stream.Object)
+		assert.Equal(t, obj.ID, stream.Object.ID)
 	})
 }
 
@@ -529,17 +529,17 @@ func TestWatchReportsAFailedFirstRead(t *testing.T) {
 	// same way.
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 	store.getErr.Store(true)
-	stream2, err := client.Watch(ctx, obj.ID)
+	one, err := client.Watch(ctx, obj.ID)
 	require.ErrorIs(t, err, errBoom)
-	assert.Nil(t, stream2)
+	assert.Nil(t, one)
 
 	// It is the read that failed, not the subscription: with the store answering
 	// again, subscribing works.
 	store.listErr.Store(false)
 	store.getErr.Store(false)
-	snap, err := client.WatchList(ctx)
+	stream, err = client.WatchList(ctx)
 	require.NoError(t, err)
-	assert.Len(t, snap.Objects, 2)
+	assert.Len(t, stream.Objects, 2)
 }
 
 // A context already cancelled at subscribe is the same story told by the store:
@@ -578,15 +578,15 @@ func TestWatchListReturnsASnapshot(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	before := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "current state, in hand before the first change")
-	assert.Equal(t, before.ID, snap.Objects[0].ID)
-	assert.GreaterOrEqual(t, snap.ResourceVersion, before.ResourceVersion)
+	require.Len(t, stream.Objects, 1, "current state, in hand before the first change")
+	assert.Equal(t, before.ID, stream.Objects[0].ID)
+	assert.GreaterOrEqual(t, stream.ResourceVersion, before.ResourceVersion)
 
 	after := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Added, ev.Type)
 	assert.Equal(t, after.ID, ev.Object.ID, "the stream carries only what the snapshot missed")
 }
@@ -604,12 +604,12 @@ func TestWatchOwnedObjectsSnapshotsOnlyTheOwnersChildren(t *testing.T) {
 	mustCreate(t, ctx, client, "theirs", cSpec{}, WithOwner(other.ID))
 	mustCreate(t, ctx, client, "orphan", cSpec{})
 
-	snap, err := client.WatchOwnedObjects(ctx, owner.ID)
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
-	require.Len(t, snap.Objects, 1)
-	assert.Equal(t, mine.ID, snap.Objects[0].ID)
-	assert.GreaterOrEqual(t, snap.ResourceVersion, mine.ResourceVersion)
+	require.Len(t, stream.Objects, 1)
+	assert.Equal(t, mine.ID, stream.Objects[0].ID)
+	assert.GreaterOrEqual(t, stream.ResourceVersion, mine.ResourceVersion)
 }
 
 // A child created after the snapshot arrives as Added. This is the case a
@@ -717,7 +717,7 @@ func TestWatchOwnedObjectsResumesFromAPosition(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	other := mustCreate(t, ctx, client, "other", cSpec{})
 
-	snap, err := client.WatchOwnedObjects(ctx, owner.ID)
+	before, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
 
 	// All of this lands in the gap the resume below has to replay.
@@ -730,7 +730,7 @@ func TestWatchOwnedObjectsResumesFromAPosition(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, gone)
 
-	stream, err := client.WatchOwnedObjects(ctx, owner.ID, WithResumeFrom(snap.ResourceVersion))
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID, WithResumeFrom(before.ResourceVersion))
 	require.NoError(t, err)
 
 	first := recv(t, stream.Changes)
@@ -782,16 +782,16 @@ func TestWatchOwnedObjectsLeavesAnUnaskedRelationUnloaded(t *testing.T) {
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 	first := mustCreate(t, ctx, client, "first", cSpec{}, WithOwner(owner.ID))
 
-	snap, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadDependencies()))
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadDependencies()))
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1)
-	require.Equal(t, first.ID, snap.Objects[0].ID)
-	_, _, err = snap.Objects[0].Owner()
+	require.Len(t, stream.Objects, 1)
+	require.Equal(t, first.ID, stream.Objects[0].ID)
+	_, _, err = stream.Objects[0].Owner()
 	require.ErrorIs(t, err, ErrNotLoaded, "the snapshot loaded only what was asked for")
 
 	mustCreate(t, ctx, client, "second", cSpec{}, WithOwner(owner.ID))
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	_, _, err = ev.Object.Owner()
 	assert.ErrorIs(t, err, ErrNotLoaded, "and so does the stream, or one call answers two ways")
 }
@@ -806,14 +806,14 @@ func TestWatchOwnedObjectsLoadsTheOwnerItAlreadyResolved(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	snap, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadOwner()))
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID, WithLoads(LoadOwner()))
 	require.NoError(t, err)
-	require.Empty(t, snap.Objects)
+	require.Empty(t, stream.Objects)
 	before := store.relationReads.Load()
 
 	child := mustCreate(t, ctx, client, "child", cSpec{}, WithOwner(owner.ID))
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	require.Equal(t, child.ID, ev.Object.ID)
 	got, ok, err := ev.Object.Owner()
 	require.NoError(t, err, "the relation the watch asked for is loaded")
@@ -854,11 +854,11 @@ func TestWatchOwnedObjectsOverAChildlessOwnerStaysQuiet(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, "owner", cSpec{})
 
-	snap, err := client.WatchOwnedObjects(ctx, owner.ID)
+	stream, err := client.WatchOwnedObjects(ctx, owner.ID)
 	require.NoError(t, err)
-	assert.Empty(t, snap.Objects)
-	assert.NotZero(t, snap.ResourceVersion)
-	assert.NotNil(t, snap.Changes)
+	assert.Empty(t, stream.Objects)
+	assert.NotZero(t, stream.ResourceVersion)
+	assert.NotNil(t, stream.Changes)
 }
 
 // The tail reads what the log says changed, not the whole kind. That is the
@@ -870,16 +870,16 @@ func TestObjectStreamTailsTheWriteLog(t *testing.T) {
 	quiet := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "quiet"})
 	busy := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "busy"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 2)
+	require.Len(t, stream.Objects, 2)
 	drainProbe(store.listed)
 	drainProbe(store.byIDs)
 
 	_, err = client.Update(ctx, busy.ID, cSpec{Val: "busy2"})
 	require.NoError(t, err)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	require.Equal(t, Modified, ev.Type)
 	require.Equal(t, busy.ID, ev.Object.ID)
 
@@ -953,15 +953,15 @@ func TestAQuietKindIsNotTornDownByATrim(t *testing.T) {
 	store, _, client, _ := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	// Trimmed through exactly where the tail sits: nothing it had not read is gone.
-	store.forceTrimmed.Store(snap.ResourceVersion)
+	store.forceTrimmed.Store(stream.ResourceVersion)
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Modified, ev.Type)
 	assert.Equal(t, "b", ev.Object.Spec.Val)
 }
@@ -981,12 +981,12 @@ func TestWithResumeFromSkipsTheSnapshot(t *testing.T) {
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
 
-	snap, err := client.WatchList(ctx, WithResumeFrom(first.ResourceVersion))
+	stream, err := client.WatchList(ctx, WithResumeFrom(first.ResourceVersion))
 	require.NoError(t, err)
-	assert.Empty(t, snap.Objects, "a resume reads no state")
-	assert.Equal(t, first.ResourceVersion, snap.ResourceVersion)
+	assert.Empty(t, stream.Objects, "a resume reads no state")
+	assert.Equal(t, first.ResourceVersion, stream.ResourceVersion)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Modified, ev.Type)
 	assert.Equal(t, "b", ev.Object.Spec.Val, "the change the caller missed")
 
@@ -1024,10 +1024,10 @@ func TestWatchAppliesLoadOptions(t *testing.T) {
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
 	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
-	snap, err := client.WatchList(ctx, WithLoads(LoadOwner()))
+	stream, err := client.WatchList(ctx, WithLoads(LoadOwner()))
 	require.NoError(t, err)
 
-	for _, obj := range snap.Objects {
+	for _, obj := range stream.Objects {
 		if obj.ID == child.ID {
 			got, ok, err := obj.Owner()
 			require.NoError(t, err, "the snapshot's objects carry the requested relation")
@@ -1039,7 +1039,7 @@ func TestWatchAppliesLoadOptions(t *testing.T) {
 	_, err = client.Update(ctx, child.ID, cSpec{Val: "child2"})
 	require.NoError(t, err)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	require.Equal(t, child.ID, ev.Object.ID)
 	got, ok, err := ev.Object.Owner()
 	require.NoError(t, err, "so do the stream's")
@@ -1058,13 +1058,13 @@ func TestWatchNeedsNoController(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientOnly)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1)
+	require.Len(t, stream.Objects, 1)
 
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "b"})
 	require.NoError(t, err)
-	assert.Equal(t, "b", recv(t, snap.Changes).Object.Spec.Val)
+	assert.Equal(t, "b", recv(t, stream.Changes).Object.Spec.Val)
 
 	_, err = client.WatchSchedule(ctx, obj.ID)
 	assert.ErrorIs(t, err, ErrNoController, "a schedule still needs a reconciler")
@@ -1886,7 +1886,7 @@ func TestTailerResetsWhenItsCursorIsTrimmed(t *testing.T) {
 		}
 	}
 	assert.ErrorIs(t, err, gobus.ErrClosed)
-	assert.ErrorIs(t, tailer.failure(), ErrWatchTooOld)
+	assert.ErrorIs(t, tailer.Err(), ErrWatchTooOld)
 
 	// A tailer started now is above the horizon and works.
 	_, fresh := startTailer(t, bh, clientTestGK)
@@ -1990,7 +1990,7 @@ func TestTailerPassDecidesWhenToLookAgain(t *testing.T) {
 
 		_, _, done := tailer.pass(ctx, tailer.now(), false)
 		assert.True(t, done, "there is no single subscriber to hand the error to")
-		assert.ErrorIs(t, tailer.failure(), ErrWatchTooOld)
+		assert.ErrorIs(t, tailer.Err(), ErrWatchTooOld)
 	})
 }
 
@@ -2311,31 +2311,31 @@ func TestTailerEndsWithItsLastSubscriber(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	firstCtx, endFirst := context.WithCancel(ctx)
-	stream, err := client.WatchList(firstCtx)
+	first, err := client.WatchList(firstCtx)
 	require.NoError(t, err)
 	secondCtx, endSecond := context.WithCancel(ctx)
-	stream2, err := client.WatchList(secondCtx)
+	second, err := client.WatchList(secondCtx)
 	require.NoError(t, err)
 	require.Equal(t, 1, tailerCount(bh), "two watches on one kind share one tailer")
 
 	// The stream closes after its lease is released, so draining it is the
 	// signal that the release has happened — no sleep needed.
 	endFirst()
-	for range stream.Changes { // draining is the signal: the stream closes after its release
+	for range first.Changes { // draining is the signal: the stream closes after its release
 	}
 	assert.Equal(t, 1, tailerCount(bh), "a tailer with a subscriber left must stay")
 
 	endSecond()
-	for range stream2.Changes { // same signal
+	for range second.Changes { // same signal
 	}
 	assert.Zero(t, tailerCount(bh), "the last subscriber left its tailer running")
 
 	// And the kind is watchable again: the teardown left nothing dead behind for
 	// the next watch to join.
-	stream3, err := client.WatchList(ctx)
+	again, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	obj := mustCreate(t, ctx, client, "after-teardown", cSpec{})
-	assert.Equal(t, obj.ID, recv(t, stream3.Changes).Object.ID)
+	assert.Equal(t, obj.ID, recv(t, again.Changes).Object.ID)
 }
 
 // A watch on a Beehive that was never Started ends with its caller. Nothing else
@@ -2371,7 +2371,7 @@ func TestWatchAfterAResetJoinsAFreshTailer(t *testing.T) {
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(fastTick))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	stream2, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	require.Equal(t, 1, tailerCount(bh))
 
@@ -2385,14 +2385,14 @@ func TestWatchAfterAResetJoinsAFreshTailer(t *testing.T) {
 	require.NoError(t, err)
 	store.failures.Store(0)
 
-	waitClosed(t, closedWhenDrained(stream2.Changes), "the stream to end on the trim")
-	require.ErrorIs(t, stream2.Err(), ErrWatchTooOld)
+	waitClosed(t, closedWhenDrained(stream.Changes), "the stream to end on the trim")
+	require.ErrorIs(t, stream.Err(), ErrWatchTooOld)
 
 	// The resubscribe the caller is told to make. It must get a working stream.
-	stream4, err := client.WatchList(ctx)
+	fresh, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	obj := mustCreate(t, ctx, client, "after-reset", cSpec{})
-	live := recv(t, stream4.Changes)
+	live := recv(t, fresh.Changes)
 	require.Equal(t, Added, live.Type, "the resubscribe rejoined the tailer that had already failed")
 	assert.Equal(t, obj.ID, live.Object.ID)
 }
@@ -2408,13 +2408,12 @@ func TestTailerForSkipsARegisteredButFailedTailer(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
 	dead, err := bh.tailerFor(ctx, clientTestGK)
 	require.NoError(t, err)
-	trimmed := error(ErrWatchTooOld)
-	dead.failed.Store(&trimmed) // as a horizon reset does, with the lease still held
+	dead.fail(ErrWatchTooOld) // as a horizon reset does, with the lease still held
 
 	fresh, err := bh.tailerFor(ctx, clientTestGK)
 	require.NoError(t, err)
 	assert.NotSame(t, dead, fresh, "a resubscribe joined the tailer that had already failed")
-	assert.NoError(t, fresh.failure())
+	assert.NoError(t, fresh.Err())
 
 	// The dead tailer's last subscriber must not evict the successor.
 	dead.release()
@@ -2559,12 +2558,12 @@ func TestWatchListDeliversWithoutPolling(t *testing.T) {
 		WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Empty(t, snap.Objects)
+	require.Empty(t, stream.Objects)
 
 	obj := mustCreate(t, ctx, client, "prompt", cSpec{Val: "a"})
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, Added, ev.Type)
 	assert.Equal(t, obj.ID, ev.Object.ID)
 	assert.Equal(t, obj.ResourceVersion, ev.ResourceVersion)
@@ -2587,9 +2586,9 @@ func TestWatchSeesDeleteOfSnapshotObject(t *testing.T) {
 	require.NoError(t, err)
 	obj := mustCreate(t, ctx, client, "doomed", cSpec{Val: "a"})
 
-	snap, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1, "the snapshot holds the object")
+	require.Len(t, stream.Objects, 1, "the snapshot holds the object")
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
 	deleted, err := bh.gcCollect(ctx, obj.ID)
@@ -2597,7 +2596,7 @@ func TestWatchSeesDeleteOfSnapshotObject(t *testing.T) {
 	require.True(t, deleted)
 
 	for {
-		ev := recv(t, snap.Changes)
+		ev := recv(t, stream.Changes)
 		if ev.Type == Deleted {
 			assert.Equal(t, obj.ID, ev.Object.ID)
 			return
@@ -2619,7 +2618,7 @@ func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
 
 	stream, err := typed.WatchList(ctx)
 	require.NoError(t, err)
-	stream2, err := raw.WatchList(ctx)
+	rawStream, err := raw.WatchList(ctx)
 	require.NoError(t, err)
 	positionReadsAtStart := store.positionReads.Load()
 
@@ -2627,7 +2626,7 @@ func TestTwoClientsOverOneKindShareATailer(t *testing.T) {
 
 	ev := recv(t, stream.Changes)
 	assert.Equal(t, "a", ev.Object.Spec.Val)
-	rawEv := recv(t, stream2.Changes)
+	rawEv := recv(t, rawStream.Changes)
 	assert.Equal(t, obj.ID, rawEv.Object.ID)
 	assert.JSONEq(t, `{"Val":"a"}`, string(rawEv.Object.Spec))
 
@@ -2648,10 +2647,10 @@ func TestWatchSingleObjectSeesOnlyItsID(t *testing.T) {
 	mine := mustCreate(t, ctx, client, "mine", cSpec{Val: "a"})
 	other := mustCreate(t, ctx, client, "other", cSpec{Val: "a"})
 
-	snap, err := client.Watch(ctx, mine.ID)
+	stream, err := client.Watch(ctx, mine.ID)
 	require.NoError(t, err)
-	require.NotNil(t, snap.Object)
-	require.Equal(t, mine.ID, snap.Object.ID)
+	require.NotNil(t, stream.Object)
+	require.Equal(t, mine.ID, stream.Object.ID)
 	require.Equal(t, 1, tailerCount(bh), "a single-object watch joins the kind's tailer")
 
 	// The other object is written first; only the watched one may arrive.
@@ -2660,7 +2659,7 @@ func TestWatchSingleObjectSeesOnlyItsID(t *testing.T) {
 	_, err = client.Update(ctx, mine.ID, cSpec{Val: "c"})
 	require.NoError(t, err)
 
-	ev := recv(t, snap.Changes)
+	ev := recv(t, stream.Changes)
 	assert.Equal(t, mine.ID, ev.Object.ID)
 	assert.Equal(t, "c", ev.Object.Spec.Val)
 }
@@ -2726,12 +2725,12 @@ func TestWatchResumeReplaysGapThenGoesLive(t *testing.T) {
 		WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	snap, err := client.WatchList(ctx)
+	before, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	missed := mustCreate(t, ctx, client, "missed", cSpec{Val: "a"})
 
-	stream, err := client.WatchList(ctx, WithResumeFrom(snap.ResourceVersion))
+	stream, err := client.WatchList(ctx, WithResumeFrom(before.ResourceVersion))
 	require.NoError(t, err)
 
 	ev := recv(t, stream.Changes)
@@ -2754,7 +2753,7 @@ func TestWatchResumeReplaysBeyondOnePage(t *testing.T) {
 		WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	snap, err := client.WatchList(ctx)
+	before, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	require.NoError(t, bh.store.Within(ctx, func(ctx context.Context) error {
 		for i := range gap {
@@ -2765,7 +2764,7 @@ func TestWatchResumeReplaysBeyondOnePage(t *testing.T) {
 		return nil
 	}))
 
-	stream, err := client.WatchList(ctx, WithResumeFrom(snap.ResourceVersion))
+	stream, err := client.WatchList(ctx, WithResumeFrom(before.ResourceVersion))
 	require.NoError(t, err)
 
 	seen := make(map[ObjectID]bool, gap)
@@ -2915,9 +2914,9 @@ func TestWatchGoroutinesDrainOnStop(t *testing.T) {
 		stream, err := client.WatchList(ctx)
 		require.NoError(t, err)
 		obj := mustCreate(t, ctx, client, "one", cSpec{})
-		stream2, err := client.Watch(ctx, obj.ID)
+		one, err := client.Watch(ctx, obj.ID)
 		require.NoError(t, err)
-		streams = append(streams, stream.Changes, stream2.Changes)
+		streams = append(streams, stream.Changes, one.Changes)
 	}
 	require.Equal(t, 3, tailerCount(bh))
 
@@ -3349,7 +3348,7 @@ func TestWatchDeliversUnderSustainedWrites(t *testing.T) {
 		ids[i] = mustCreate(t, ctx, client, fmt.Sprintf("w%d", i), cSpec{}).ID
 	}
 
-	stream2, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	writes, stopWrites := context.WithCancel(ctx)
@@ -3370,8 +3369,8 @@ func TestWatchDeliversUnderSustainedWrites(t *testing.T) {
 	const want = 50
 	for got := 0; got < want; {
 		select {
-		case _, ok := <-stream2.Changes:
-			require.True(t, ok, "the stream ended after %d changes: %v", got, stream2.Err())
+		case _, ok := <-stream.Changes:
+			require.True(t, ok, "the stream ended after %d changes: %v", got, stream.Err())
 			got++
 		case <-ctx.Done():
 			t.Fatalf("delivered %d of %d changes before the failsafe", got, want)
@@ -3467,56 +3466,10 @@ func TestWatchOnABeehiveNotBuiltByNewFails(t *testing.T) {
 	assert.Contains(t, err.Error(), "built by New")
 }
 
-// A stream that ends because the beehive stopped must say so. The contract is
-// that a silent close means the caller's own context ended, so a supervisor
-// written to it — Err is nil and my ctx is live, therefore resubscribe — would
-// otherwise loop hot after Stop, re-reading a full snapshot every pass.
-func TestWatchEndsWithErrStoppedOnStop(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-
-	stream, err := client.WatchList(ctx)
-	require.NoError(t, err)
-	require.NoError(t, bh.stop(ctx))
-
-	for range stream.Changes {
-	}
-	assert.ErrorIs(t, stream.Err(), ErrStopped, "the stream closed silently on stop")
-
-	// A watch opened before stop ends the same way rather than closing silently,
-	// which is what stops a resubscribe loop from spinning.
-	stream2, err := client.WatchList(ctx)
-	require.NoError(t, err)
-	for range stream2.Changes {
-	}
-	assert.ErrorIs(t, stream2.Err(), ErrStopped, "a watch opened before stop closed silently")
-}
-
-// Watch does not get its own tail: it adapts the kind's list stream down to one
-// object, and the failure is written after that adaptation. Share the slot or
-// the value the caller holds reports nil forever — every terminal failure lost,
-// on the shape most callers reach for first.
-func TestASingleObjectStreamReportsTheFailureToo(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	obj := mustCreate(t, ctx, client, "watched", cSpec{})
-
-	stream, err := client.Watch(ctx, obj.ID)
-	require.NoError(t, err)
-	require.NoError(t, bh.stop(ctx))
-
-	waitClosed(t, closedWhenDrained(stream.Changes), "the single-object stream to end")
-	assert.ErrorIs(t, stream.Err(), ErrStopped)
-}
-
-// All three entry points report a terminal failure the same way. They differ in
-// what they scope the tail to, never in how they end.
+// Every watch shape reports a terminal failure the same way, and Watch is the
+// one that could silently not: it has no tail of its own, so it adapts the
+// kind's list stream down to one object and the failure is written after that
+// adaptation. Share the slot, or the value the caller holds reports nil forever.
 func TestEveryWatchShapeReportsItsFailureAlike(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
@@ -3546,49 +3499,37 @@ func TestEveryWatchShapeReportsItsFailureAlike(t *testing.T) {
 		{"WatchOwnedObjects", owned.Changes, owned.Err},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Nobody read these while the beehive stopped: storing the failure
+			// cannot block, so the teardown does not wait on a reader.
 			waitClosed(t, closedWhenDrained(tc.changes), "the stream to end on stop")
 			assert.ErrorIs(t, tc.err(), ErrStopped)
 		})
 	}
 }
 
-// The failure is stored before the channel closes, so the close is the whole
-// signal: a caller that reads Err the instant it sees the close is never told
-// nil about a stream that failed.
-func TestErrIsReadableTheInstantTheStreamCloses(t *testing.T) {
+// A stream that ends because the beehive stopped must say so. The contract is
+// that a silent close means the caller's own context ended, so a supervisor
+// written to it — Err is nil and my ctx is live, therefore resubscribe — would
+// otherwise loop hot after Stop, re-reading a full snapshot every pass. A watch
+// opened after the stop ends the same way rather than closing silently, which
+// is what stops that loop from spinning.
+//
+// The failure is stored before the close, so the close is the whole signal: the
+// bare receive below reads Err with nothing between it and the close.
+func TestAWatchOpenedAfterStopEndsWithErrStopped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	require.NoError(t, bh.stop(ctx))
 
 	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.NoError(t, bh.stop(ctx))
 
 	_, ok := <-stream.Changes
 	require.False(t, ok)
 	assert.ErrorIs(t, stream.Err(), ErrStopped, "the close outran the failure it reports")
-}
-
-// Storing the failure cannot block, so teardown no longer waits on a reader:
-// the terminal report used to go out over the unbuffered channel, which a
-// caller that stopped reading held up until its own context ended. Only the
-// terminal report — an undelivered change still parks the sender, by design.
-func TestAStreamNobodyReadsStillReportsWhyItEnded(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
-	defer cancel()
-
-	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-
-	// Quiet, with nothing in flight: the subscriber is parked on its receive.
-	stream, err := client.WatchList(ctx)
-	require.NoError(t, err)
-	require.NoError(t, bh.stop(ctx))
-
-	waitClosed(t, closedWhenDrained(stream.Changes), "the stream to end without a reader waiting on it")
-	assert.ErrorIs(t, stream.Err(), ErrStopped)
 }
 
 // blockingPositionStore parks one kind's position read until released, so a
@@ -3938,22 +3879,22 @@ func TestResumeAboveTheLogHeadFails(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, "w1", cSpec{})
 
-	stream2, err := client.WatchList(ctx, WithResumeFrom(1<<40))
+	stream, err := client.WatchList(ctx, WithResumeFrom(1<<40))
 	require.NoError(t, err, "the position arrives on the stream, not from the call")
 
-	for range stream2.Changes {
+	for range stream.Changes {
 	}
-	assert.ErrorIs(t, stream2.Err(), ErrWatchTooNew)
+	assert.ErrorIs(t, stream.Err(), ErrWatchTooNew)
 
 	// A position exactly at the head is caught up, not ahead: it is what a
 	// subscriber that read every entry checkpoints.
 	at, err := bh.store.ObjectWrites().MaxVersion(ctx, clientTestGK)
 	require.NoError(t, err)
-	snap, err := client.WatchList(ctx, WithResumeFrom(at))
+	atHead, err := client.WatchList(ctx, WithResumeFrom(at))
 	require.NoError(t, err)
-	assert.Equal(t, at, snap.ResourceVersion)
+	assert.Equal(t, at, atHead.ResourceVersion)
 	obj := mustCreate(t, ctx, client, "w2", cSpec{})
-	ev := recv(t, snap.Changes)
+	ev := recv(t, atHead.Changes)
 	assert.Equal(t, obj.ID, ev.ID, "a resume at the head must still stream")
 }
 
@@ -4123,25 +4064,15 @@ func TestWatchLoadRetryDecodesOnce(t *testing.T) {
 	assert.Equal(t, int64(1), decodes.Load(), "the batch was decoded once per attempt")
 }
 
-func TestStreamFailReportsTheStoredFailure(t *testing.T) {
-	var unwired *streamFail
-	assert.NoError(t, unwired.Err(), "a stream built without a slot reports no failure")
-
-	f := &streamFail{}
-	assert.NoError(t, f.Err(), "a stream that has not ended reports no failure")
-
-	f.fail(ErrWatchTooOld)
-	assert.ErrorIs(t, f.Err(), ErrWatchTooOld)
-}
-
-func TestBothStreamShapesReportOneSharedFailure(t *testing.T) {
-	assert.NoError(t, (&ObjectStream[cSpec, cStatus]{}).Err(), "a zero stream reports no failure")
-	assert.NoError(t, (&ObjectListStream[cSpec, cStatus]{}).Err(), "a zero stream reports no failure")
+func TestAStreamReportsTheStoredFailure(t *testing.T) {
+	assert.NoError(t, (&ObjectStream[cSpec, cStatus]{}).Err(), "a stream built without a slot reports no failure")
+	assert.NoError(t, (&ObjectListStream[cSpec, cStatus]{}).Err(), "a stream built without a slot reports no failure")
 
 	// The shape Watch builds: one slot, two values over it.
 	slot := &streamFail{}
 	list := &ObjectListStream[cSpec, cStatus]{streamFail: slot}
 	one := &ObjectStream[cSpec, cStatus]{streamFail: list.streamFail}
+	assert.NoError(t, list.Err(), "a stream that has not ended reports no failure")
 
 	slot.fail(ErrStopped)
 	assert.ErrorIs(t, list.Err(), ErrStopped)

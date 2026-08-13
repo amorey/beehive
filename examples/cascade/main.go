@@ -207,11 +207,11 @@ func watchCascade(
 	for !clusterRemoved || cachesRemoved < numCaches {
 		select {
 		case ev, open := <-clusters.Changes:
-			// Object is nil on a Deleted whose row image no longer decodes;
-			// ev.ID identifies the object either way.
 			if !open {
 				log.Fatalf("cluster watch ended: %v", clusters.Err())
 			}
+			// Object is nil on a Deleted whose row image no longer decodes;
+			// ev.ID identifies the object either way.
 			if ev.Type == beehive.Deleted {
 				fmt.Printf("Cluster %d: removed\n", ev.ID)
 				clusterRemoved = true

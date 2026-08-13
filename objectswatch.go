@@ -107,12 +107,12 @@ type watchConfig struct {
 }
 
 // WithResumeFrom streams the changes above rv instead of taking a snapshot. The
-// returned snapshot holds no objects and carries rv back. A position retention
-// has already passed ends the stream with a Failed change carrying
-// ErrWatchTooOld — the same way a live stream reports it — which the caller
-// answers by subscribing again without this option. A position above the log's
-// head arrives the same way with ErrWatchTooNew: it did not come from this
-// store, so no retention window would have kept it.
+// returned stream holds no objects and carries rv back. A position retention
+// has already passed ends the stream with Err reporting ErrWatchTooOld — the
+// same way a live stream reports it — which the caller answers by subscribing
+// again without this option. A position above the log's head arrives the same
+// way with ErrWatchTooNew: it did not come from this store, so no retention
+// window would have kept it.
 func WithResumeFrom(rv int64) WatchOption {
 	return func(c *watchConfig) { c.resumeFrom = &rv }
 }
@@ -292,7 +292,7 @@ func (bh *Beehive) joinTailer(gk GroupKind) (*objectTailer, bool) {
 // joinLocked is joinTailer's body, for the caller that already holds tailMu.
 func joinLocked(tailers map[GroupKind]*objectTailer, gk GroupKind) (*objectTailer, bool) {
 	t, ok := tailers[gk]
-	if !ok || t.failure() != nil {
+	if !ok || t.Err() != nil {
 		return nil, false
 	}
 	t.refs++
@@ -424,9 +424,10 @@ type objectTailer struct {
 	now func() time.Time
 	// pagesPerDrain bounds one drain; a field so a benchmark can sweep it.
 	pagesPerDrain int
-	// failed records why the fan-out closed, for subscribers to report. Written
-	// before the sender closes, read after.
-	failed atomic.Pointer[error]
+	// streamFail records why the fan-out closed, for subscribers to report.
+	// Written before the sender closes, read after. By value: a tailer is never
+	// copied, and its subscribers reach it through the one pointer they hold.
+	streamFail
 }
 
 // newObjectTailer registers the wake receiver BEFORE reading the starting
@@ -500,14 +501,6 @@ func coalesceOp(began, ended WriteOp) WriteOp {
 	return ended
 }
 
-// failure returns why the tailer ended, or nil when it ended with the beehive.
-func (t *objectTailer) failure() error {
-	if err := t.failed.Load(); err != nil {
-		return *err
-	}
-	return nil
-}
-
 // run tails the kind's log until the last subscriber leaves. A commit wakes it;
 // the floor timer covers what a wake cannot. Entries at or below the starting
 // cursor belong to the subscribers' snapshots, not to the tail.
@@ -519,8 +512,7 @@ func (t *objectTailer) run() {
 		// Only stop closes the wake hub — the last subscriber leaving comes
 		// through ctx — so this is shutdown, and saying so is what keeps a closed
 		// stream distinguishable from a cancelled one.
-		err := error(ErrStopped)
-		t.failed.Store(&err)
+		t.fail(ErrStopped)
 	}, func(backingOff bool) (time.Duration, bool, bool) {
 		return t.pass(ctx, t.now(), backingOff)
 	})
@@ -549,7 +541,7 @@ func (t *objectTailer) pass(ctx context.Context, now time.Time, backingOff bool)
 		if errors.Is(err, ErrWatchTooOld) {
 			t.bh.log().Warn("watch tail fell below the retention horizon; ending its subscribers",
 				"kind", t.gk.Kind, "err", err)
-			t.failed.Store(&err)
+			t.fail(err)
 			return 0, false, true
 		}
 		t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
@@ -752,9 +744,11 @@ func (c *clientImpl[Spec, Status]) tailStream(
 
 	mig := c.bh.migratorFor(c.gk) // invariant for the stream's lifetime
 
+	out := make(chan ObjectChange[Spec, Status])
 	// One slot per subscribe, shared by every stream value built from this call:
-	// Watch hands back a value this goroutine never writes through.
-	stream := &ObjectListStream[Spec, Status]{streamFail: &streamFail{}}
+	// Watch hands back a value the stream goroutine never writes through.
+	slot := &streamFail{}
+	stream := &ObjectListStream[Spec, Status]{Changes: out, streamFail: slot}
 	// floor is what the caller already holds; deliveries at or below it are
 	// dropped. A resume raises it as the replay advances.
 	var floor int64
@@ -780,7 +774,8 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		}
 	}
 
-	out := make(chan ObjectChange[Spec, Status])
+	// The goroutine takes the slot, not the stream: capturing the stream would
+	// pin its snapshot for the stream's whole life.
 	go func() {
 		// LIFO: the receiver leaves the fan-out, then the lease goes, then the
 		// caller sees the stream end.
@@ -804,14 +799,13 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		if cfg.resumeFrom != nil {
 			at, fail, ok := c.replay(work, mig, cfg, floor, out)
 			if !ok {
-				c.endStream(ctx, tailer, fail, stream.streamFail)
+				c.endStream(ctx, tailer, fail, slot)
 				return
 			}
 			floor = at
 		}
-		c.consume(ctx, work, tailer, rx, mig, cfg, floor, out, stream.streamFail)
+		c.consume(ctx, work, tailer, rx, mig, cfg, floor, out, slot)
 	}()
-	stream.Changes = out
 	return stream, nil
 }
 
@@ -837,7 +831,7 @@ func (c *clientImpl[Spec, Status]) endStream(
 		return
 	}
 	if fail == nil {
-		fail = tailer.failure()
+		fail = tailer.Err()
 	}
 	if fail != nil {
 		slot.fail(fail)
@@ -1000,8 +994,8 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 // replay delivers the gap between a resume's position and the tail, in pages —
 // with a day of retention the gap can be far more than one page. It returns
 // the position reached, or ok false with the failure to report — nil when there
-// is nothing to report beyond whatever the tailer says. One place sends the
-// Failed change, so a replay that ends as the tailer does cannot send two.
+// is nothing to report beyond whatever the tailer says. One place stores the
+// terminal failure, so a replay that ends as the tailer does cannot store two.
 func (c *clientImpl[Spec, Status]) replay(
 	ctx context.Context,
 	mig Migrator,
