@@ -461,6 +461,28 @@ func TestWatchEventsReportsTheRetentionBound(t *testing.T) {
 	}
 }
 
+// The bound is configuration, not a property of the snapshot, so a resume
+// reports it too — the reader that resumes is exactly the one holding a list
+// across reconnects.
+func TestWatchEventsResumeReportsTheRetentionBound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, _, client, cc := watchFixtureWith(t, WithEventRetention(20, time.Hour))
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+
+	snap, err := client.WatchEvents(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
+
+	resumed, err := client.WatchEvents(ctx, obj.ID, WithEventsResumeFrom(snap.ResourceVersion))
+	require.NoError(t, err)
+	require.Empty(t, resumed.Runs, "a resume snapshots nothing")
+	assert.Equal(t, snap.Retention, resumed.Retention)
+	assert.Equal(t, EventRetention{PerTimeline: 20, MaxAge: time.Hour}, resumed.Retention)
+}
+
 // The cursor moves only past a delivered page, so a run abandoned mid-send is
 // still owed: a new stream resuming from the caller's last checkpoint gets it.
 func TestWatchEventsKeepsAnUndeliveredRunOwed(t *testing.T) {
