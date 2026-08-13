@@ -72,7 +72,8 @@ transaction and taking the `resource_version` that write was assigned.
   `trimmed_through + 1`. This is not an edge case: a kind that stops writing has
   its whole log age out, and the horizon converges onto exactly where every live
   tail is parked, so `<=` would end every established watcher on every idle kind.
-  A real gap ends the stream with `ErrWatchTooOld` on a terminal `Failed` change.
+  A real gap ends the stream with `ErrWatchTooOld`, reported by its
+  [`Err()`](2026-08-13-a-stream-reports-its-failure-beside-itself.md).
 - **`ObjectWrites().MaxVersion` folds the horizon in**, so the position only ever
   rises and the tick gate is `>` rather than `!=`. Without the fold, a kind
   trimmed empty reports 0 against a tail parked higher and lists on every tick —

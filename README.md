@@ -375,6 +375,7 @@ type ObjectListStream[Spec, Status any] struct {
 // Err, on either stream, reports why Changes closed: ErrWatchTooOld,
 // ErrWatchTooNew, ErrStopped, or nil for the caller's own cancellation.
 func (s *ObjectStream[Spec, Status]) Err() error
+func (s *ObjectListStream[Spec, Status]) Err() error
 
 type Client[Spec, Status any] interface {
     // Creating: the name is positional, because there is no id yet.
