@@ -162,4 +162,7 @@ was the error: they stream the client's own kind, so the omit-the-prefix rule re
 them exactly as it reaches `List`. Bare `Watch` beside `EventsWatch` reads the way
 bare `List` already reads beside `EventsList`, and the `Get`/`List` cardinality
 pairing returns. The `Object` noun stays where it carries information — the return
-types `ObjectSnapshot`, `ObjectListSnapshot` and `ObjectChange`.
+types `ObjectSnapshot`, `ObjectListSnapshot` and `ObjectChange`. The first two
+have since become
+[`ObjectStream`/`ObjectListStream`](2026-08-13-a-stream-reports-its-failure-beside-itself.md),
+which also retires rule 2's "the channel is the whole handle".

@@ -39,7 +39,7 @@ func TestWatchScheduleEmitsOnlyOnChange(t *testing.T) {
 	store, bh, client, _ := watchFixture(t)
 	r, ok := bh.reconcilerFor(clientTestGK)
 	require.True(t, ok)
-	_, _, err := client.WatchList(ctx)
+	_, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	ch, err := client.WatchSchedule(ctx, 1)

@@ -89,8 +89,6 @@ const (
 	Added    = storeapi.Added
 	Modified = storeapi.Modified
 	Deleted  = storeapi.Deleted
-	// Failed is terminal: the stream is over and the change carries the reason.
-	Failed = storeapi.Failed
 )
 
 // ErrNotFound is returned by Store reads when no object matches.

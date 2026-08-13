@@ -47,6 +47,15 @@ whole handle, and `ctx` cancellation ends and closes it. A watch over a **gauge*
 `EventChange` gap that record left open is still open, and still a behavioural
 change rather than a rename.
 
+> **Superseded in part (2026-08-13):** "the channel is the whole handle" no
+> longer holds for the object watches. They return a stream value carrying the
+> snapshot, the channel and an `Err()`, because a channel cannot say *why* it
+> closed without putting a non-change on the change stream. What survives is the
+> rest of the rule: no `…Watcher` interface, no subscription object to `Close`,
+> `ctx` still ends the stream, and a change still travels by value.
+> `WatchSchedule` is now the only bare channel.
+> → [a stream reports its failure beside itself](2026-08-13-a-stream-reports-its-failure-beside-itself.md)
+
 ### What was renamed
 
 Breaking, with no deprecation shim — pre-release. `Client`:

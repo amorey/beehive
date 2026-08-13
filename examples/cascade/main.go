@@ -144,9 +144,9 @@ func main() {
 
 	// Watch before creating, so each object's lifecycle reads in order from Added.
 	// A poll coalesces, so a step shorter than the interval can still be skipped.
-	_, clusterCh, err := clusterClient.WatchList(ctx)
+	clusters, err := clusterClient.WatchList(ctx)
 	exitOnErr(err)
-	_, cacheCh, err := cacheClient.WatchList(ctx)
+	caches, err := cacheClient.WatchList(ctx)
 	exitOnErr(err)
 
 	// A Cluster guarded by a connection finalizer, owning two caches that each
@@ -167,7 +167,7 @@ func main() {
 		exitOnErr(cacheClient.Requeue(ctx, cache.ID))
 	}
 
-	watchCascade(ctx, clusterClient, clusterCh, cacheCh, cluster.ID)
+	watchCascade(ctx, clusterClient, clusters, caches, cluster.ID)
 }
 
 func stopBeehive(stop func(context.Context) error) {
@@ -184,8 +184,8 @@ func stopBeehive(stop func(context.Context) error) {
 func watchCascade(
 	ctx context.Context,
 	clusterClient beehive.Client[ClusterSpec, ClusterStatus],
-	clusterCh <-chan beehive.ObjectChange[ClusterSpec, ClusterStatus],
-	cacheCh <-chan beehive.ObjectChange[ClusterCacheSpec, ClusterCacheStatus],
+	clusters *beehive.ObjectListStream[ClusterSpec, ClusterStatus],
+	caches *beehive.ObjectListStream[ClusterCacheSpec, ClusterCacheStatus],
 	clusterID beehive.ObjectID,
 ) {
 	warmed := map[beehive.ObjectID]bool{}
@@ -206,12 +206,12 @@ func watchCascade(
 	timeout := time.After(30 * time.Second)
 	for !clusterRemoved || cachesRemoved < numCaches {
 		select {
-		case ev := <-clusterCh:
-			// Object is nil on Failed, and on a Deleted whose row image no
-			// longer decodes; ev.ID identifies the object either way.
-			if ev.Type == beehive.Failed {
-				log.Fatalf("cluster watch ended: %v", ev.Err)
+		case ev, open := <-clusters.Changes:
+			if !open {
+				log.Fatalf("cluster watch ended: %v", clusters.Err())
 			}
+			// Object is nil on a Deleted whose row image no longer decodes;
+			// ev.ID identifies the object either way.
 			if ev.Type == beehive.Deleted {
 				fmt.Printf("Cluster %d: removed\n", ev.ID)
 				clusterRemoved = true
@@ -223,9 +223,9 @@ func watchCascade(
 				fmt.Printf("Cluster %d: connected to %s\n", o.ID, o.Spec.Endpoint)
 				deleteWhenReady()
 			}
-		case ev := <-cacheCh:
-			if ev.Type == beehive.Failed {
-				log.Fatalf("cache watch ended: %v", ev.Err)
+		case ev, open := <-caches.Changes:
+			if !open {
+				log.Fatalf("cache watch ended: %v", caches.Err())
 			}
 			if ev.Type == beehive.Deleted {
 				fmt.Printf("ClusterCache %d: removed\n", ev.ID)

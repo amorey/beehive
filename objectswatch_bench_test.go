@@ -111,12 +111,12 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 		ids[k] = obj.ID
 
 		for range watchersPerKind {
-			var ch <-chan ObjectChange[cSpec, cStatus]
+			var stream *ObjectListStream[cSpec, cStatus]
 			var err error
 			if scoped {
-				_, ch, err = clients[k].WatchOwnedObjects(ctx, ownerID)
+				stream, err = clients[k].WatchOwnedObjects(ctx, ownerID)
 			} else {
-				_, ch, err = clients[k].WatchList(ctx)
+				stream, err = clients[k].WatchList(ctx)
 			}
 			require.NoError(b, err)
 			watchers.Add(1)
@@ -124,7 +124,7 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 			// the benchmark measures a backlog rather than a write path.
 			go func() {
 				defer watchers.Done()
-				for range ch {
+				for range stream.Changes {
 				}
 			}()
 		}

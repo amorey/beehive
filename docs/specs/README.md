@@ -14,9 +14,8 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-Two specs sit on their own branches and are not indexed here until they land:
-one gives the object watches the `EventStream` shape, the other drops
-`WatchEvents`' kind check.
+One spec sits on its own branch and is not indexed here until it lands: it
+drops `WatchEvents`' kind check.
 
 The last spec shipped as
-[`EventStream.Retention`](../adr/2026-08-06-event-retention-is-a-ring-per-timeline.md).
+[the object watches' stream shape](../adr/2026-08-13-a-stream-reports-its-failure-beside-itself.md).

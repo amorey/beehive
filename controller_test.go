@@ -234,9 +234,9 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	snap, ch, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
-	require.Len(t, snap.Objects, 1)
+	require.Len(t, stream.Objects, 1)
 
 	// Same status: silent. Checked at the mechanism rather than by waiting out a
 	// grace period on the channel — the watch emits off resource_version, so a
@@ -254,7 +254,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	// A real change still flows.
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "changed"}))
 	select {
-	case ev := <-ch:
+	case ev := <-stream.Changes:
 		assert.Equal(t, Modified, ev.Type)
 		require.NotNil(t, ev.Object.Status)
 		assert.Equal(t, "changed", ev.Object.Status.Val)

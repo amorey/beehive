@@ -255,3 +255,5 @@ to hand the error to.
   always worked on an unstarted `Beehive`. `stop` closes the wake hub, which
   ends every tailer whose subscribers are still reading; the rest end
   themselves.
+- **How a subscriber is *told* the tail failed** moved off the change channel
+  later; see [a stream reports its failure beside itself](2026-08-13-a-stream-reports-its-failure-beside-itself.md).

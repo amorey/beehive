@@ -735,7 +735,7 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -744,7 +744,7 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 
 	require.NoError(t, client.Delete(ctx, a.ID))
 	require.NoError(t, client.Delete(ctx, b.ID))
-	waitForDeletions(t, w, a.ID, b.ID)
+	waitForDeletions(t, stream.Changes, a.ID, b.ID)
 }
 
 func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
@@ -765,7 +765,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -773,7 +773,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	waitForDeletions(t, w, obj.ID)
+	waitForDeletions(t, stream.Changes, obj.ID)
 }
 
 func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
@@ -814,14 +814,14 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// from under the stream before it has looked.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
 
-	waitForDeletions(t, w, raw.ID)
+	waitForDeletions(t, stream.Changes, raw.ID)
 
 	_, err = client.Get(ctx, raw.ID)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -847,11 +847,11 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	// the object is in its snapshot and the Deleted below cannot be missed.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.Watch(wctx, obj.ID)
+	stream, err := client.Watch(wctx, obj.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	waitForDeletions(t, w, obj.ID)
+	waitForDeletions(t, stream.Changes, obj.ID)
 
 	_, err = client.Get(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -877,11 +877,11 @@ func TestIntegrationGCCascadeWithFullPassDisabled(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, owner.ID))
-	waitForDeletions(t, w, owner.ID, child.ID)
+	waitForDeletions(t, stream.Changes, owner.ID, child.ID)
 }
 
 func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
@@ -903,12 +903,12 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	// Deleting only the owner must cascade to the child and remove both.
 	require.NoError(t, client.Delete(ctx, owner.ID))
-	waitForDeletions(t, w, owner.ID, child.ID)
+	waitForDeletions(t, stream.Changes, owner.ID, child.ID)
 
 	_, err = client.Get(ctx, owner.ID)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -947,11 +947,11 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	// only the sweeper can collect that client-only child.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, wOwner, err := owners.WatchList(wctx)
+	stream, err := owners.WatchList(wctx)
 	require.NoError(t, err)
 
 	require.NoError(t, owners.Delete(ctx, owner.ID))
-	waitForDeletions(t, wOwner, owner.ID)
+	waitForDeletions(t, stream.Changes, owner.ID)
 
 	_, err = owners.Get(ctx, owner.ID)
 	require.ErrorIs(t, err, ErrNotFound)
@@ -1097,7 +1097,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1112,7 +1112,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 
 	// Only now does the dependent release the edge.
 	require.NoError(t, client.Requeue(ctx, dep.ID))
-	waitForDeletions(t, w, target.ID)
+	waitForDeletions(t, stream.Changes, target.ID)
 
 	// The dependent is untouched.
 	_, err = client.Get(ctx, dep.ID)
@@ -1134,7 +1134,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1144,7 +1144,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutThePush(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, target.ID))
 	_, err = store.Edges().Delete(ctx, dep.ID, target.ID, RelationDependsOn)
 	require.NoError(t, err)
-	waitForDeletions(t, w, target.ID)
+	waitForDeletions(t, stream.Changes, target.ID)
 }
 
 // Marking the last live referrer lifts the target's RESTRICT, and with every pass
@@ -1162,7 +1162,7 @@ func TestIntegrationDeleteRequestCollectsWithoutASweep(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1176,7 +1176,7 @@ func TestIntegrationDeleteRequestCollectsWithoutASweep(t *testing.T) {
 	awaitQueueIdle(t, mustReconciler(t, bh, clientTestGK).work, target.ID)
 
 	require.NoError(t, client.Delete(ctx, dep.ID))
-	waitForDeletions(t, w, target.ID)
+	waitForDeletions(t, stream.Changes, target.ID)
 }
 
 // The pull path under that push: marking the referrer through the store issues no
@@ -1194,7 +1194,7 @@ func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1204,7 +1204,7 @@ func TestIntegrationDeleteRequestCollectsWithoutThePush(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, target.ID))
 	_, err = store.DeletionRequests().Create(ctx, clientTestGK, dep.ID)
 	require.NoError(t, err)
-	waitForDeletions(t, w, target.ID)
+	waitForDeletions(t, stream.Changes, target.ID)
 }
 
 // The cascade marks referrers too, so the same push has to come from there.
@@ -1222,7 +1222,7 @@ func TestIntegrationCascadeMarkCollectsWithoutASweep(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1234,7 +1234,7 @@ func TestIntegrationCascadeMarkCollectsWithoutASweep(t *testing.T) {
 
 	// The owner's collect cascades to the child, whose mark lifts the block.
 	require.NoError(t, client.Delete(ctx, owner.ID))
-	waitForDeletions(t, w, target.ID)
+	waitForDeletions(t, stream.Changes, target.ID)
 }
 
 // siblingFinalizerClearingController clears finalizer on targetID — never on the
@@ -1294,7 +1294,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1305,7 +1305,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
 	// collect. Requeuing the sibling is what then clears it.
 	require.NoError(t, client.Delete(ctx, target.ID))
 	require.NoError(t, client.Requeue(ctx, sibling.ID))
-	waitForDeletions(t, w, target.ID)
+	waitForDeletions(t, stream.Changes, target.ID)
 }
 
 // The pull path under this push: TestIntegrationGCDeletesAfterFinalizerCleared
@@ -1322,7 +1322,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1332,7 +1332,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, obj.ID))
 	_, err = store.Objects().DeleteFinalizer(ctx, clientTestGK, obj.ID, "f")
 	require.NoError(t, err)
-	waitForDeletions(t, w, obj.ID)
+	waitForDeletions(t, stream.Changes, obj.ID)
 }
 
 // With the sweeper stopped and the periodic passes off, pushes are the only
@@ -1354,7 +1354,7 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutASweep(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1362,7 +1362,7 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutASweep(t *testing.T) {
 	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, owner.ID))
-	waitForDeletions(t, w, child.ID, owner.ID)
+	waitForDeletions(t, stream.Changes, child.ID, owner.ID)
 }
 
 // A child created after its owner's cascade has already run is invisible to
@@ -1388,7 +1388,7 @@ func TestIntegrationCreateUnderADeletingOwnerCollectsItWithoutASweep(t *testing.
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1396,10 +1396,10 @@ func TestIntegrationCreateUnderADeletingOwnerCollectsItWithoutASweep(t *testing.
 	defer stop(ctx)
 
 	require.NoError(t, client.Delete(ctx, owner.ID))
-	waitForDeletionRequest(t, w, held.ID) // the cascade has provably run
+	waitForDeletionRequest(t, stream.Changes, held.ID) // the cascade has provably run
 
 	late := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "late"}, WithOwner(owner.ID))
-	waitForDeletionRequest(t, w, late.ID)
+	waitForDeletionRequest(t, stream.Changes, late.ID)
 }
 
 // The pull path under this push: a client-only owner resolves to no reconciler,
@@ -1424,7 +1424,7 @@ func TestIntegrationCreateUnderADeletingClientOnlyOwnerHealsOnTheSweep(t *testin
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1432,10 +1432,10 @@ func TestIntegrationCreateUnderADeletingClientOnlyOwnerHealsOnTheSweep(t *testin
 	defer stop(ctx)
 
 	require.NoError(t, owners.Delete(ctx, owner.ID))
-	waitForDeletionRequest(t, w, held.ID)
+	waitForDeletionRequest(t, stream.Changes, held.ID)
 
 	late := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "late"}, WithOwner(owner.ID))
-	waitForDeletionRequest(t, w, late.ID)
+	waitForDeletionRequest(t, stream.Changes, late.ID)
 }
 
 // The pull path under this push: the child's finalizer keeps its own collect from
@@ -1457,7 +1457,7 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutThePush(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1467,9 +1467,9 @@ func TestIntegrationLastChildCollectsItsOwnerWithoutThePush(t *testing.T) {
 	// Wait for the cascade's mark, or the direct delete could beat the owner's
 	// first collect and leave the owner's own delete push as the collector.
 	require.NoError(t, client.Delete(ctx, owner.ID))
-	waitForDeletionRequest(t, w, child.ID)
+	waitForDeletionRequest(t, stream.Changes, child.ID)
 	require.NoError(t, store.Objects().Delete(ctx, child.ID))
-	waitForDeletions(t, w, owner.ID)
+	waitForDeletions(t, stream.Changes, owner.ID)
 }
 
 // TestGCSweepsOnItsOwnInterval pins that garbage collection has a cadence of its
@@ -1550,7 +1550,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.WatchList(wctx)
+	stream, err := client.WatchList(wctx)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -1576,7 +1576,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 	_, err = real.DeletionRequests().Create(ctx, clientTestGK, obj.ID)
 	require.NoError(t, err)
 
-	waitForDeletions(t, w, obj.ID)
+	waitForDeletions(t, stream.Changes, obj.ID)
 }
 
 // listFailStore fails the sweep's own listing, before any row is reached.

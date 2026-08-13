@@ -86,7 +86,9 @@ incoming bytes. `Within` supplies the atomicity, not the statement count.
 ### Watch follows one incarnation
 
 `Watch` godoc promised that an id holding nothing yet reports a nil
-`ObjectSnapshot.Object`, and that "its creation arrives as `Added`". That promise
+`ObjectSnapshot.Object` (now
+[`ObjectStream.Object`](2026-08-13-a-stream-reports-its-failure-beside-itself.md)),
+and that "its creation arrives as `Added`". That promise
 cannot hold. An id is minted by a create that already happened. Ids are
 `AUTOINCREMENT` and are never reused, so an id that holds nothing will never come
 to hold anything.

@@ -97,42 +97,19 @@ func checkName(name string) error {
 	return nil
 }
 
-// ObjectSnapshot is a single-object watch's starting state. Object is nil when
-// the id holds nothing yet; the stream that comes with it carries changes
-// strictly above ResourceVersion.
-type ObjectSnapshot[Spec, Status any] struct {
-	Object          *Object[Spec, Status]
-	ResourceVersion int64
-}
-
-// ObjectListSnapshot is a kind-wide watch's starting state: the objects as they
-// were, and the log position they are complete as of. The stream that comes
-// with it carries changes strictly above that position.
-type ObjectListSnapshot[Spec, Status any] struct {
-	Objects         []*Object[Spec, Status]
-	ResourceVersion int64
-}
-
 // ObjectChange reports a change to a watched object. On a Deleted change,
 // Object carries the row's final state, or is nil when that state could not be
 // decoded — the removal is reported either way, because nothing later in the
-// log mentions a deleted id. On a Failed change, Object is nil and Err is
-// non-nil: the stream is over, and a Failed change is always the last value
-// before the channel closes — ErrWatchTooOld for a stream that fell behind
-// retention, ErrWatchTooNew for a resume position this store never issued,
-// ErrStopped for a Beehive that stopped. A channel that closes with
-// no Failed change ended because the caller's context did, so a supervisor may
-// treat that alone as its own cancellation.
+// log mentions a deleted id. Why a stream ended is reported beside it, by the
+// stream's own Err.
 type ObjectChange[Spec, Status any] struct {
 	Type ChangeType
-	// ID is the object this change is about, set whether or not Object is. Zero
-	// on a Failed change.
+	// ID is the object this change is about, set whether or not Object is.
 	ID ObjectID
 	// ResourceVersion is the log position this change was reported at, and what
-	// WithResumeFrom takes to continue from here. Zero on a Failed change.
+	// WithResumeFrom takes to continue from here.
 	ResourceVersion int64
 	Object          *Object[Spec, Status]
-	Err             error
 }
 
 // Client is the user-facing API for a single resource kind: creating, reading,
@@ -243,7 +220,7 @@ type Client[Spec, Status any] interface {
 	// above it: Added/Modified/Deleted until ctx is cancelled. Kind-scoped, and
 	// needs no registered controller — the tail reads the write log, not a
 	// reconciler. It follows one incarnation: an id holding nothing is a nil
-	// ObjectSnapshot.Object rather than ErrNotFound, and a recreate under the
+	// ObjectStream.Object rather than ErrNotFound, and a recreate under the
 	// same name is a different id, so the stream ends at Deleted.
 	//
 	// The snapshot is read before Watch returns, on the caller's goroutine, so a
@@ -257,7 +234,7 @@ type Client[Spec, Status any] interface {
 	// and a floor tick covers what a wake cannot. Delivery is latest-per-object,
 	// so changes to one object collapse. A watch cannot be opened inside a
 	// transaction (the read would deadlock on the single connection).
-	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (*ObjectStream[Spec, Status], error)
 	// WatchEvents streams id's event log: a snapshot of the runs matching opts,
 	// the position it was read at, and the runs the log grows by above it. An
 	// extend re-samples ResourceVersion, so a run that grew is delivered again
@@ -269,7 +246,7 @@ type Client[Spec, Status any] interface {
 	WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 	// WatchList is Watch over every object of this client's kind: the same
 	// snapshot-and-stream contract, tailer and errors. See Watch.
-	WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	WatchList(ctx context.Context, opts ...WatchOption) (*ObjectListStream[Spec, Status], error)
 	// WatchOwnedObjects is ListOwnedObjects as a watch: a snapshot of
 	// ownerID's children of this kind, then every change to one of them. A child
 	// created under ownerID later arrives as Added and its collection as Deleted.
@@ -278,7 +255,7 @@ type Client[Spec, Status any] interface {
 	// Assumes the one owner WithOwner can express, as GetOwner and Owner() do: a
 	// child carrying several owned_by edges — reachable only through a direct
 	// Store call — streams to one of them. See docs/TODO.md.
-	WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (*ObjectListStream[Spec, Status], error)
 	// WatchSchedule streams id's schedule as a gauge: the current value, then
 	// a new Schedule whenever it changes. Unlike the other watches it reports
 	// in-memory state as the work queue moves it — no polling, emits only on

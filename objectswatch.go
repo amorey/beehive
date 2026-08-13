@@ -37,6 +37,61 @@ import (
 // against a hub-wide pending slot meeting a per-subscriber floor.
 // See docs/adr/2026-08-03-watch-shared-tail.md.
 
+// streamFail holds a stream's terminal failure. Shared by pointer: Watch hands
+// back a value the stream goroutine does not write through, so a slot embedded
+// by value would leave that caller's Err forever nil.
+type streamFail struct {
+	failed atomic.Pointer[error]
+}
+
+// Err reports why the stream ended, after its change channel is closed:
+// ErrWatchTooOld for a stream that fell below retention, ErrWatchTooNew for a
+// resume position this store never issued, ErrStopped for a Beehive that
+// stopped, or nil when the caller's own context ended. Before the close it
+// reports nil, which says nothing.
+func (f *streamFail) Err() error {
+	if f == nil {
+		return nil
+	}
+	if err := f.failed.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
+func (f *streamFail) fail(err error) { f.failed.Store(&err) }
+
+// ObjectStream is a live view of one object: its state as of the subscribe, the
+// position that state was read at, and the changes above it.
+type ObjectStream[Spec, Status any] struct {
+	// Object is the current state, or nil when the id holds nothing yet. Nil on
+	// a resume.
+	Object *Object[Spec, Status]
+	// ResourceVersion is the position Object was read at, and the value to hand
+	// back to WithResumeFrom.
+	ResourceVersion int64
+	// Changes delivers the changes above ResourceVersion, ascending by resource
+	// version, until ctx ends or the stream fails. Closed exactly once.
+	Changes <-chan ObjectChange[Spec, Status]
+
+	*streamFail
+}
+
+// ObjectListStream is ObjectStream over many objects: a kind, or one owner's
+// children of a kind.
+type ObjectListStream[Spec, Status any] struct {
+	// Objects is the snapshot. Empty on a resume.
+	Objects []*Object[Spec, Status]
+	// ResourceVersion is the position Objects is complete as of, and the value
+	// to hand back to WithResumeFrom.
+	ResourceVersion int64
+	// Changes delivers the changes above ResourceVersion, ascending by resource
+	// version, until ctx ends or the stream fails. Closed exactly once.
+	Changes <-chan ObjectChange[Spec, Status]
+
+	*streamFail
+}
+
 // WatchOption configures one watch call. A distinct type from Option: these are
 // meaningful only here, and dispatching them on a Beehive or a controller would
 // silently accept nonsense.
@@ -52,12 +107,12 @@ type watchConfig struct {
 }
 
 // WithResumeFrom streams the changes above rv instead of taking a snapshot. The
-// returned snapshot holds no objects and carries rv back. A position retention
-// has already passed ends the stream with a Failed change carrying
-// ErrWatchTooOld — the same way a live stream reports it — which the caller
-// answers by subscribing again without this option. A position above the log's
-// head arrives the same way with ErrWatchTooNew: it did not come from this
-// store, so no retention window would have kept it.
+// returned stream holds no objects and carries rv back. A position retention
+// has already passed ends the stream with Err reporting ErrWatchTooOld — the
+// same way a live stream reports it — which the caller answers by subscribing
+// again without this option. A position above the log's head arrives the same
+// way with ErrWatchTooNew: it did not come from this store, so no retention
+// window would have kept it.
 func WithResumeFrom(rv int64) WatchOption {
 	return func(c *watchConfig) { c.resumeFrom = &rv }
 }
@@ -110,32 +165,38 @@ func (bh *Beehive) watchBackoff() driver.Backoff {
 
 // WatchList streams changes to every object of this client's kind. See
 // the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchOption) (*ObjectListStream[Spec, Status], error) {
 	return c.tailStream(ctx, resolveWatch(opts))
 }
 
 // Watch streams changes to the single object id: an id that does not exist yet
 // streams nothing until created, and its removal reads as a Deleted.
-func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (*ObjectStream[Spec, Status], error) {
 	// The tail is shared per kind — the log has no index on object_id — so a
 	// single-object watch joins the kind's reader and filters the fan-out down
 	// to its own id.
 	cfg := resolveWatch(opts)
 	cfg.scope.only = &id
-	list, ch, err := c.tailStream(ctx, cfg)
+	list, err := c.tailStream(ctx, cfg)
 	if err != nil {
-		return ObjectSnapshot[Spec, Status]{}, nil, err
+		return nil, err
 	}
-	snap := ObjectSnapshot[Spec, Status]{ResourceVersion: list.ResourceVersion}
+	// The slot travels, it is not copied: the subscriber writes the failure
+	// through the value tailStream built, not through this one.
+	stream := &ObjectStream[Spec, Status]{
+		ResourceVersion: list.ResourceVersion,
+		Changes:         list.Changes,
+		streamFail:      list.streamFail,
+	}
 	if len(list.Objects) > 0 {
-		snap.Object = list.Objects[0]
+		stream.Object = list.Objects[0]
 	}
-	return snap, ch, nil
+	return stream, nil
 }
 
 // WatchOwnedObjects streams the objects of this client's kind owned by
 // ownerID. See the Client interface for the contract.
-func (c *clientImpl[Spec, Status]) WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (*ObjectListStream[Spec, Status], error) {
 	// Ownership is not in the log, so unlike Watch this cannot filter the fan-out
 	// by key: the tailer resolves each change's owner and the subscriber matches
 	// on it. See docs/adr/2026-08-06-owner-scoped-watches.md.
@@ -231,7 +292,7 @@ func (bh *Beehive) joinTailer(gk GroupKind) (*objectTailer, bool) {
 // joinLocked is joinTailer's body, for the caller that already holds tailMu.
 func joinLocked(tailers map[GroupKind]*objectTailer, gk GroupKind) (*objectTailer, bool) {
 	t, ok := tailers[gk]
-	if !ok || t.failure() != nil {
+	if !ok || t.Err() != nil {
 		return nil, false
 	}
 	t.refs++
@@ -363,9 +424,10 @@ type objectTailer struct {
 	now func() time.Time
 	// pagesPerDrain bounds one drain; a field so a benchmark can sweep it.
 	pagesPerDrain int
-	// failed records why the fan-out closed, for subscribers to report. Written
-	// before the sender closes, read after.
-	failed atomic.Pointer[error]
+	// streamFail records why the fan-out closed, for subscribers to report.
+	// Written before the sender closes, read after. By value: a tailer is never
+	// copied, and its subscribers reach it through the one pointer they hold.
+	streamFail
 }
 
 // newObjectTailer registers the wake receiver BEFORE reading the starting
@@ -439,14 +501,6 @@ func coalesceOp(began, ended WriteOp) WriteOp {
 	return ended
 }
 
-// failure returns why the tailer ended, or nil when it ended with the beehive.
-func (t *objectTailer) failure() error {
-	if err := t.failed.Load(); err != nil {
-		return *err
-	}
-	return nil
-}
-
 // run tails the kind's log until the last subscriber leaves. A commit wakes it;
 // the floor timer covers what a wake cannot. Entries at or below the starting
 // cursor belong to the subscribers' snapshots, not to the tail.
@@ -458,8 +512,7 @@ func (t *objectTailer) run() {
 		// Only stop closes the wake hub — the last subscriber leaving comes
 		// through ctx — so this is shutdown, and saying so is what keeps a closed
 		// stream distinguishable from a cancelled one.
-		err := error(ErrStopped)
-		t.failed.Store(&err)
+		t.fail(ErrStopped)
 	}, func(backingOff bool) (time.Duration, bool, bool) {
 		return t.pass(ctx, t.now(), backingOff)
 	})
@@ -488,7 +541,7 @@ func (t *objectTailer) pass(ctx context.Context, now time.Time, backingOff bool)
 		if errors.Is(err, ErrWatchTooOld) {
 			t.bh.log().Warn("watch tail fell below the retention horizon; ending its subscribers",
 				"kind", t.gk.Kind, "err", err)
-			t.failed.Store(&err)
+			t.fail(err)
 			return 0, false, true
 		}
 		t.bh.log().Warn("watch tail step failed; retrying", "kind", t.gk.Kind, "err", err)
@@ -667,11 +720,10 @@ func collectChanges(ctx context.Context, bh *Beehive, gk GroupKind, page []Objec
 func (c *clientImpl[Spec, Status]) tailStream(
 	ctx context.Context,
 	cfg watchConfig,
-) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
-	var empty ObjectListSnapshot[Spec, Status]
+) (*ObjectListStream[Spec, Status], error) {
 	tailer, err := c.bh.tailerFor(ctx, c.gk)
 	if err != nil {
-		return empty, nil, fmt.Errorf("beehive: watch on %s/%s: %w", c.gk.Group, c.gk.Kind, err)
+		return nil, fmt.Errorf("beehive: watch on %s/%s: %w", c.gk.Group, c.gk.Kind, err)
 	}
 
 	if cfg.scope.ownedBy != nil {
@@ -692,7 +744,11 @@ func (c *clientImpl[Spec, Status]) tailStream(
 
 	mig := c.bh.migratorFor(c.gk) // invariant for the stream's lifetime
 
-	var snap ObjectListSnapshot[Spec, Status]
+	out := make(chan ObjectChange[Spec, Status])
+	// One slot per subscribe, shared by every stream value built from this call:
+	// Watch hands back a value the stream goroutine never writes through.
+	slot := &streamFail{}
+	stream := &ObjectListStream[Spec, Status]{Changes: out, streamFail: slot}
 	// floor is what the caller already holds; deliveries at or below it are
 	// dropped. A resume raises it as the replay advances.
 	var floor int64
@@ -701,24 +757,25 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		// replay checks the horizon on every page it reads anyway. Probing it
 		// once more first would cost a round trip to answer the same question a
 		// moment earlier, in a second place the caller has to handle.
-		snap.ResourceVersion, floor = *cfg.resumeFrom, *cfg.resumeFrom
+		stream.ResourceVersion, floor = *cfg.resumeFrom, *cfg.resumeFrom
 	} else {
 		raws, at, err := c.snapshot(ctx, cfg.scope)
 		if err != nil {
 			abandon()
-			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+			return nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
 		}
-		snap.ResourceVersion, floor = at, at
-		snap.Objects = c.decodeList(raws, "Watch")
-		if err := c.loadListRelated(ctx, snap.Objects, cfg.loads); err != nil {
+		stream.ResourceVersion, floor = at, at
+		stream.Objects = c.decodeList(raws, "Watch")
+		if err := c.loadListRelated(ctx, stream.Objects, cfg.loads); err != nil {
 			abandon()
-			return empty, nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
+			return nil, fmt.Errorf("beehive: watch on %s/%s: initial read failed: %w",
 				c.gk.Group, c.gk.Kind, err)
 		}
 	}
 
-	out := make(chan ObjectChange[Spec, Status])
+	// The goroutine takes the slot, not the stream: capturing the stream would
+	// pin its snapshot for the stream's whole life.
 	go func() {
 		// LIFO: the receiver leaves the fan-out, then the lease goes, then the
 		// caller sees the stream end.
@@ -736,18 +793,20 @@ func (c *clientImpl[Spec, Status]) tailStream(
 		work, stopWork := mergeDone(ctx, tailer.ctx)
 		defer stopWork()
 
-		// One place sends the terminal Failed change; see endStream.
+		// One place stores the terminal failure; see endStream. It runs before
+		// the deferred close, which is what lets a caller that sees the close
+		// read Err.
 		if cfg.resumeFrom != nil {
 			at, fail, ok := c.replay(work, mig, cfg, floor, out)
 			if !ok {
-				c.endStream(ctx, tailer, fail, out)
+				c.endStream(ctx, tailer, fail, slot)
 				return
 			}
 			floor = at
 		}
-		c.consume(ctx, work, tailer, rx, mig, cfg, floor, out)
+		c.consume(ctx, work, tailer, rx, mig, cfg, floor, out, slot)
 	}()
-	return snap, out, nil
+	return stream, nil
 }
 
 // mergeDone returns a context that ends when either parent does. The returned
@@ -758,24 +817,24 @@ func mergeDone(first, second context.Context) (context.Context, func()) {
 	return ctx, func() { stop(); cancel() }
 }
 
-// endStream sends the one Failed change a stream is allowed, or nothing when
-// the caller's own context ended — a silent close is how that case is reported,
-// so a supervisor can tell its own cancellation from everything else. fail is
-// what the subscriber discovered itself; absent that, the tailer says why.
+// endStream stores why the stream ended, or nothing when the caller's own
+// context ended — a nil Err is how that case is reported, so a supervisor can
+// tell its own cancellation from everything else. fail is what the subscriber
+// discovered itself; absent that, the tailer says why.
 func (c *clientImpl[Spec, Status]) endStream(
 	ctx context.Context,
 	tailer *objectTailer,
 	fail error,
-	out chan<- ObjectChange[Spec, Status],
+	slot *streamFail,
 ) {
 	if ctx.Err() != nil {
 		return
 	}
 	if fail == nil {
-		fail = tailer.failure()
+		fail = tailer.Err()
 	}
 	if fail != nil {
-		sendOrDone(ctx, out, ObjectChange[Spec, Status]{Type: Failed, Err: fail})
+		slot.fail(fail)
 	}
 }
 
@@ -791,18 +850,19 @@ func (c *clientImpl[Spec, Status]) consume(
 	cfg watchConfig,
 	floor int64,
 	out chan<- ObjectChange[Spec, Status],
+	slot *streamFail,
 ) {
 	for {
 		ev, err := rx.RecvContext(work)
 		if err != nil {
 			// Either the fan-out closed or work ended. Both resolve the same
 			// way: the tailer says why unless the caller cancelled.
-			c.endStream(ctx, tailer, nil, out)
+			c.endStream(ctx, tailer, nil, slot)
 			return
 		}
 		changes, ok := c.decodeBatch(work, drainPending(ev.Value, rx), mig, cfg, floor)
 		if !ok {
-			c.endStream(ctx, tailer, nil, out) // the tailer stopped under a retry
+			c.endStream(ctx, tailer, nil, slot) // the tailer stopped under a retry
 			return
 		}
 		for _, ch := range changes {
@@ -934,8 +994,8 @@ func (c *clientImpl[Spec, Status]) decodeChanges(
 // replay delivers the gap between a resume's position and the tail, in pages —
 // with a day of retention the gap can be far more than one page. It returns
 // the position reached, or ok false with the failure to report — nil when there
-// is nothing to report beyond whatever the tailer says. One place sends the
-// Failed change, so a replay that ends as the tailer does cannot send two.
+// is nothing to report beyond whatever the tailer says. One place stores the
+// terminal failure, so a replay that ends as the tailer does cannot store two.
 func (c *clientImpl[Spec, Status]) replay(
 	ctx context.Context,
 	mig Migrator,
