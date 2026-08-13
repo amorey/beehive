@@ -14,5 +14,17 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-Nothing is in flight right now. The last spec shipped as
+In flight:
+[`2026-08-13-event-retention-on-the-stream.md`](2026-08-13-event-retention-on-the-stream.md)
+— report the configured event retention on `EventStream`, so a consumer holding
+runs in memory can size its own buffer from the server's number.
+
+Two sibling specs sit on their own branches and are not indexed here until they
+land: one gives the object watches the `EventStream` shape, the other drops
+`WatchEvents`' kind check. Both touch `eventswatch.go` and the README's events
+section, so **this one lands first** — it is the smallest diff, it adds a field
+and two lines to `WatchEvents`' construction, and it does not move the lines the
+other two rewrite.
+
+The last spec shipped as
 [`SetObservedGeneration`](../adr/2026-07-27-generation-handshake-and-noop-writes.md).
