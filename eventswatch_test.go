@@ -429,6 +429,34 @@ func TestWatchEventsStreamsAreIndependent(t *testing.T) {
 	assert.Equal(t, "Connected", recv(t, probes.Events).Reason)
 }
 
+// A stream reports the retention the sweeper enforces, so a consumer holding
+// runs in memory sizes its own list from the server's number rather than a copy
+// of it. Configuration, not a per-stream fact: an unset bound reads zero.
+func TestWatchEventsReportsTheRetentionBound(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want EventRetention
+	}{
+		{"both bounds", []Option{WithEventRetention(20, time.Hour)}, EventRetention{PerTimeline: 20, MaxAge: time.Hour}},
+		{"unset", nil, EventRetention{}},
+		{"count only", []Option{WithEventRetention(20, 0)}, EventRetention{PerTimeline: 20}},
+		{"age only", []Option{WithEventRetention(0, time.Hour)}, EventRetention{MaxAge: time.Hour}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			_, _, client, _ := watchFixtureWith(t, tc.opts...)
+			obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+			stream, err := client.WatchEvents(ctx, obj.ID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, stream.Retention)
+		})
+	}
+}
+
 // The cursor moves only past a delivered page, so a run abandoned mid-send is
 // still owed: a new stream resuming from the caller's last checkpoint gets it.
 func TestWatchEventsKeepsAnUndeliveredRunOwed(t *testing.T) {

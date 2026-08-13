@@ -318,6 +318,17 @@ type Event struct {
 	ResourceVersion int64
 }
 
+// EventRetention is the event-log bound the GC sweeper enforces, as configured
+// by WithEventRetention. A zero field is that bound unset.
+type EventRetention struct {
+	// PerTimeline caps each (object, category) timeline to its newest N runs,
+	// so it bounds one stream only when the watch is scoped to one category.
+	PerTimeline int
+	// MaxAge drops runs whose window ended more than MaxAge ago, across every
+	// timeline.
+	MaxAge time.Duration
+}
+
 // EventDetail unmarshals an event's Detail payload into T. An empty Detail
 // yields the zero value with a nil error.
 func EventDetail[T any](e Event) (T, error) {
