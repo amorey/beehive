@@ -37,6 +37,30 @@ import (
 // against a hub-wide pending slot meeting a per-subscriber floor.
 // See docs/adr/2026-08-03-watch-shared-tail.md.
 
+// streamFail holds a stream's terminal failure. Shared by pointer: Watch hands
+// back a value the stream goroutine does not write through, so a slot embedded
+// by value would leave that caller's Err forever nil.
+type streamFail struct {
+	failed atomic.Pointer[error]
+}
+
+// Err reports why the stream ended, after its change channel is closed:
+// ErrWatchTooOld for a stream that fell below retention, ErrWatchTooNew for a
+// resume position this store never issued, ErrStopped for a Beehive that
+// stopped, or nil when the caller's own context ended. Before the close it
+// reports nil, which says nothing.
+func (f *streamFail) Err() error {
+	if f == nil {
+		return nil
+	}
+	if err := f.failed.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
+func (f *streamFail) fail(err error) { f.failed.Store(&err) }
+
 // WatchOption configures one watch call. A distinct type from Option: these are
 // meaningful only here, and dispatching them on a Beehive or a controller would
 // silently accept nonsense.

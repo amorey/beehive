@@ -4025,3 +4025,14 @@ func TestWatchLoadRetryDecodesOnce(t *testing.T) {
 	assert.Zero(t, store.failuresLeft.Load()+1, "the load did not exhaust its failures")
 	assert.Equal(t, int64(1), decodes.Load(), "the batch was decoded once per attempt")
 }
+
+func TestStreamFailReportsTheStoredFailure(t *testing.T) {
+	var unwired *streamFail
+	assert.NoError(t, unwired.Err(), "a stream built without a slot reports no failure")
+
+	f := &streamFail{}
+	assert.NoError(t, f.Err(), "a stream that has not ended reports no failure")
+
+	f.fail(ErrWatchTooOld)
+	assert.ErrorIs(t, f.Err(), ErrWatchTooOld)
+}
