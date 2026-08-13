@@ -257,8 +257,8 @@ func TestWatchEventsHorizonIsPerTimeline(t *testing.T) {
 }
 
 // An event watch opened before its object exists waits for it rather than
-// erroring: the kind check needs a row to read, and "not there yet" is ordinary
-// for a watch opened ahead of the thing it is about.
+// erroring: the existence probe needs a row to read, and "not there yet" is
+// ordinary for a watch opened ahead of the thing it is about.
 func TestWatchEventsWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -266,8 +266,8 @@ func TestWatchEventsWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	store, _, client, cc := watchFixture(t)
 	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	// The id the store will assign next: no row holds it yet, so the kind check
-	// finds nothing on every pass.
+	// The id the store will assign next: no row holds it yet, so the existence
+	// probe finds nothing on every pass.
 	next := first.ID + 1
 	stream, err := client.WatchEvents(ctx, next)
 	require.NoError(t, err)
@@ -280,23 +280,83 @@ func TestWatchEventsWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	assert.Equal(t, "Started", recv(t, stream.Events).Reason, "the stream picks the object up once it exists")
 }
 
-// An event watch is kind-scoped like the object watches: an unscoped log read
-// would let another kind's id stream its events through this client. An id
-// belongs to one kind for life, so this is answered at subscribe.
-func TestWatchEventsIsKindScoped(t *testing.T) {
+// An event watch reads by id, not by kind: events carry no kind of their own, so
+// the client's kind says who is asking, not whose log this is.
+func TestWatchEventsIsNotKindScoped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	_, bh, client, _ := watchFixture(t)
-	other := GroupKind{Kind: "Other"}
-	otherCC, err := Register(bh, other, &noopController[cSpec, cStatus]{})
+	foreign, otherCC := foreignObject(t, ctx, bh)
+	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
+
+	stream, err := client.WatchEvents(ctx, foreign)
+	require.NoError(t, err)
+	require.Len(t, stream.Runs, 1, "the snapshot carries the foreign object's log")
+	assert.Equal(t, "Started", stream.Runs[0].Reason)
+
+	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	assert.Equal(t, "Probing", recv(t, stream.Events).Reason, "and what it grows by after")
+}
+
+// The three reads answer for the same id. WatchEvents used to be the odd one,
+// which is the disagreement this pins.
+func TestTheEventReadsAgreeOnAForeignID(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, bh, client, _ := watchFixture(t)
+	foreign, otherCC := foreignObject(t, ctx, bh)
+	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
+
+	runs, err := client.ListEvents(ctx, foreign)
+	require.NoError(t, err)
+	latest, ok, err := client.GetLatestEvent(ctx, foreign, "")
+	require.NoError(t, err)
+	require.True(t, ok)
+	stream, err := client.WatchEvents(ctx, foreign)
 	require.NoError(t, err)
 
-	foreign := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, other), "foreign", cSpec{Val: "foreign"})
-	require.NoError(t, otherCC.AddEvent(ctx, foreign.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
+	assert.Equal(t, runs, stream.Runs, "the watch snapshot is the list")
+	assert.Equal(t, runs[0], latest, "and the latest is its newest run")
+}
 
-	_, err = client.WatchEvents(ctx, foreign.ID)
-	assert.ErrorIs(t, err, ErrNotFound, "another kind's log must not stream through this client")
+// An id with no row yet is probed on every pass, and the kind that later claims
+// it is not the watch's business: the stream resolves whoever it turns out to be.
+func TestWatchEventsResolvesAnIDCreatedAsAnotherKind(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, bh, client, _ := watchFixture(t)
+	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+
+	next := first.ID + 1
+	stream, err := client.WatchEvents(ctx, next)
+	require.NoError(t, err)
+	waitClosed(t, chanAfter(store.metaRead, 2), "passes while the id is unassigned")
+
+	foreign, otherCC := foreignObject(t, ctx, bh)
+	require.Equal(t, next, foreign, "the store assigns ids in order")
+	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
+
+	assert.Equal(t, "Started", recv(t, stream.Events).Reason, "the stream resolves rather than ending")
+}
+
+// The collected-object ending is about the object, not the kind.
+func TestWatchEventsEndsWhenAForeignObjectIsCollected(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store, bh, client, _ := watchFixture(t)
+	foreign, otherCC := foreignObject(t, ctx, bh)
+	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Probing"}))
+
+	stream, err := client.WatchEvents(ctx, foreign)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Objects().Delete(ctx, foreign))
+	waitClosed(t, closedWhenDrained(stream.Events), "the stream to end with its object")
+	assert.ErrorIs(t, stream.Err(), ErrNotFound)
 }
 
 // A collected object's log cascaded away with it, so an empty page there is not
@@ -566,7 +626,7 @@ func TestWatchEventsReportsSubscribeReadFailures(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
-	t.Run("kind check", func(t *testing.T) {
+	t.Run("existence probe", func(t *testing.T) {
 		store.metaErr.Store(true)
 		defer store.metaErr.Store(false)
 		_, err := client.WatchEvents(ctx, obj.ID)
@@ -655,7 +715,7 @@ func TestEventReaderPacesItsDrains(t *testing.T) {
 
 	clk := &fakeClock{at: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}
 	r := &eventReader{
-		bh: bh, gk: clientTestGK, id: obj.ID,
+		bh: bh, id: obj.ID,
 		out:    make(chan Event, 8), // buffered: nothing here reads the stream
 		stream: &EventStream{},
 		gate:   rategate.NewSingle(time.Second),

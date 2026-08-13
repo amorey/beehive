@@ -91,7 +91,6 @@ func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID,
 	}
 	r := &eventReader{
 		bh:      c.bh,
-		gk:      c.gk,
 		id:      id,
 		cfg:     resolveEvents(opts),
 		written: written,
@@ -121,7 +120,6 @@ func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID,
 // stream is run's alone once it starts.
 type eventReader struct {
 	bh      *Beehive
-	gk      GroupKind
 	id      ObjectID
 	cfg     eventConfig
 	written *watch.Receiver[ObjectID, struct{}]
@@ -129,9 +127,9 @@ type eventReader struct {
 	stream  *EventStream
 
 	cursor int64
-	// resolved latches the kind check: group and kind are fixed at insert and
-	// ids are never reused, so once the id resolves the answer cannot change.
-	// Only "not there yet" stays unresolved — the id can still be created later.
+	// resolved latches that a row exists, which is what lets drain read: an empty
+	// page for an id with no row is ErrNotFound, so without the latch a watch
+	// opened ahead of its object would end as a collected one does.
 	resolved bool
 	gate     *rategate.Single
 	retry    driver.Backoff
@@ -143,10 +141,10 @@ type eventReader struct {
 	pagesPerDrain int
 }
 
-// start makes the reads a caller learns about synchronously: the kind check, and
-// then either the snapshot or the resume's own first look at the log.
+// start makes the reads a caller learns about synchronously: the existence
+// probe, and then either the snapshot or the resume's own first look at the log.
 func (r *eventReader) start(ctx context.Context) error {
-	if err := r.checkKind(ctx); err != nil {
+	if err := r.checkExists(ctx); err != nil {
 		return err
 	}
 	if r.cfg.resumeFrom == nil {
@@ -167,21 +165,15 @@ func (r *eventReader) start(ctx context.Context) error {
 	return nil
 }
 
-// checkKind scopes the read to this client's kind, as the object watches do, and
-// sets resolved when it answers. An id that holds no object yet leaves it unset
-// rather than failing — ordinary for a watch opened ahead of the thing it is
-// about — where another kind's id is ErrNotFound for good, an id belonging to
-// one kind for life.
-func (r *eventReader) checkKind(ctx context.Context) error {
-	raw, err := r.bh.store.Objects().GetMeta(ctx, r.id)
-	if errors.Is(err, ErrNotFound) {
-		return nil
-	}
-	if err != nil {
+// checkExists sets resolved once a row holds the id, whatever kind it is. An id
+// that holds no object yet leaves it unset rather than failing — ordinary for a
+// watch opened ahead of the thing it is about.
+func (r *eventReader) checkExists(ctx context.Context) error {
+	if _, err := r.bh.store.Objects().GetMeta(ctx, r.id); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil
+		}
 		return err
-	}
-	if raw.Group != r.gk.Group || raw.Kind != r.gk.Kind {
-		return fmt.Errorf("%w: %d belongs to another kind", ErrNotFound, r.id)
 	}
 	r.resolved = true
 	return nil
@@ -198,7 +190,7 @@ func (r *eventReader) checkResume(ctx context.Context, at int64) error {
 	if err != nil {
 		return err
 	}
-	if err := horizonErr(r.gk, "the event resume", at, trimmed); err != nil {
+	if err := horizonErr(fmt.Sprintf("object %d", r.id), "the event resume", at, trimmed); err != nil {
 		return err
 	}
 	if len(runs) > 0 {
@@ -269,7 +261,7 @@ func isTerminalWatchErr(err error) bool {
 // bool reports whether the budget stopped it with work still above the cursor.
 func (r *eventReader) drain(ctx context.Context) (more bool, err error) {
 	if !r.resolved {
-		if err := r.checkKind(ctx); err != nil || !r.resolved {
+		if err := r.checkExists(ctx); err != nil || !r.resolved {
 			return false, err
 		}
 	}
@@ -293,7 +285,7 @@ func (r *eventReader) step(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := horizonErr(r.gk, "the event stream", r.cursor, trimmed); err != nil {
+	if err := horizonErr(fmt.Sprintf("object %d", r.id), "the event stream", r.cursor, trimmed); err != nil {
 		return 0, err
 	}
 	for _, raw := range page {

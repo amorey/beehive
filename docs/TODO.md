@@ -402,6 +402,20 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   enough streams for the goroutine count to matter, and expect it to need an index
   before it needs an API.
 
+- **`WatchEvents` requires a registered controller for the client's own kind**,
+  which since [the reads take an id](adr/2026-08-13-the-event-reads-take-an-id.md)
+  is plainly a property of the caller and not of the target: a registered kind's
+  client may watch a client-only kind's object, but a client-only kind's client
+  may watch nothing at all. Deliberate, not deferred — the requirement is one
+  line and nothing in the read path needs a reconciler.
+
+  Dropping it would mean deciding what a watch on a beehive with no controllers
+  is for, and `NewClient` is the surface that would have to answer. What would
+  make it worth doing: a consumer that only observes — a panel, an exporter —
+  built against a beehive whose kinds it does not implement. Until one exists,
+  registering the kind is a one-line workaround and the requirement documents
+  itself.
+
 - **The store-side tests still spell pre-accessor method names in prose and test
   names** — `sqlite/store_test.go` and `internal/storeapi/storeapi_test.go` carry
   `EventsAdd`, `EventsList`, `ConditionsSet`, `EdgesHasIncoming` in comments, and

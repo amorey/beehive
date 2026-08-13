@@ -142,6 +142,11 @@ type Client[Spec, Status any] interface {
 	GetByName(ctx context.Context, name string, loads ...LoadOption) (*Object[Spec, Status], error)
 	// GetLatestEvent returns the current run in id's category timeline. ok is
 	// false (with a nil error) when the timeline is empty.
+	//
+	// This, ListEvents and WatchEvents all read by id and are not kind-scoped: an
+	// event carries no kind of its own, so any id's log reads through any client.
+	// The write is the asymmetry — ControllerClient.AddEvent is scoped to its own
+	// kind and returns ErrWrongKind.
 	GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error)
 	// GetOrCreate returns the object with the given name, creating it from spec
 	// if absent. It NEVER mutates an existing row: a name held by a live or
@@ -242,7 +247,9 @@ type Client[Spec, Status any] interface {
 	// instead of snapshotting; one retention has passed is ErrWatchTooOld and
 	// one above the log's head is ErrWatchTooNew. The stream reports the
 	// configured EventRetention, so a caller holding runs in memory can bound
-	// its own list. Requires a registered controller.
+	// its own list. Reads by id, not kind-scoped. Requires a registered
+	// controller for this client's kind, which is a property of the caller and
+	// not of the target.
 	WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 	// WatchList is Watch over every object of this client's kind: the same
 	// snapshot-and-stream contract, tailer and errors. See Watch.

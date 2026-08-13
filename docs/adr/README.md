@@ -51,6 +51,7 @@ for the mapping.
 - [The object tail floors the gap between wake-driven drains](2026-08-05-the-object-tail-throttles-its-drains.md)
 - [An owner-scoped watch resolves ownership from current state](2026-08-06-owner-scoped-watches.md)
 - [The event watch reads from a cursor, and a commit wakes it](2026-08-05-events-get-a-cursor-and-a-commit-wake.md)
+- [The event reads take an id](2026-08-13-the-event-reads-take-an-id.md)
 - [The stale-dependents pass scans from a cursor over target versions](2026-08-03-stale-dependents-cursor.md)
 - [Reclaim a client-only object's reconcile_owed count](2026-08-05-reclaim-a-client-only-owed-count.md)
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
