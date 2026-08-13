@@ -1751,8 +1751,9 @@ type pollProbeStore struct {
 	// already succeeded and the goroutine is on its way to the send.
 	listed chan struct{}
 	// eventsListed is the event reader's equivalent of tailed, and eventsFailed
-	// its failure counterpart; metaRead covers the kind check a pass makes while
-	// the id is still unassigned, which is the only clock an unresolved stream has.
+	// its failure counterpart; metaRead covers the existence probe a pass makes
+	// while the id is still unassigned, which is the only clock an unresolved
+	// stream has.
 	eventsListed chan struct{}
 	metaRead     chan struct{}
 	eventsFailed chan struct{}

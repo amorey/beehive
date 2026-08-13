@@ -257,8 +257,8 @@ func TestWatchEventsHorizonIsPerTimeline(t *testing.T) {
 }
 
 // An event watch opened before its object exists waits for it rather than
-// erroring: the kind check needs a row to read, and "not there yet" is ordinary
-// for a watch opened ahead of the thing it is about.
+// erroring: the existence probe needs a row to read, and "not there yet" is
+// ordinary for a watch opened ahead of the thing it is about.
 func TestWatchEventsWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -266,8 +266,8 @@ func TestWatchEventsWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 	store, _, client, cc := watchFixture(t)
 	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 
-	// The id the store will assign next: no row holds it yet, so the kind check
-	// finds nothing on every pass.
+	// The id the store will assign next: no row holds it yet, so the existence
+	// probe finds nothing on every pass.
 	next := first.ID + 1
 	stream, err := client.WatchEvents(ctx, next)
 	require.NoError(t, err)
@@ -321,8 +321,8 @@ func TestTheEventReadsAgreeOnAForeignID(t *testing.T) {
 	assert.Equal(t, runs[0], latest, "and the latest is its newest run")
 }
 
-// The kind check ran on every pass while the id was unassigned, so an id created
-// later as another kind killed a watch that was only ever waiting for it.
+// An id with no row yet is probed on every pass, and the kind that later claims
+// it is not the watch's business: the stream resolves whoever it turns out to be.
 func TestWatchEventsResolvesAnIDCreatedAsAnotherKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -626,7 +626,7 @@ func TestWatchEventsReportsSubscribeReadFailures(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
-	t.Run("kind check", func(t *testing.T) {
+	t.Run("existence probe", func(t *testing.T) {
 		store.metaErr.Store(true)
 		defer store.metaErr.Store(false)
 		_, err := client.WatchEvents(ctx, obj.ID)

@@ -129,9 +129,9 @@ type eventReader struct {
 	stream  *EventStream
 
 	cursor int64
-	// resolved latches the kind check: group and kind are fixed at insert and
-	// ids are never reused, so once the id resolves the answer cannot change.
-	// Only "not there yet" stays unresolved — the id can still be created later.
+	// resolved latches that a row exists, which is what lets drain read: an empty
+	// page for an id with no row is ErrNotFound, so without the latch a watch
+	// opened ahead of its object would end as a collected one does.
 	resolved bool
 	gate     *rategate.Single
 	retry    driver.Backoff
@@ -143,10 +143,10 @@ type eventReader struct {
 	pagesPerDrain int
 }
 
-// start makes the reads a caller learns about synchronously: the kind check, and
-// then either the snapshot or the resume's own first look at the log.
+// start makes the reads a caller learns about synchronously: the existence
+// probe, and then either the snapshot or the resume's own first look at the log.
 func (r *eventReader) start(ctx context.Context) error {
-	if err := r.checkKind(ctx); err != nil {
+	if err := r.checkExists(ctx); err != nil {
 		return err
 	}
 	if r.cfg.resumeFrom == nil {
@@ -167,12 +167,10 @@ func (r *eventReader) start(ctx context.Context) error {
 	return nil
 }
 
-// checkKind scopes the read to this client's kind, as the object watches do, and
-// sets resolved when it answers. An id that holds no object yet leaves it unset
-// rather than failing — ordinary for a watch opened ahead of the thing it is
-// about — where another kind's id is ErrNotFound for good, an id belonging to
-// one kind for life.
-func (r *eventReader) checkKind(ctx context.Context) error {
+// checkExists sets resolved once a row holds the id, whatever kind it is. An id
+// that holds no object yet leaves it unset rather than failing — ordinary for a
+// watch opened ahead of the thing it is about.
+func (r *eventReader) checkExists(ctx context.Context) error {
 	if _, err := r.bh.store.Objects().GetMeta(ctx, r.id); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil
@@ -265,7 +263,7 @@ func isTerminalWatchErr(err error) bool {
 // bool reports whether the budget stopped it with work still above the cursor.
 func (r *eventReader) drain(ctx context.Context) (more bool, err error) {
 	if !r.resolved {
-		if err := r.checkKind(ctx); err != nil || !r.resolved {
+		if err := r.checkExists(ctx); err != nil || !r.resolved {
 			return false, err
 		}
 	}
