@@ -91,7 +91,6 @@ func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID,
 	}
 	r := &eventReader{
 		bh:      c.bh,
-		gk:      c.gk,
 		id:      id,
 		cfg:     resolveEvents(opts),
 		written: written,
@@ -121,7 +120,6 @@ func (c *clientImpl[Spec, Status]) WatchEvents(ctx context.Context, id ObjectID,
 // stream is run's alone once it starts.
 type eventReader struct {
 	bh      *Beehive
-	gk      GroupKind
 	id      ObjectID
 	cfg     eventConfig
 	written *watch.Receiver[ObjectID, struct{}]
@@ -192,7 +190,7 @@ func (r *eventReader) checkResume(ctx context.Context, at int64) error {
 	if err != nil {
 		return err
 	}
-	if err := horizonErr(r.gk, "the event resume", at, trimmed); err != nil {
+	if err := horizonErr(fmt.Sprintf("object %d", r.id), "the event resume", at, trimmed); err != nil {
 		return err
 	}
 	if len(runs) > 0 {
@@ -287,7 +285,7 @@ func (r *eventReader) step(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := horizonErr(r.gk, "the event stream", r.cursor, trimmed); err != nil {
+	if err := horizonErr(fmt.Sprintf("object %d", r.id), "the event stream", r.cursor, trimmed); err != nil {
 		return 0, err
 	}
 	for _, raw := range page {

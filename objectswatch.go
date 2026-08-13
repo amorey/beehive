@@ -324,13 +324,14 @@ func (t *objectTailer) release() {
 
 // horizonErr returns ErrWatchTooOld when retention has trimmed the log past
 // cursor, else nil. Strictly <: a cursor exactly on the horizon has lost
-// nothing, and a kind that stops writing ends up exactly there.
-func horizonErr(gk GroupKind, what string, cursor, trimmedThrough int64) error {
+// nothing, and a kind that stops writing ends up exactly there. subject names
+// whose log was trimmed, as it does for tooNewErr.
+func horizonErr(subject, what string, cursor, trimmedThrough int64) error {
 	if cursor >= trimmedThrough {
 		return nil
 	}
-	return fmt.Errorf("%w: %s/%s trimmed through %d, %s was at %d",
-		ErrWatchTooOld, gk.Group, gk.Kind, trimmedThrough, what, cursor)
+	return fmt.Errorf("%w: %s trimmed through %d, %s was at %d",
+		ErrWatchTooOld, subject, trimmedThrough, what, cursor)
 }
 
 // tooNewErr returns ErrWatchTooNew when cursor sits above everything the log
@@ -600,7 +601,7 @@ func (t *objectTailer) step(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := horizonErr(t.gk, "the tail", t.cursor, trimmedThrough); err != nil {
+	if err := horizonErr(fmt.Sprintf("%s/%s", t.gk.Group, t.gk.Kind), "the tail", t.cursor, trimmedThrough); err != nil {
 		return 0, err
 	}
 	if len(page) == 0 {
@@ -1016,7 +1017,7 @@ func (c *clientImpl[Spec, Status]) replay(
 			continue
 		}
 		// Retention can overtake a replay that is still paging.
-		if err := horizonErr(c.gk, "the resume", cursor, trimmedThrough); err != nil {
+		if err := horizonErr(fmt.Sprintf("%s/%s", c.gk.Group, c.gk.Kind), "the resume", cursor, trimmedThrough); err != nil {
 			return 0, err, false
 		}
 		if len(page) == 0 {

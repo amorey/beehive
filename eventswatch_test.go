@@ -715,7 +715,7 @@ func TestEventReaderPacesItsDrains(t *testing.T) {
 
 	clk := &fakeClock{at: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}
 	r := &eventReader{
-		bh: bh, gk: clientTestGK, id: obj.ID,
+		bh: bh, id: obj.ID,
 		out:    make(chan Event, 8), // buffered: nothing here reads the stream
 		stream: &EventStream{},
 		gate:   rategate.NewSingle(time.Second),
