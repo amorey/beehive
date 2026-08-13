@@ -91,8 +91,6 @@ const (
 	Added    ChangeType = "Added"
 	Modified ChangeType = "Modified"
 	Deleted  ChangeType = "Deleted"
-	// Failed is terminal: the stream is over and the change carries the reason.
-	Failed ChangeType = "Failed"
 )
 
 // ObjectWrite is a write-log row: which object holds a version above the

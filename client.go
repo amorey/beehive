@@ -97,42 +97,19 @@ func checkName(name string) error {
 	return nil
 }
 
-// ObjectSnapshot is a single-object watch's starting state. Object is nil when
-// the id holds nothing yet; the stream that comes with it carries changes
-// strictly above ResourceVersion.
-type ObjectSnapshot[Spec, Status any] struct {
-	Object          *Object[Spec, Status]
-	ResourceVersion int64
-}
-
-// ObjectListSnapshot is a kind-wide watch's starting state: the objects as they
-// were, and the log position they are complete as of. The stream that comes
-// with it carries changes strictly above that position.
-type ObjectListSnapshot[Spec, Status any] struct {
-	Objects         []*Object[Spec, Status]
-	ResourceVersion int64
-}
-
 // ObjectChange reports a change to a watched object. On a Deleted change,
 // Object carries the row's final state, or is nil when that state could not be
 // decoded — the removal is reported either way, because nothing later in the
-// log mentions a deleted id. On a Failed change, Object is nil and Err is
-// non-nil: the stream is over, and a Failed change is always the last value
-// before the channel closes — ErrWatchTooOld for a stream that fell behind
-// retention, ErrWatchTooNew for a resume position this store never issued,
-// ErrStopped for a Beehive that stopped. A channel that closes with
-// no Failed change ended because the caller's context did, so a supervisor may
-// treat that alone as its own cancellation.
+// log mentions a deleted id. Why a stream ended is reported beside it, by the
+// stream's own Err.
 type ObjectChange[Spec, Status any] struct {
 	Type ChangeType
-	// ID is the object this change is about, set whether or not Object is. Zero
-	// on a Failed change.
+	// ID is the object this change is about, set whether or not Object is.
 	ID ObjectID
 	// ResourceVersion is the log position this change was reported at, and what
-	// WithResumeFrom takes to continue from here. Zero on a Failed change.
+	// WithResumeFrom takes to continue from here.
 	ResourceVersion int64
 	Object          *Object[Spec, Status]
-	Err             error
 }
 
 // Client is the user-facing API for a single resource kind: creating, reading,
@@ -243,7 +220,7 @@ type Client[Spec, Status any] interface {
 	// above it: Added/Modified/Deleted until ctx is cancelled. Kind-scoped, and
 	// needs no registered controller — the tail reads the write log, not a
 	// reconciler. It follows one incarnation: an id holding nothing is a nil
-	// ObjectSnapshot.Object rather than ErrNotFound, and a recreate under the
+	// ObjectStream.Object rather than ErrNotFound, and a recreate under the
 	// same name is a different id, so the stream ends at Deleted.
 	//
 	// The snapshot is read before Watch returns, on the caller's goroutine, so a

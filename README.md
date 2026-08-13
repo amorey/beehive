@@ -353,24 +353,28 @@ const (
     Added    ChangeType = "Added"
     Modified ChangeType = "Modified"
     Deleted  ChangeType = "Deleted"
-    Failed   ChangeType = "Failed" // terminal: the stream is over, Err says why
 )
 
 type ObjectChange[Spec, Status any] struct {
     Type   ChangeType
-    Object *Object[Spec, Status] // nil on Failed
-    Err    error                 // non-nil on Failed only
+    Object *Object[Spec, Status] // nil on a Deleted whose row image no longer decodes
 }
 
-type ObjectSnapshot[Spec, Status any] struct {
+type ObjectStream[Spec, Status any] struct {
     Object          *Object[Spec, Status] // nil when the id holds nothing yet
     ResourceVersion int64                 // the log position the snapshot is complete as of
+    Changes         <-chan ObjectChange[Spec, Status]
 }
 
-type ObjectListSnapshot[Spec, Status any] struct {
+type ObjectListStream[Spec, Status any] struct {
     Objects         []*Object[Spec, Status]
     ResourceVersion int64 // the log position the snapshot is complete as of
+    Changes         <-chan ObjectChange[Spec, Status]
 }
+
+// Err, on either stream, reports why Changes closed: ErrWatchTooOld,
+// ErrWatchTooNew, ErrStopped, or nil for the caller's own cancellation.
+func (s *ObjectStream[Spec, Status]) Err() error
 
 type Client[Spec, Status any] interface {
     // Creating: the name is positional, because there is no id yet.
@@ -391,8 +395,8 @@ type Client[Spec, Status any] interface {
     // Watching: a snapshot plus the changes above it. Kind-scoped; no controller
     // needed; follows one incarnation, so an id holding nothing is a nil Object
     // rather than ErrNotFound, and the stream ends at Deleted.
-    Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
-    WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+    Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (*ObjectStream[Spec, Status], error)
+    WatchList(ctx context.Context, opts ...WatchOption) (*ObjectListStream[Spec, Status], error)
 
     // Lazy secondary lookups — the on-demand counterparts to the Load options.
     GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
@@ -401,7 +405,7 @@ type Client[Spec, Status any] interface {
     ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error)
     // The typed, kind-scoped form of ListOwned: this kind's decoded children.
     ListOwnedObjects(ctx context.Context, ownerID ObjectID, loads ...LoadOption) ([]*Object[Spec, Status], error)
-    WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+    WatchOwnedObjects(ctx context.Context, ownerID ObjectID, opts ...WatchOption) (*ObjectListStream[Spec, Status], error)
 
     // Event log — per-object, category-partitioned, contiguous-run aggregated.
     ListEvents(ctx context.Context, id ObjectID, opts ...EventOption) ([]Event, error)
@@ -579,19 +583,24 @@ Looking the name up is **atomic with the delete** — the name goes into the sto
 
 #### Watching
 
-`Watch` and `WatchList` return the current state as a snapshot, plus a stream of the changes above it. The snapshot type matches the call's cardinality: `Watch` returns one `ObjectSnapshot`, whose `Object` is `nil` when the id holds nothing yet, and `WatchList` returns an `ObjectListSnapshot`. Both carry the same stream type, and the channel closes when `ctx` is cancelled. `WatchOwnedObjects(ownerID)` is `WatchList` narrowed to one owner's children — see [secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned) below.
+`Watch` and `WatchList` return a **stream**: the current state, the position it was read at, the `Changes` channel, and an `Err()` saying why that channel closed. The shape matches the call's cardinality — `Watch` returns an `ObjectStream`, whose `Object` is `nil` when the id holds nothing yet, and `WatchList` returns an `ObjectListStream`. `WatchOwnedObjects(ownerID)` is `WatchList` narrowed to one owner's children — see [secondary lookups](#secondary-lookups-owner--dependencies--dependents--owned) below. It is the same shape `WatchEvents` returns, so a stream ends one way across the whole library.
 
 ```go
-snap, ch, err := client.WatchList(ctx)
-// snap.Objects is current state; snap.ResourceVersion is where the stream starts.
+list, err := client.WatchList(ctx)
+// list.Objects is current state; list.ResourceVersion is where list.Changes starts.
 
-one, ch, err := client.Watch(ctx, id)
-// one.Object is current state, or nil; one.ResourceVersion is where the stream starts.
+one, err := client.Watch(ctx, id)
+// one.Object is current state, or nil; one.ResourceVersion is where one.Changes starts.
+
+for change := range list.Changes {
+    // ...
+}
+if err := list.Err(); err != nil { /* the stream ended; see below */ }
 ```
 
 **Do not open a watch inside `Within`.** The read below happens on your goroutine, and the store runs on a single connection — so it waits for the connection your transaction is holding, and the transaction cannot commit until it returns. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction.)
 
-**Subscribe, then act.** The snapshot is read *before either returns*, so a change you make after subscribing is always in the stream — delete an object on the next line and its `Deleted` will come. If that read fails you get the error rather than a stream, since a watch with no snapshot could not report that delete. The stream carries changes strictly above `snap.ResourceVersion`: no overlap with the snapshot, no gap between them. That is also what makes "have I caught up?" a value rather than a guess — you hold the starting state before you read the first change.
+**Subscribe, then act.** The snapshot is read *before either returns*, so a change you make after subscribing is always in the stream — delete an object on the next line and its `Deleted` will come. If that read fails you get the error rather than a stream, since a watch with no snapshot could not report that delete. The stream carries changes strictly above `ResourceVersion`: no overlap with the snapshot, no gap between them. That is also what makes "have I caught up?" a value rather than a guess — you hold the starting state before you read the first change.
 
 Both **share one reader per kind.** However many watches a kind has, one tailer reads its write-log position, and only a position that moved costs anything more: the entries above the cursor, then one batched read of the objects they name. A commit wakes that tailer, and a floor tick (`WithWatchFloorInterval`, 30s by default) covers what a wake cannot — a failed read, a retention trim. That reader lives exactly as long as the kind has watches — the first one starts it, the last one to end takes it down — so cancelling a watch releases everything it held, on a `Beehive` you started or one you never did. Three things follow, and they are the level-triggered contract the rest of beehive keeps — you are told what *is*, never what happened:
 
@@ -601,7 +610,7 @@ Both **share one reader per kind.** However many watches a kind has, one tailer 
 
 **`Deleted` means collected, not requested.** Deleting an object sets `DeletionRequestedAt` and leaves the row live and readable, so you get a `Modified` with that field set. `Deleted` follows only when the GC sweeper physically removes the row — after its finalizers clear, which is controller-defined and unbounded, and after nothing references it any more. So: key on `DeletionRequestedAt != nil` to stop using an object, and on `Deleted` to evict it from a cache. A `Deleted` arrives even when its row image will not decode — a peer wrote the row at a schema version this binary cannot read, say — with `Object` nil and `ID` set. Nothing later in the log mentions a deleted id, so a `Deleted` withheld here would leave the object in your cache for good.
 
-A failed read is logged and retried rather than fatal, so the stream survives a transient store error. One failure is terminal: if retention trims log entries the tail had not read, every watch on that kind gets a `Failed` change carrying `ErrWatchTooOld` and closes, because it cannot continue truthfully. Subscribe again for a fresh snapshot. A `WithResumeFrom` position that retention has already passed arrives the same way, on the stream rather than as an error from the call — so `ErrWatchTooOld` has one place to be handled, not two. Stopping the beehive ends every stream the same way, on a `Failed` change carrying `ErrStopped`; unlike `ErrWatchTooOld` that one cannot be answered by subscribing again. So a channel that closes with **no** `Failed` change closed because your own context ended, and a supervisor can key on exactly that to decide whether to resubscribe.
+A failed read is logged and retried rather than fatal, so the stream survives a transient store error. One failure is terminal: if retention trims log entries the tail had not read, every watch on that kind closes with `Err()` reporting `ErrWatchTooOld`, because it cannot continue truthfully. Subscribe again for a fresh snapshot. A `WithResumeFrom` position that retention has already passed arrives the same way, on the stream rather than as an error from the call — so `ErrWatchTooOld` has one place to be handled, not two. Stopping the beehive ends every stream the same way, with `ErrStopped`; unlike `ErrWatchTooOld` that one cannot be answered by subscribing again. So a `Changes` channel that closes with a **nil** `Err()` closed because your own context ended, and a supervisor can key on exactly that to decide whether to resubscribe. `Err()` is set before the close, so reading it the moment the channel closes is enough — and because it is not a value on the stream, a caller that forgets it drops an error rather than mistaking one for a change.
 
 `WatchOption`s tune the rest:
 

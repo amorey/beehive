@@ -164,9 +164,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   unlike the event log, because entries land at reconcile rate; what it trims is
   recorded per kind in `object_writes_horizon`, and that horizon is the resume
   boundary. → [ADR](docs/adr/2026-08-02-object-write-log.md)
-- **Client watches return a snapshot and subscribe to their kind's shared
-  tailer** (`objectswatch.go`). One tailer per kind owns the cursor, so reads scale
-  with watched kinds, not watch count: a quiet read costs one
+- **Client watches return a stream — snapshot, `Changes`, and an `Err()` —
+  and subscribe to their kind's shared tailer** (`objectswatch.go`). The
+  terminal failure is stored in a `streamFail` slot **before** the channel
+  closes, never delivered as a change; `Watch` shares the slot of the list
+  stream it adapts, so a copy there would report nil forever. A nil `Err()`
+  after the close means the caller's own context ended.
+  One tailer per kind owns the cursor, so reads scale with watched kinds, not
+  watch count: a quiet read costs one
   `ObjectWrites().MaxVersion` (which folds in the horizon so it only rises — gate on
   `>`, not `!=`), a busy one reads the entries above the cursor and then one
   batched `Objects().ListByIDs`, draining until a page comes back short. A commit

@@ -102,7 +102,7 @@ func main() {
 	ctx := context.Background()
 	client := beehive.NewClient[PanelSpec, PanelStatus](bh, PanelGroupKind)
 
-	_, watchCh, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	exitOnErr(err)
 
 	started := time.Now()
@@ -112,14 +112,14 @@ func main() {
 
 	// No Requeue, unlike every other example here: the spec write already
 	// enqueued this object, and waiting on the tick instead would take 5m.
-	waitFor(watchCh, panel.ID, func(o *beehive.Object[PanelSpec, PanelStatus]) bool {
+	waitFor(stream, panel.ID, func(o *beehive.Object[PanelSpec, PanelStatus]) bool {
 		return o != nil && o.Status != nil && o.Status.Connected
 	})
 	fmt.Printf("connected after %s (the owed pass is %s away)\n", time.Since(started).Round(time.Millisecond), 5*time.Minute)
 
 	started = time.Now()
 	exitOnErr(client.Delete(ctx, panel.ID))
-	waitFor(watchCh, panel.ID, func(o *beehive.Object[PanelSpec, PanelStatus]) bool { return o == nil })
+	waitFor(stream, panel.ID, func(o *beehive.Object[PanelSpec, PanelStatus]) bool { return o == nil })
 	fmt.Printf("collected after %s (the GC sweep is %s away)\n", time.Since(started).Round(time.Millisecond), 5*time.Minute)
 }
 
@@ -131,18 +131,15 @@ func stopBeehive(stop func(context.Context) error) {
 	}
 }
 
-// waitFor drains watchCh until id satisfies want. A Deleted carries a row image
-// rather than a live object, so want sees nil for the collected panel.
-func waitFor(watchCh <-chan beehive.ObjectChange[PanelSpec, PanelStatus], id beehive.ObjectID, want func(*beehive.Object[PanelSpec, PanelStatus]) bool) {
+// waitFor drains the stream until id satisfies want. A Deleted carries a row
+// image rather than a live object, so want sees nil for the collected panel.
+func waitFor(stream *beehive.ObjectListStream[PanelSpec, PanelStatus], id beehive.ObjectID, want func(*beehive.Object[PanelSpec, PanelStatus]) bool) {
 	timeout := time.After(30 * time.Second)
 	for {
 		select {
-		case evt, open := <-watchCh:
+		case evt, open := <-stream.Changes:
 			if !open {
-				log.Fatal("watch channel closed early")
-			}
-			if evt.Type == beehive.Failed {
-				log.Fatalf("watch ended: %v", evt.Err)
+				log.Fatalf("watch ended early: %v", stream.Err())
 			}
 			if evt.ID != id {
 				continue

@@ -166,7 +166,7 @@ func main() {
 	// Watch before creating, so the create arrives as an Added and the controller's
 	// writes as the Modifieds after it. A watch is a poll, so it converges on
 	// current state either way — starting first is what keeps the sequence legible.
-	_, watchCh, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	exitOnErr(err)
 
 	obj, err := client.Create(ctx, "web", ServerSpec{Replicas: 3})
@@ -178,7 +178,7 @@ func main() {
 	// 30s. The RequeueAfter the controller returns paces every step after it.
 	exitOnErr(client.Requeue(ctx, obj.ID))
 
-	waitForReady(obj.ID, watchCh)
+	waitForReady(obj.ID, stream)
 }
 
 func stopBeehive(stop func(context.Context) error) {
@@ -191,13 +191,10 @@ func stopBeehive(stop func(context.Context) error) {
 
 // waitForReady prints each change to object id and returns once its Ready
 // condition reports True.
-func waitForReady(id int64, watchCh <-chan beehive.ObjectChange[ServerSpec, ServerStatus]) {
-	for evt := range watchCh {
-		// Object is nil on Failed, and on a Deleted whose row image no longer
-		// decodes; evt.ID identifies the object either way.
-		if evt.Type == beehive.Failed {
-			log.Fatalf("watch ended: %v", evt.Err)
-		}
+func waitForReady(id int64, stream *beehive.ObjectListStream[ServerSpec, ServerStatus]) {
+	for evt := range stream.Changes {
+		// Object is nil on a Deleted whose row image no longer decodes; evt.ID
+		// identifies the object either way.
 		if evt.ID != id || evt.Object == nil {
 			continue
 		}
@@ -206,6 +203,9 @@ func waitForReady(id int64, watchCh <-chan beehive.ObjectChange[ServerSpec, Serv
 			fmt.Println("converged: server is Ready")
 			return
 		}
+	}
+	if err := stream.Err(); err != nil {
+		log.Fatalf("watch ended: %v", err)
 	}
 	log.Fatal("watch channel closed before the server became Ready")
 }

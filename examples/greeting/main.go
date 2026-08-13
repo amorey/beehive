@@ -91,7 +91,7 @@ func main() {
 	// controller's UpdateStatus as the Modified after it. (A watch started later
 	// would still converge — its first poll reports current state — but it could
 	// report the settled object in one event and never show the intermediate.)
-	_, watchCh, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	exitOnErr(err)
 
 	obj, err := client.Create(ctx, "world", GreetingSpec{Name: "world"})
@@ -104,7 +104,7 @@ func main() {
 	// same convergence happens, 30s later.
 	exitOnErr(client.Requeue(ctx, obj.ID))
 
-	waitForConvergence(obj.ID, watchCh)
+	waitForConvergence(obj.ID, stream)
 }
 
 func stopBeehive(stop func(context.Context) error) {
@@ -115,19 +115,19 @@ func stopBeehive(stop func(context.Context) error) {
 	}
 }
 
-// waitForConvergence drains watchCh until it sees a status-bearing event for id.
-func waitForConvergence(id int64, watchCh <-chan beehive.ObjectChange[GreetingSpec, GreetingStatus]) {
-	for evt := range watchCh {
-		// Object is nil on Failed, and on a Deleted whose row image no longer
-		// decodes; evt.ID identifies the object either way.
-		if evt.Type == beehive.Failed {
-			log.Fatalf("watch ended: %v", evt.Err)
-		}
+// waitForConvergence drains the stream until it sees a status-bearing event for id.
+func waitForConvergence(id int64, stream *beehive.ObjectListStream[GreetingSpec, GreetingStatus]) {
+	for evt := range stream.Changes {
+		// Object is nil on a Deleted whose row image no longer decodes; evt.ID
+		// identifies the object either way.
 		if evt.ID != id || evt.Object == nil || evt.Object.Status == nil {
 			continue
 		}
 		fmt.Printf("converged: %s\n", evt.Object.Status.Message)
 		return
+	}
+	if err := stream.Err(); err != nil {
+		log.Fatalf("watch ended: %v", err)
 	}
 	log.Fatal("watch channel closed before convergence")
 }
