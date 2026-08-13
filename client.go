@@ -269,7 +269,7 @@ type Client[Spec, Status any] interface {
 	WatchEvents(ctx context.Context, id ObjectID, opts ...EventOption) (*EventStream, error)
 	// WatchList is Watch over every object of this client's kind: the same
 	// snapshot-and-stream contract, tailer and errors. See Watch.
-	WatchList(ctx context.Context, opts ...WatchOption) (ObjectListSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	WatchList(ctx context.Context, opts ...WatchOption) (*ObjectListStream[Spec, Status], error)
 	// WatchOwnedObjects is ListOwnedObjects as a watch: a snapshot of
 	// ownerID's children of this kind, then every change to one of them. A child
 	// created under ownerID later arrives as Added and its collection as Deleted.

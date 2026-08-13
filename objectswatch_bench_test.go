@@ -116,7 +116,10 @@ func benchWritesUnderWatch(b *testing.B, kinds, watchersPerKind int, scoped bool
 			if scoped {
 				_, ch, err = clients[k].WatchOwnedObjects(ctx, ownerID)
 			} else {
-				_, ch, err = clients[k].WatchList(ctx)
+				var stream *ObjectListStream[cSpec, cStatus]
+				if stream, err = clients[k].WatchList(ctx); err == nil {
+					ch = stream.Changes
+				}
 			}
 			require.NoError(b, err)
 			watchers.Add(1)

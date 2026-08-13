@@ -234,7 +234,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	snap, ch, err := client.WatchList(ctx)
+	snap, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
 
@@ -254,7 +254,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	// A real change still flows.
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "changed"}))
 	select {
-	case ev := <-ch:
+	case ev := <-snap.Changes:
 		assert.Equal(t, Modified, ev.Type)
 		require.NotNil(t, ev.Object.Status)
 		assert.Equal(t, "changed", ev.Object.Status.Val)

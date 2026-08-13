@@ -211,7 +211,7 @@ func TestWatchListSkipsUndecodableRows(t *testing.T) {
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	snap, _, err := client.WatchList(ctx)
+	snap, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	require.Len(t, snap.Objects, 1, "the poison row is quarantined, not fatal")
@@ -1531,12 +1531,12 @@ func watchTestClient(t *testing.T) (context.Context, Client[cSpec, cStatus]) {
 func TestWatchListReceivesAddedOnCreate(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	_, ch, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	evt := recv(t, ch)
+	evt := recv(t, stream.Changes)
 	assert.Equal(t, Added, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "hello", evt.Object.Spec.Val)
@@ -1549,17 +1549,17 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 
 	// Subscribe before creating so the snapshot is empty and the first event is
 	// the Modified from the Update, not an Added from the snapshot.
-	_, ch, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
 	// Drain the Added event from Create.
-	recv(t, ch)
+	recv(t, stream.Changes)
 
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "v2"})
 	require.NoError(t, err)
 
-	evt := recv(t, ch)
+	evt := recv(t, stream.Changes)
 	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "v2", evt.Object.Spec.Val)
@@ -1571,16 +1571,16 @@ func TestWatchListReceivesModifiedOnUpdate(t *testing.T) {
 func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	_, ch, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
 	// Drain the Added event from Create.
-	recv(t, ch)
+	recv(t, stream.Changes)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
 
-	evt := recv(t, ch)
+	evt := recv(t, stream.Changes)
 	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.NotNil(t, evt.Object.DeletionRequestedAt)
@@ -1591,14 +1591,14 @@ func TestWatchListReceivesModifiedOnDelete(t *testing.T) {
 func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	ctx, client := watchTestClient(t)
 
-	_, ch, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{})
-	recv(t, ch) // drain Added
+	recv(t, stream.Changes) // drain Added
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	recv(t, ch) // drain first Modified
+	recv(t, stream.Changes) // drain first Modified
 
 	// Second Delete is idempotent. Pinned at the mechanism first: the watch emits
 	// off resource_version, so a write that leaves it alone is invisible to the
@@ -1615,7 +1615,7 @@ func TestWatchListNoEventOnIdempotentDelete(t *testing.T) {
 	// so anything the idempotent delete emitted has to show up at or before that
 	// frame. Reading until the Added arrives therefore sees every stray there is.
 	other := mustCreate(t, ctx, client, uniqueName(), cSpec{})
-	evt := recv(t, ch)
+	evt := recv(t, stream.Changes)
 	require.Equal(t, other.ID, evt.Object.ID, "unexpected event on idempotent delete: %v", evt.Type)
 	assert.Equal(t, Added, evt.Type)
 }
@@ -1654,11 +1654,11 @@ func TestWatchListClosesOnCtxCancel(t *testing.T) {
 	parent, client := watchTestClient(t)
 	ctx, cancel := context.WithCancel(parent)
 
-	_, ch, err := client.WatchList(ctx)
+	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	cancel()
-	assertChanClosed(t, ch)
+	assertChanClosed(t, stream.Changes)
 }
 
 // TestWatchClosesOnCtxCancel verifies that Watch(id) channel closes on ctx cancel.
@@ -1704,14 +1704,14 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 
 	// Subscribe after create: the object is in the snapshot, and the stream
 	// carries the Modified that UpdateStatus makes next.
-	snap, ch, err := client2.WatchList(ctx)
+	snap, err := client2.WatchList(ctx)
 	require.NoError(t, err)
 	require.Len(t, snap.Objects, 1)
 	assert.Equal(t, obj.ID, snap.Objects[0].ID)
 
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
 
-	evt := recv(t, ch)
+	evt := recv(t, snap.Changes)
 	assert.Equal(t, Modified, evt.Type)
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	require.NotNil(t, evt.Object.Status)
@@ -1727,7 +1727,7 @@ func TestWatchListInitialSnapshot(t *testing.T) {
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 
-	snap, _, err := client.WatchList(ctx)
+	snap, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
 	seen := map[ObjectID]string{}
@@ -1784,7 +1784,7 @@ func TestWatchListWorksForAnUnregisteredKind(t *testing.T) {
 	unknownGK := GroupKind{Kind: "Unknown"}
 	client := NewClient[cSpec, cStatus](bh, unknownGK)
 
-	snap, _, err := client.WatchList(ctx)
+	snap, err := client.WatchList(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, snap.Objects)
 
