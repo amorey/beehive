@@ -171,7 +171,7 @@ func (c *clientImpl[Spec, Status]) WatchList(ctx context.Context, opts ...WatchO
 
 // Watch streams changes to the single object id: an id that does not exist yet
 // streams nothing until created, and its removal reads as a Deleted.
-func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error) {
+func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (*ObjectStream[Spec, Status], error) {
 	// The tail is shared per kind — the log has no index on object_id — so a
 	// single-object watch joins the kind's reader and filters the fan-out down
 	// to its own id.
@@ -179,13 +179,19 @@ func (c *clientImpl[Spec, Status]) Watch(ctx context.Context, id ObjectID, opts 
 	cfg.scope.only = &id
 	list, err := c.tailStream(ctx, cfg)
 	if err != nil {
-		return ObjectSnapshot[Spec, Status]{}, nil, err
+		return nil, err
 	}
-	snap := ObjectSnapshot[Spec, Status]{ResourceVersion: list.ResourceVersion}
+	// The slot travels, it is not copied: the subscriber writes the failure
+	// through the value tailStream built, not through this one.
+	stream := &ObjectStream[Spec, Status]{
+		ResourceVersion: list.ResourceVersion,
+		Changes:         list.Changes,
+		streamFail:      list.streamFail,
+	}
 	if len(list.Objects) > 0 {
-		snap.Object = list.Objects[0]
+		stream.Object = list.Objects[0]
 	}
-	return snap, list.Changes, nil
+	return stream, nil
 }
 
 // WatchOwnedObjects streams the objects of this client's kind owned by

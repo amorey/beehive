@@ -257,7 +257,7 @@ type Client[Spec, Status any] interface {
 	// and a floor tick covers what a wake cannot. Delivery is latest-per-object,
 	// so changes to one object collapse. A watch cannot be opened inside a
 	// transaction (the read would deadlock on the single connection).
-	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (ObjectSnapshot[Spec, Status], <-chan ObjectChange[Spec, Status], error)
+	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (*ObjectStream[Spec, Status], error)
 	// WatchEvents streams id's event log: a snapshot of the runs matching opts,
 	// the position it was read at, and the runs the log grows by above it. An
 	// extend re-samples ResourceVersion, so a run that grew is delivered again

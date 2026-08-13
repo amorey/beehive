@@ -847,11 +847,11 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	// the object is in its snapshot and the Deleted below cannot be missed.
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	_, w, err := client.Watch(wctx, obj.ID)
+	stream, err := client.Watch(wctx, obj.ID)
 	require.NoError(t, err)
 
 	require.NoError(t, client.Delete(ctx, obj.ID))
-	waitForDeletions(t, w, obj.ID)
+	waitForDeletions(t, stream.Changes, obj.ID)
 
 	_, err = client.Get(ctx, obj.ID)
 	require.ErrorIs(t, err, ErrNotFound)
