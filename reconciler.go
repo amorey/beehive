@@ -302,6 +302,16 @@ func (r *reconciler) backoffClear(id ObjectID) {
 	delete(r.backoffFor, id)
 }
 
+// unsettledRequeue is when a bare Unsettled comes back: the owed pass's cadence,
+// since this alarm is that pass extended to the objects whose generation its
+// listing cannot see. The default stands in when the pass is disabled.
+func (r *reconciler) unsettledRequeue() time.Duration {
+	if r.owedPassInterval > 0 {
+		return r.owedPassInterval
+	}
+	return defaultUnsettledRequeue
+}
+
 // requeue makes id immediately dispatchable, optionally resetting its backoff
 // ladder first. It is the engine behind Client.Requeue — a latency hint, not a
 // synchronous run. Backoff is otherwise cleared only by a successful reconcile.
@@ -451,8 +461,9 @@ func (r *reconciler) runWorker(ctx context.Context) {
 					r.logger.Debug("requeued", "id", id, "after", 0)
 				case result.unsettled():
 					r.backoffClear(id)
-					r.work.addAfter(id, defaultUnsettledRequeue, alarmRequeueAfter)
-					r.logger.Debug("requeued unsettled", "id", id, "after", defaultUnsettledRequeue)
+					after := r.unsettledRequeue()
+					r.work.addAfter(id, after, alarmRequeueAfter)
+					r.logger.Debug("requeued unsettled", "id", id, "after", after)
 				default:
 					r.backoffClear(id)
 				}

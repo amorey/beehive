@@ -28,6 +28,7 @@ import (
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlite"
+	"github.com/amorey/gobus/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -3665,6 +3666,22 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 	})
 }
 
+// waitScheduleBeyond blocks until id's schedule sits further out than d, which
+// is how a test tells an alarm apart from a floored re-dispatch — scheduleAt
+// races the worker, so the hub is the signal.
+func waitScheduleBeyond(t *testing.T, ctx context.Context, rx *watch.Receiver[ObjectID, gaugeValue], d time.Duration, what string) {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, testTimeout)
+	defer cancel()
+	for {
+		ev, err := rx.RecvContext(waitCtx)
+		require.NoError(t, err, what)
+		if ev.Value.Schedule.NextRequeueAt.After(time.Now().Add(d)) {
+			return
+		}
+	}
+}
+
 // A bare Unsettled must schedule its own return: the unsettled listing gates on
 // the generation, so an object that declines to settle without having moved its
 // generation is in no listing and no other driver would come back for it.
@@ -3686,15 +3703,36 @@ func TestReconcilerBareUnsettledSchedulesItself(t *testing.T) {
 
 	// The pass publishes a due-now and a dispatched-zero on the way; what proves
 	// the alarm is a schedule further out than the floor could ever be.
-	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer waitCancel()
-	for {
-		ev, err := rx.RecvContext(waitCtx)
-		require.NoError(t, err, "a bare Unsettled scheduled nothing further out than the floor")
-		if at := ev.Value.Schedule.NextRequeueAt; at.After(time.Now().Add(5 * time.Second)) {
-			break
-		}
+	waitScheduleBeyond(t, ctx, rx, 5*time.Second,
+		"a bare Unsettled scheduled nothing further out than the floor")
+}
+
+// The bare Unsettled alarm is the owed pass extended to the objects its listing
+// misses, so it follows that pass's configured cadence: an embedder who asked for
+// a quiet store does not get a 30s ping per unsettled object anyway.
+func TestReconcilerBareUnsettledFollowsTheOwedPassCadence(t *testing.T) {
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			return Unsettled()
+		},
 	}
+	q := newWorkQueue()
+	r := &reconciler{
+		adapter:          adapter,
+		work:             q,
+		backoffFor:       make(map[ObjectID]time.Duration),
+		owedPassInterval: time.Hour,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+	defer func() { cancel(); waitClosed(t, done, "run to exit") }()
+
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+	r.enqueue(1)
+
+	waitScheduleBeyond(t, ctx, rx, 30*time.Minute,
+		"the alarm must follow the owed pass, not the default")
 }
 
 // The 30s default is an upper bound, not a period: alarmRequeueAfter does not
@@ -3729,15 +3767,7 @@ func TestReconcilerBareUnsettledYieldsToAPush(t *testing.T) {
 
 	// Push only once the alarm is really pending, or a fast dispatch would prove
 	// nothing about outranking it.
-	waitCtx, waitCancel := context.WithTimeout(ctx, testTimeout)
-	defer waitCancel()
-	for {
-		ev, err := rx.RecvContext(waitCtx)
-		require.NoError(t, err, "the bare Unsettled alarm")
-		if ev.Value.Schedule.NextRequeueAt.After(time.Now().Add(5 * time.Second)) {
-			break
-		}
-	}
+	waitScheduleBeyond(t, ctx, rx, 5*time.Second, "the bare Unsettled alarm")
 
 	r.enqueue(1)
 	waitClosed(t, second, "the pushed reconcile, which must not wait out the 30s alarm")

@@ -340,14 +340,14 @@ func (ReconcileResult) Err() error                                  // the failu
 | Return | Records `ObservedGeneration` | Requeue |
 | --- | --- | --- |
 | `Settled()` | yes | nothing scheduled |
-| `Unsettled()` | no | after 30s |
+| `Unsettled()` | no | after the owed-pass interval (30s by default) |
 | `Settled().RequeueAfter(d)`, `Unsettled().RequeueAfter(d)` | as above | after `d` |
 | `Settled().RequeueAfter(0)`, `Unsettled().RequeueAfter(0)` | as above | as soon as the queue's per-object floor allows |
 | `Fail(err)` | no | the backoff ladder |
 
 `Settled` claims only that the pass observed the object's current generation — not that it is healthy, nor that any status was written.
 
-A bare `Unsettled()` schedules its own return because nothing else would: the owed pass lists an object whose generation has moved, so one that declines to settle without having moved its generation is in no listing. The 30s is an upper bound, not a period — a dependency wake or a spec write landing inside the window dispatches on its own schedule, paced only by the queue's floor. `RequeueAfter(0)` polls at that floor (1s by default), which is the right answer only for a pass that can make progress the moment it is called again.
+A bare `Unsettled()` schedules its own return because nothing else would: the owed pass lists an object whose generation has moved, so one that declines to settle without having moved its generation is in no listing. It comes back on that pass's own cadence — `WithOwedPassInterval`, 30s by default — since the alarm is that pass extended to what its listing cannot see. The interval is an upper bound, not a period: a dependency wake or a spec write landing inside the window dispatches on its own schedule, paced only by the queue's floor. `RequeueAfter(0)` polls at that floor (1s by default), which is the right answer only for a pass that can make progress the moment it is called again.
 
 `RequeueAfter` is ignored on a `Fail`, which takes the backoff ladder.
 

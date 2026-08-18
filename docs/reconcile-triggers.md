@@ -712,7 +712,8 @@ failed while servicing a wake keeps its `reconcile_owed` count, because
 ### 13. A result's requeue delay
 
 `runWorker` calls `workQueue.addAfter` for a `RequeueAfter(d)` with `d > 0`, and for
-a bare `Unsettled()` at `defaultUnsettledRequeue` (30s).
+a bare `Unsettled()` at the owed pass's interval (`defaultUnsettledRequeue`, 30s,
+when that pass is disabled).
 
 A chain of these on a settled object is the one case with no durable record at all.
 It does not survive a restart, and no driver brings it back. **This is accepted, not
@@ -742,13 +743,15 @@ is absent from the listing, and a restart drops the chain exactly as section 13'
 does. Only an object whose generation really has moved past what was observed is
 recovered.
 
-That gap is why a bare `Unsettled()` schedules a 30s alarm rather than nothing:
-in memory it is section 13's chain, and across a restart the listing is all there
-is. A pending floor alarm outranks the 30s one, and an arriving wake is not
+That gap is why a bare `Unsettled()` schedules an alarm rather than nothing: in
+memory it is section 13's chain, and across a restart the listing is all there is.
+It fires at the owed pass's cadence, being that pass extended to what the listing
+cannot see. A pending floor alarm outranks it, and an arriving wake is not
 absorbed by it, so the alarm is an upper bound rather than a period.
 
 Tests: `TestReconcilerSchedulesFromTheResultKind`,
 `TestReconcilerBareUnsettledSchedulesItself`,
+`TestReconcilerBareUnsettledFollowsTheOwedPassCadence`,
 `TestReconcilerBareUnsettledYieldsToAPush`.
 
 ### 13c. Beehive's generation stamp

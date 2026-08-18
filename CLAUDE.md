@@ -343,8 +343,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   what stops a controller re-applying its own spec from waking itself forever.
   `Reconcile` returns `Settled`/`Unsettled`/`Fail` — with the next pass scheduled
   by `RequeueAfter`, whose explicit zero is the queue floor on either kind, and a
-  bare `Unsettled` scheduling itself at 30s because the unsettled listing gates on
-  the generation and would not list it — and beehive stamps `observed_generation`
+  bare `Unsettled` scheduling itself at the owed pass's cadence because the
+  unsettled listing gates on the generation and would not list it — and beehive stamps `observed_generation`
   from **the object it handed out**, never a fresh read.
   `UpdateStatus` writes status alone, which is what leaves
   `Objects().SetObservedGeneration` the sole writer of that column.
