@@ -42,6 +42,16 @@ go test -run '^$' -bench . -benchtime 2000x -count 3 ./
 go test -run '^$' -bench . -benchtime 1x ./   # smoke: compiles and runs each once
 ```
 
+## Writing standards
+
+1. **Code — simple, idiomatic, easy for a human to follow.** Prefer the boring construction. Match the idiom of the file you are in over the one you would pick on a blank page. Cleverness that needs a comment to survive review is usually the wrong trade.
+2. **Comments — terse, necessary, easy for a human to read.** Say what the code cannot: the *why*, the invariant, the trap that made this shape necessary. Never restate what the line already says. A comment justifying a choice the code no longer contains is dead weight — state the current design, don't argue against the alternatives you rejected (that is what `docs/adr/` is for).
+3. **Documentation — simple, concise, easy for a human to read.** Lead with what is true now. One idea per sentence.
+
+The failure mode to watch for is a comment addressed to a *reviewer* — someone who just watched the reasoning — rather than to a reader opening the file cold. The tell is a comment that spends its length on the option **not** taken.
+
+A `UserPromptSubmit` hook (`scripts/writing-standards-hook.sh`, wired in `.claude/settings.json`) restates this at the start of every turn, since the rule has to be in mind *before* anything is composed. Keep the script's short form in sync with this section.
+
 ## Architecture
 
 Beehive is an embedded, Kubernetes-inspired control plane backed by a durable store.

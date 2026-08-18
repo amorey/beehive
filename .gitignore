@@ -1,6 +1,7 @@
 .worktrees
 
-# Claude Code per-machine settings. Shared config belongs in .claude/settings.json,
-# which stays tracked; the .local.json overlay is personal (permission grants for
-# one developer's throwaway commands) and must not follow the repo.
-.claude/settings.local.json
+# Claude Code state is per-machine by default: only .claude/settings.json is shared,
+# so the directory is ignored wholesale and that one file is re-admitted. The
+# .local.json overlay (one developer's permission grants) must not follow the repo.
+.claude/*
+!.claude/settings.json
