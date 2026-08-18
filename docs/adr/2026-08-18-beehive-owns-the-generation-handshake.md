@@ -32,11 +32,12 @@ controller could return a schedule beehive silently ignored.
 
 `Reconcile` returns one `ReconcileResult`, and beehive writes the handshake.
 
-- `Settled(d)` — the pass observed the object's current generation, which
-  beehive records. Not a claim of health, and no status write required.
-- `Unsettled(d)` — a real pass over an object not caught up. Nothing recorded.
-  `d == 0` re-dispatches at the work queue's per-object floor.
+- `Settled()` — the pass observed the object's current generation, which beehive
+  records. Not a claim of health, and no status write required.
+- `Unsettled()` — a real pass over an object not caught up. Nothing recorded.
 - `Fail(err)` — the backoff ladder, settling nothing.
+
+`RequeueAfter(d)` schedules the next pass, and `Err()` reads a failure back out.
 
 The discriminant's zero names no kind, so the zero value is detectable;
 `normalize` folds it and `Fail(nil)` into `Fail(ErrInvalidResult)` before
@@ -75,6 +76,64 @@ unsettled for the listing to re-derive — the same bargain the watermark write
 makes. Two errors are silent: a cancelled context is shutdown, and `ErrNotFound`
 is another kind's cascade collecting the row between the load and the stamp.
 
+### The delay is a method, and its zero means one thing
+
+`Settled` and `Unsettled` took the delay positionally, where `0` was the
+opposite instruction on each — nothing scheduled on one, a re-dispatch at the
+work queue's floor (1s) on the other. The spelling that read as "no opinion
+about scheduling" was, on `Unsettled`, a 1/s poll for as long as the condition
+held, which is exactly where `Unsettled` is the right answer: a pass deferring on
+something external. On a fleet waiting on one downed dependency, that is one
+dispatch per object per second.
+
+So the delay moved to `RequeueAfter(d)`, and an explicit zero means the same
+thing on both kinds — dispatch as soon as the floor allows. `requeueSet` is what
+separates that zero from a result with no opinion; the two are different
+schedules, so the state is not derivable from the duration alone. `RequeueAfter`
+never changes the kind, so `ReconcileResult{}.RequeueAfter(d)` is still the
+detectable zero value.
+
+**A bare `Unsettled()` schedules its own return**, at the owed pass's interval.
+It has to schedule *something*: `Objects().ListUnsettledIDs` gates on
+`observed_generation IS NULL OR observed_generation < generation`, so declining
+to stamp does not un-settle a row, and an already-converged object — woken by a
+dependency, say — that returns `Unsettled()` is in no listing and no other driver
+would come back for it. It follows `WithOwedPassInterval` rather than a constant
+of its own because it *is* that pass, extended to the objects whose generation
+its listing cannot see; `defaultUnsettledRequeue` stands in only when the pass is
+disabled.
+
+That interval is an upper bound, not a period. A pending floor alarm outranks it,
+and `alarmRequeueAfter` does not absorb an arriving add, so a wake landing inside
+the window dispatches on the floor's schedule —
+`TestReconcilerBareUnsettledYieldsToAPush` pins it. The alarm belongs to the pass
+that set it and nothing on the success path cancels one, so an object enqueued by
+the owed pass inside the window and then settling still takes one more pass when
+the alarm fires. Idempotent, and pre-existing for any `RequeueAfter`.
+
+`RequeueAfter` on a `Fail` is ignored: the switch tests `!succeeded()` first and
+the ladder owns the retry.
+
+### Err, and why there is no Unwrap
+
+`ReconcileResult.err` was unreachable outside the package, so a failure
+assertion downstream degraded to equality against the `Fail` the controller
+built — which pins the wrapping text into the test — and `errors.Is` on a
+sentinel was impossible for a controller wrapping another.
+
+`Err()` normalizes first, so a caller-side `Fail(nil)` or zero value reports the
+`ErrInvalidResult` beehive would record rather than a nil.
+
+**No `Unwrap`.** `errors.Is`/`errors.As` take an `error` and consult `Unwrap`
+only while walking a chain they were handed, so one here is unreachable unless
+`ReconcileResult` implements `error` — which would make `Settled()` a non-nil
+`error`. The assertion is `require.ErrorIs(t, res.Err(), sentinel)`.
+
+There is no `String` and no exported discriminant. Equality against `Settled()`
+is how a caller asserts the kind, and it prints the unexported `kind` as a
+number; that is a failure message rather than a capability, and an exported
+discriminant is the honest fix if it ever bites.
+
 ## Consequences
 
 Kept from the superseded record: byte-identical status writes are still skipped,
@@ -95,3 +154,8 @@ caller's. `ErrInvalidResult` replaces them.
 
 `ObservedAt` now moves only with the handshake, so it means exactly "when the
 object settled at `ObservedGeneration`". Still not a liveness signal.
+
+An object returning a bare `Unsettled()` whose generation really did move now
+carries two unsynchronised schedules at the owed pass's rate — the listing and
+its own alarm — so it costs roughly two dispatches per interval rather than one.
+Against `Unsettled(0)`'s 1/s at the default that is still a ~15× reduction.
