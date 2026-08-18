@@ -3,6 +3,7 @@ package beehivetest_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -242,4 +243,30 @@ func TestScoping(t *testing.T) {
 		err := c.UpdateStatus(ctx, beehive.ObjectID(9999), clusterStatus{})
 		assert.ErrorIs(t, err, beehive.ErrNotFound)
 	})
+
+	t.Run("deleting a condition is scoped the same way", func(t *testing.T) {
+		err := c.DeleteCondition(ctx, beehive.ObjectID(9999), "Ready")
+		assert.ErrorIs(t, err, beehive.ErrNotFound)
+	})
+}
+
+// unmarshalableStatus stands in for a Status a caller cannot serialise.
+type unmarshalableStatus struct{}
+
+func (unmarshalableStatus) MarshalJSON() ([]byte, error) {
+	return nil, errNoJSON
+}
+
+var errNoJSON = errors.New("this status does not marshal")
+
+func TestUpdateStatusReportsAMarshalFailure(t *testing.T) {
+	ctx := context.Background()
+	bh := newBeehive(t)
+	objects := beehive.NewClient[clusterSpec, unmarshalableStatus](bh, clusterGK)
+
+	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+
+	c := beehivetest.NewClient[unmarshalableStatus](bh, clusterGK)
+	assert.ErrorIs(t, c.UpdateStatus(ctx, obj.ID, unmarshalableStatus{}), errNoJSON)
 }
