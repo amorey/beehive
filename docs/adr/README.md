@@ -67,7 +67,7 @@ for the mapping.
 - [Name-keyed writes](2026-07-27-name-keyed-writes.md)
 - [Beehive owns the generation handshake](2026-08-18-beehive-owns-the-generation-handshake.md)
 - [A ControllerClient exists only for the pass it is handed to, and writes only that pass's object](2026-08-18-a-controller-client-exists-only-for-a-pass.md)
-- [A TestClient writes status and conditions outside a pass](2026-08-18-a-test-client-writes-status.md)
+- [An AdminClient writes outside a pass, for fixtures and for maintenance](2026-08-18-an-admin-client-writes-outside-a-pass.md)
 - [A downgraded liveness condition says so](2026-08-07-a-downgraded-liveness-condition-says-so.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)
 - [The schema is amended in place until release](2026-07-31-amend-the-schema-in-place-until-release.md)

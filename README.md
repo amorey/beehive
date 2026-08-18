@@ -782,16 +782,39 @@ A non-nil error triggers an automatic retry with exponential backoff starting at
 
 `Reconcile` takes an interface and the object it acts on, so the cheapest test calls it directly against a fake `ControllerClient` — no store and no beehive, and the assertion lands on what the pass *decided* rather than on what a row ended up holding. Assert a controller's own status writes this way.
 
-That stops covering a pass that reads *another kind's* status out of the store, because calling `Reconcile` directly leaves the read where it was. For that fixture, `TestClient` writes the columns only a controller can otherwise write:
+That stops covering a pass that reads *another kind's* status out of the store, because calling `Reconcile` directly leaves the read where it was. For that fixture, `AdminClient` writes what only a controller can otherwise write:
 
 ```go
-c := beehive.NewTestClient[ClusterStatus](bh, clusterGK)
+c := beehive.NewAdminClient[ClusterStatus](bh, clusterGK)
 require.NoError(t, c.UpdateStatus(ctx, cluster.ID, ClusterStatus{Server: ServerStatus{UID: "server-1"}}))
 ```
 
-It needs no registered controller and no running beehive, and carries `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition`. It keeps the `ObjectID` a `ControllerClient` no longer takes — a fixture writes for whatever object it is seeding — and builds a `ControllerClient` nothing ever ends, so each verb behaves exactly as it does during a pass — correct before `Start` and while beehive runs, though on a running beehive it races that object's own pass, last-writer-wins.
+→ [AdminClient](#adminclient) for the whole surface, which serves maintenance as well as fixtures.
 
-It never stamps `observed_generation`: the handshake stays beehive's, so an object given a fixture status is still unsettled and the owed pass will reconcile it once beehive starts. → [ADR](docs/adr/2026-08-18-a-test-client-writes-status.md)
+### AdminClient
+
+```go
+type AdminClient[Status any] interface {
+    AddDependency(ctx context.Context, fromID, toID ObjectID) error
+    AddEvent(ctx context.Context, id ObjectID, event EventSpec) error
+    DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
+    DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
+    DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
+    SetCondition(ctx context.Context, id ObjectID, condition Condition) error
+    SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
+    UpdateStatus(ctx context.Context, id ObjectID, status Status) error
+}
+```
+
+`AdminClient` writes what only a reconcile pass can otherwise write, for one kind, from outside a pass. It needs no registered controller and no running beehive, and every verb behaves exactly as it does during a pass — it builds a `ControllerClient` nothing ever ends, so there is one implementation of each write, not a parallel one.
+
+Two uses. A **test fixture**, as above. And **maintenance**: a data migration or backfill that has to set status or conditions, an object wedged by a finalizer nothing will clear, a stale `depends_on` edge holding its target against collection — for an edge whose source has no controller, this is the only way to drop it at all. Spec rewrites and deletes need nothing from here; `Client.Update` and `Client.Delete` already do those.
+
+**Run it with beehive stopped.** A write while beehive runs races that object's own pass and the later write wins, which for a fixture parking state is usually fine and for a migration is not. A write from a *second process* is [never supported](#scope-one-process-one-beehive-no-out-of-band-access), stopped or not — a migration runs in the app's own process, before `Start`.
+
+It is not for reconcile logic. A controller holds a `ControllerClient` bound to the object it was handed; reaching for this one inside `Reconcile` is how you get the sibling-write race the binding exists to remove. Nothing enforces that, the same way nothing enforces the single-writer rule.
+
+It never stamps `observed_generation`: the handshake stays beehive's, so an object written here is still unsettled and the owed pass reconciles it once beehive starts — which is what you want after a backfill. Every verb is scoped to the client's kind, and another kind's id is `ErrWrongKind`. → [ADR](docs/adr/2026-08-18-an-admin-client-writes-outside-a-pass.md)
 
 ### Migrator
 

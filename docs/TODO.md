@@ -427,6 +427,8 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   for a write that settles nothing. Binding the client then took the second half:
   a pass can no longer append to a *related* object's log either, so a controller
   that observes a child reports it on its own timeline or not at all.
+  `AdminClient.AddEvent` does not answer this: it is correct on a stopped
+  beehive, and a prober is running.
 
   The argument that took the client away does not reach `AddEvent`: an event
   bumps no `resource_version` and is invisible to the handshake, so an out-of-band
@@ -449,11 +451,13 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   edge (it is still fine as a target: the waker scans the whole write log). The
   drop binds the same way, so an edge left in a store by an earlier build, whose
   source is a client-only kind, cannot be removed through the package at all — it
-  pins its target against collection through the RESTRICT for good. What would
-  make this worth closing: a store that actually carries such an edge, or an
-  application that declares dependencies for objects it does not reconcile. The
-  fix is the same shape as the `AddEvent` one — id-keyed edge verbs on `Client` —
-  and runs into the same question about what `Client` may write.
+  pins its target against collection through the RESTRICT — until an operator
+  drops it with `AdminClient`, which is the answer for a wedged store but not for
+  an application. What would make this worth closing at the application level: a
+  caller that declares dependencies for objects it does not reconcile, on a
+  running beehive. The fix is the same shape as the `AddEvent` one — id-keyed
+  edge verbs on `Client` — and runs into the same question about what `Client`
+  may write.
 
 - **`HasIncomingEdges` has no `Client` counterpart.** The other four edge reads
   moved to the pass's own object with an id-keyed twin already on `Client`; this
