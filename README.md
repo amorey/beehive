@@ -66,11 +66,7 @@ func main() {
   defer store.Close()
 
   bh, _ := beehive.New(store)
-  // Register returns the kind's ControllerClient for status writes from outside
-  // a reconcile (background work belongs to the app, not beehive). It is the
-  // one to keep: the client Reconcile is passed stops working when that call
-  // returns. Ignore it if Reconcile is your only writer.
-  _, _ = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
+  _ = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
 
   stop, err := bh.Start(context.Background())
   if err != nil {
@@ -107,10 +103,10 @@ The reasoning behind each of these is recorded in [docs/adr](docs/adr/README.md)
 
 ```go
 func New(store Store, opts ...Option) (*Beehive, error)
-func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) (ControllerClient[Status], error)
+func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error
 ```
 
-`Register` returns the kind's `ControllerClient`, the status-write surface, so your application can write status from its own goroutines without beehive handing it over through a callback. Registering a controller is the only way to get one, which is what keeps status writes limited to the kind's owner.
+`Register` installs a controller and hands nothing back. The `ControllerClient` — the status-write surface — reaches you as a parameter of `Reconcile` and lives only for that call, which is what keeps a status write inside the pass that owns it.
 
 Where you pass an option decides its scope. `WithFullPassInterval` at `New` sets the default for every kind; at `Register` it overrides that one controller. An option a given call site doesn't recognize is ignored. `WithGCInterval` is global and therefore only meaningful at `New` — garbage collection covers kinds with no controller.
 
@@ -274,7 +270,7 @@ func EventDetail[T any](e Event) (T, error)
 
 `Detail` is sampled like `Message` — latest occurrence wins, and it is not part of the run key — so a payload that varies never splits a run. If you need every occurrence's payload, that event shouldn't aggregate: give it a unique `Reason`. Unlike `Spec` and `Status`, `Detail` is **not** schema-versioned, so reshaping it breaks decoding of older rows. That is tolerable only because retention ages events out; put a version inside the payload if you need more.
 
-Only controllers write events. `ControllerClient.AddEvent` is the only write path, because events are observations and, like `status`, have no user-facing writer. Reads live on `Client` (`ListEvents`, `WatchEvents`, `GetLatestEvent`), plus the eager `LoadEvents()` / `Object.Events()` pair, which gates on being loaded exactly like the secondary lookups and returns `ErrNotLoaded` otherwise.
+Only controllers write events, and only during a pass. `ControllerClient.AddEvent` is the only write path, because events are observations and, like `status`, have no user-facing writer. Reads live on `Client` (`ListEvents`, `WatchEvents`, `GetLatestEvent`), plus the eager `LoadEvents()` / `Object.Events()` pair, which gates on being loaded exactly like the secondary lookups and returns `ErrNotLoaded` otherwise.
 
 A connection-health panel renders one category's timeline directly — `client.ListEvents(ctx, id, WithEventCategory("connection"))` yields, newest first:
 
@@ -736,7 +732,7 @@ A pass that settles a *new* generation therefore costs two write-log entries whe
 
 `ObservedAt` records **when the object settled at `ObservedGeneration`**, not when the controller last ran — a pass returning `Unsettled` never moves it, so don't use it as a liveness check. For "when did we last look", record an event: `AddEvent` bumps the current run's `LastAt` every time.
 
-→ [ADR: beehive owns the generation handshake](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md), for why the stamp is the generation you were handed and why the in-memory gate is sound. → [ADR: the pass client dies with the pass](docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md)
+→ [ADR: beehive owns the generation handshake](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md), for why the stamp is the generation you were handed and why the in-memory gate is sound. → [ADR: a ControllerClient exists only for the pass it is handed to](docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md)
 
 `SetConditions` writes several conditions of one object as **one** write: they land in a single transaction under a single `resource_version` bump, so a watcher never sees a fresh `Connected` beside a stale `Healthy`, and a dependent is woken once for the pass rather than once per condition. Suppression stays per condition — the ones matching what is stored are not rewritten, so their `UpdatedAt` holds — and a batch where every condition matches writes nothing at all, exactly like a single `SetCondition` no-op. Naming a type twice in one call is refused with `ErrDuplicateConditionType` rather than resolved by slice order, and nothing in that batch is written. An empty slice writes nothing.
 
@@ -756,9 +752,9 @@ type Controller[Spec, Status any] interface {
 }
 ```
 
-A controller has **no lifecycle** in beehive. It implements `Reconcile` and nothing else, and receives the kind's `ControllerClient` as a parameter. Background work — timers, subscriptions, engines — belongs to your application, which already has its own lifecycle and can get a `ControllerClient` from `Register`. Beehive owns only the reconcile lifecycle: the work queue, backoff, the periodic drivers and shutdown ordering.
+A controller has **no lifecycle** in beehive. It implements `Reconcile` and nothing else, and receives the kind's `ControllerClient` as a parameter. Background work — timers, subscriptions, engines — belongs to your application, which already has its own lifecycle. Beehive owns only the reconcile lifecycle: the work queue, backoff, the periodic drivers and shutdown ordering.
 
-**The client you are passed is scoped to that one call.** Once `Reconcile` returns, every method on it fails with `ErrReconcileReturned`: a write arriving after the pass moves status with no pass behind it, which nothing re-derives. A goroutine outliving the pass should use the `ControllerClient` from `Register` — the application's, and unrestricted — or keep its result in memory and call `Client.Requeue`. It is a fail-fast, not a barrier: calls already in flight are not waited for.
+**The client you are passed is scoped to that one call**, and it is the only one there is. Once `Reconcile` returns, every method on it fails with `ErrReconcileReturned`: a write arriving after the pass moves status with no pass behind it, which nothing re-derives. A goroutine outliving the pass keeps its result in memory and calls `Client.Requeue`, which buys it a pass with a live client. It is a fail-fast, not a barrier: calls already in flight are not waited for. → [ADR](docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md)
 
 `Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed. The next pass works from the stored state, so write `Reconcile` to be idempotent. Each write is still atomic on its own, and the handshake covers a concurrent spec change racing the `obj` you were handed: beehive records the generation it gave you, so a newer one is left unobserved and the object reconciles again.
 

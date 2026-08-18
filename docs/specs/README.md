@@ -14,10 +14,7 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-In flight:
-[Register hands back nothing](2026-08-18-register-hands-back-nothing.md) — a
-`ControllerClient` exists only for the duration of one pass.
+No spec is in flight.
 
 The last spec shipped as
-[beehive owning the generation handshake](../adr/2026-08-18-beehive-owns-the-generation-handshake.md)
-and [the pass client dying with the pass](../adr/2026-08-18-the-pass-client-dies-with-the-pass.md).
+[a ControllerClient existing only for the pass it is handed to](../adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).

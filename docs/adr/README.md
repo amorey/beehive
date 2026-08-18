@@ -66,7 +66,7 @@ for the mapping.
 - [The id is the Client API's key; the name resolves through ByName siblings](2026-08-02-id-primary-key-with-byname-siblings.md)
 - [Name-keyed writes](2026-07-27-name-keyed-writes.md)
 - [Beehive owns the generation handshake](2026-08-18-beehive-owns-the-generation-handshake.md)
-- [The pass client dies with the pass](2026-08-18-the-pass-client-dies-with-the-pass.md)
+- [A ControllerClient exists only for the pass it is handed to](2026-08-18-a-controller-client-exists-only-for-a-pass.md)
 - [A downgraded liveness condition says so](2026-08-07-a-downgraded-liveness-condition-says-so.md)
 - [Schema-version migration](2026-07-27-schema-version-migration.md)
 - [The schema is amended in place until release](2026-07-31-amend-the-schema-in-place-until-release.md)

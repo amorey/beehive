@@ -346,12 +346,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `UpdateStatus` writes status alone, which is what leaves
   `Objects().SetObservedGeneration` the sole writer of that column.
   → [ADR](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md)
-- **The `ControllerClient` passed to `Reconcile` dies with the pass**, because
+- **A `ControllerClient` exists only for the pass it is handed to**, because
   beehive concludes a pass by stamping the generation it handed out. Every method
-  fails with `ErrReconcileReturned` once it returns. The client `Register` returns
-  is the application's and unrestricted — the documented home for background
-  writes. A fail-fast, not a barrier.
-  → [ADR](docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md)
+  fails with `ErrReconcileReturned` once `Reconcile` returns, and `Register` hands
+  back nothing, so there is no other way to hold one. A fail-fast, not a barrier.
+  An application that must write between passes keeps what it learned in memory
+  and calls `Client.Requeue`; appending to an event log out of band is the one
+  capability this removes rather than relocates (`docs/TODO.md`).
+  → [ADR](docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md)
 - **A downgraded liveness condition says so.** `downgradeLiveness` sets
   `Condition.Unconfirmed` beside the `Unknown` rewrite, because the predicate
   (`UpdatedAt` before `processStart`) is store-internal and a remote consumer
