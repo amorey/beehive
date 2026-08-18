@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1352,13 +1353,9 @@ func TestObservedGenerationStampWakesTheKindsWatches(t *testing.T) {
 	settle.Store(true)
 	require.NoError(t, client.Requeue(ctx, obj.ID))
 
-	select {
-	case ev := <-stream.Changes:
-		require.NotNil(t, ev.Object.ObservedGeneration)
-		assert.Equal(t, ev.Object.Generation, *ev.Object.ObservedGeneration)
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the stamp to wake the watch")
-	}
+	ev := recv(t, stream.Changes)
+	require.NotNil(t, ev.Object.ObservedGeneration)
+	assert.Equal(t, ev.Object.Generation, *ev.Object.ObservedGeneration)
 }
 
 // The client passed into Reconcile stops working when that call returns: a write
@@ -1533,6 +1530,18 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		{"Within", func(cc ControllerClient[cStatus]) error {
 			return cc.Within(ctx, func(context.Context) error { return nil })
 		}},
+	}
+
+	// The table is the surface, so pin it to the interface: a method added
+	// without a row here would go ungated and nothing else would fail.
+	iface := reflect.TypeFor[ControllerClient[cStatus]]()
+	named := make(map[string]bool, len(calls))
+	for _, c := range calls {
+		named[c.name] = true
+	}
+	require.Len(t, named, iface.NumMethod(), "every ControllerClient method needs a row")
+	for i := range iface.NumMethod() {
+		assert.True(t, named[iface.Method(i).Name], "ungated method missing from the table")
 	}
 
 	live := controllerClientFor[cStatus](bh, clientTestGK)

@@ -1257,7 +1257,7 @@ func registerNoop[Spec, Status any](t *testing.T, bh *Beehive, gk GroupKind) {
 // hands back. Identical to the value a pass is given, and live, so it exercises
 // the write surface but not the scoping — that belongs to the pass-client tests.
 func controllerClientFor[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
-	return &controllerClientImpl[Status]{bh: bh, gk: gk}
+	return newPassClient[Status](bh, gk)
 }
 
 // registerWithClient registers c for gk and returns the kind's client, standing

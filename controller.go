@@ -86,15 +86,21 @@ type ControllerClient[Status any] interface {
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
-// controllerClientImpl is the ControllerClient one Reconcile is handed: the
-// status-writing surface for a controller's kind, built per pass and refusing
-// everything once that pass ends. A fail-fast rather than a barrier — nothing
-// waits for calls already in flight.
+// controllerClientImpl is the ControllerClient one Reconcile is handed. It
+// refuses everything once the pass ends, and is a fail-fast rather than a
+// barrier: nothing waits for calls already in flight.
 // See docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md.
 type controllerClientImpl[Status any] struct {
 	bh   *Beehive
 	gk   GroupKind
 	done atomic.Bool
+}
+
+// newPassClient builds the client for one pass. The only constructor: tests
+// build the same value through it, so a per-pass field cannot appear in one
+// place and not the other.
+func newPassClient[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
+	return &controllerClientImpl[Status]{bh: bh, gk: gk}
 }
 
 // Called once, after Reconcile returns and before beehive's own writes.

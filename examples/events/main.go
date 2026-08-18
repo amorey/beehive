@@ -15,10 +15,10 @@
 //go:build ignore
 
 // Command events demonstrates the Events API with a cluster connection-health
-// panel. A "Cluster" resource is probed by its own controller: each reconcile
-// pass records one event per connection probe, and consecutive identical
-// outcomes coalesce into runs, so a flapping cluster produces the aggregated,
-// newest-first timeline a panel renders:
+// panel. A "Cluster" resource is probed by its own controller, which records one
+// event per connection outcome; consecutive identical outcomes coalesce into
+// runs, so a flapping cluster produces the aggregated, newest-first timeline a
+// panel renders:
 //
 //	Create(spec) -> reconcile AddEvent×N -> Client.WatchEvents -> render, then resume
 //
@@ -26,7 +26,9 @@
 package main
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -39,9 +41,20 @@ import (
 // ClusterGroupKind identifies the resource. Empty Group == core group.
 var ClusterGroupKind = beehive.GroupKind{Group: "kstack.sh", Kind: "Cluster"}
 
-// ClusterSpec is the desired state the user writes.
+// ClusterSpec is the desired state the user writes. Probes stands in for a real
+// endpoint: it is what the controller would observe if it dialled one.
 type ClusterSpec struct {
 	Endpoint string
+	Probes   []Probe
+}
+
+// Probe is one connection outcome, seen Count times in a row.
+type Probe struct {
+	Type    beehive.EventType `json:"type"`
+	Reason  string            `json:"reason"`
+	Message string            `json:"message,omitempty"`
+	Detail  *ProbeDetail      `json:"detail,omitempty"`
+	Count   int               `json:"count"`
 }
 
 // ClusterStatus is the observed state only the controller writes.
@@ -55,44 +68,60 @@ type ProbeDetail struct {
 	LatencyMs int    `json:"latencyMs"`
 }
 
-// probe is one scripted outcome, repeated n times.
-type probe struct {
-	typ     beehive.EventType
-	reason  string
-	message string
-	detail  any
-	n       int
-}
-
-// ClusterController reconciles a Cluster by probing its connection and recording
-// what it saw. Each pass consumes one scripted burst; a real prober would derive
-// the outcome from the endpoint, which is level-triggered as this script is not.
-type ClusterController struct {
-	bursts [][]probe
-	passes int
-	// Closed after the first burst commits. Events are written by a reconcile
-	// worker, so main needs to know when there is a panel to render.
-	probed chan struct{}
-}
+// ClusterController records what probing the cluster observed. Stateless and
+// level-triggered: it reads the outcomes from the spec it was handed, and the
+// handshake is what keeps a repeat pass from appending them twice.
+type ClusterController struct{}
 
 func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
-	if cc.passes >= len(cc.bursts) {
+	if settled(obj) {
 		return beehive.Settled(0)
 	}
-	for _, p := range cc.bursts[cc.passes] {
-		for range p.n {
-			if err := client.AddEvent(ctx, obj.ID, beehive.EventSpec{
-				Category: "connection", Type: p.typ, Reason: p.reason, Message: p.message, Detail: p.detail,
-			}); err != nil {
-				return beehive.Fail(err)
+	// One transaction for the burst: the store has a single write connection, so
+	// an event apiece would be an event's worth of commits.
+	err := client.Within(ctx, func(ctx context.Context) error {
+		for _, p := range obj.Spec.Probes {
+			var detail any
+			if p.Detail != nil {
+				detail = p.Detail
+			}
+			for range p.Count {
+				if err := client.AddEvent(ctx, obj.ID, beehive.EventSpec{
+					Category: "connection", Type: p.Type, Reason: p.Reason, Message: p.Message, Detail: detail,
+				}); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	cc.passes++
-	if cc.passes == 1 {
-		close(cc.probed)
+		return nil
+	})
+	if err != nil {
+		return beehive.Fail(err)
 	}
 	return beehive.Settled(0)
+}
+
+// settled reports whether this generation's events are already in the log:
+// beehive records the generation a Settled pass observed.
+func settled(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+	return obj.ObservedGeneration != nil && *obj.ObservedGeneration >= obj.Generation
+}
+
+// waitSettled blocks until id's controller has observed its current generation.
+// The checkpoint any consumer can wait on, and here it is what says the panel
+// below has something to render.
+func waitSettled(ctx context.Context, client beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID) {
+	stream, err := client.Watch(ctx, id)
+	exitOnErr(err)
+	if stream.Object != nil && settled(stream.Object) {
+		return
+	}
+	for change := range stream.Changes {
+		if change.Object != nil && settled(change.Object) {
+			return
+		}
+	}
+	exitOnErr(cmp.Or(stream.Err(), errors.New("the watch ended before the cluster settled")))
 }
 
 func exitOnErr(err error) {
@@ -109,21 +138,7 @@ func main() {
 	bh, err := beehive.New(store)
 	exitOnErr(err)
 
-	// A flapping connection, scripted: the first burst is the panel below, the
-	// second is the live probe the resumed watch reads.
-	ctrl := &ClusterController{
-		probed: make(chan struct{}),
-		bursts: [][]probe{{
-			{beehive.EventNormal, "Connected", "", nil, 16},
-			{beehive.EventWarning, "TLSHandshake", "x509: certificate expired", nil, 5},
-			{beehive.EventNormal, "Connected", "", nil, 7},
-			{beehive.EventWarning, "ProbeFailed", "i/o timeout", ProbeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}, 18},
-			{beehive.EventNormal, "Connected", "", nil, 4},
-		}, {
-			{beehive.EventWarning, "ProbeFailed", "i/o timeout", nil, 1},
-		}},
-	}
-	err = beehive.Register(bh, ClusterGroupKind, ctrl)
+	err = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())
@@ -133,14 +148,24 @@ func main() {
 	ctx := context.Background()
 	client := beehive.NewClient[ClusterSpec, ClusterStatus](bh, ClusterGroupKind)
 
-	cluster, err := client.Create(ctx, "primary", ClusterSpec{Endpoint: "10.0.0.1:443"})
+	// A flapping connection, as the controller would have observed it.
+	cluster, err := client.Create(ctx, "primary", ClusterSpec{
+		Endpoint: "10.0.0.1:443",
+		Probes: []Probe{
+			{Type: beehive.EventNormal, Reason: "Connected", Count: 16},
+			{Type: beehive.EventWarning, Reason: "TLSHandshake", Message: "x509: certificate expired", Count: 5},
+			{Type: beehive.EventNormal, Reason: "Connected", Count: 7},
+			{Type: beehive.EventWarning, Reason: "ProbeFailed", Message: "i/o timeout", Count: 18,
+				Detail: &ProbeDetail{Endpoint: "10.0.0.1:443", LatencyMs: 5000}},
+			{Type: beehive.EventNormal, Reason: "Connected", Count: 4},
+		},
+	})
 	exitOnErr(err)
 	fmt.Printf("created Cluster id=%d endpoint=%s\n\n", cluster.ID, cluster.Spec.Endpoint)
 
-	// The create schedules the pass that writes the events; beehive promises the
-	// pass, not when it runs. Waiting is this example's own business — without it
-	// the snapshot below is a snapshot of nothing.
-	<-ctrl.probed
+	// The events are written by the pass the create schedules, so wait for that
+	// pass to settle before reading a snapshot of them.
+	waitSettled(ctx, client, cluster.ID)
 
 	stream, err := client.WatchEvents(ctx, cluster.ID, beehive.WithEventCategory("connection"))
 	exitOnErr(err)
@@ -155,7 +180,11 @@ func main() {
 		beehive.WithEventsResumeFrom(stream.ResourceVersion))
 	exitOnErr(err)
 
-	exitOnErr(client.Requeue(ctx, cluster.ID))
+	_, err = client.Update(ctx, cluster.ID, ClusterSpec{
+		Endpoint: "10.0.0.1:443",
+		Probes:   []Probe{{Type: beehive.EventWarning, Reason: "ProbeFailed", Message: "i/o timeout", Count: 1}},
+	})
+	exitOnErr(err)
 	fmt.Println("\nlive, resumed above the snapshot:")
 	renderPanel([]beehive.Event{<-resumed.Events})
 }

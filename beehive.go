@@ -437,8 +437,8 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 }
 
 // Register installs controller c for the resource kind gk. It must be called
-// before Start, and only once per kind. A ControllerClient is handed to
-// Reconcile and lives only for that pass; there is no other way to hold one.
+// before Start, and only once per kind. The kind's ControllerClient reaches the
+// controller as a parameter of Reconcile.
 func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()

@@ -55,8 +55,7 @@ type typedController[Spec, Status any] struct {
 // stampObserved records raw's generation as observed, skipping the store call
 // when the loaded row already carries it. That gate stands in for the store's
 // clamp only while observed_generation is monotonic — keep
-// SetObservedGeneration its sole writer. Beehive's own write, made after the
-// pass client is dead, so it is not on that client.
+// SetObservedGeneration its sole writer.
 func (t *typedController[Spec, Status]) stampObserved(ctx context.Context, raw *RawObject) error {
 	if raw.ObservedGeneration != nil && *raw.ObservedGeneration >= raw.Generation {
 		return nil
@@ -65,8 +64,7 @@ func (t *typedController[Spec, Status]) stampObserved(ctx context.Context, raw *
 	if err != nil || !settled {
 		return err
 	}
-	// A stamp is a logged write like any other; forgetting the wake costs a
-	// watch its latency and nothing catches it.
+	// A logged write: the wake is not optional. See controllerClientImpl.wakeAfter.
 	t.bh.signalKindWritten(ctx, t.gk)
 	return nil
 }
@@ -121,7 +119,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
 	// Ended below, before beehive's own writes: nothing the controller captured
 	// may write past that point.
-	pass := &controllerClientImpl[Status]{bh: t.bh, gk: t.gk}
+	pass := newPassClient[Status](t.bh, t.gk)
 	// Normalized before any gate below reads it.
 	result := t.inner.Reconcile(ctx, pass, obj).normalize()
 	pass.end()
