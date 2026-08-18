@@ -3665,6 +3665,38 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 	})
 }
 
+// A bare Unsettled must schedule its own return: the unsettled listing gates on
+// the generation, so an object that declines to settle without having moved its
+// generation is in no listing and no other driver would come back for it.
+func TestReconcilerBareUnsettledSchedulesItself(t *testing.T) {
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			return Unsettled()
+		},
+	}
+	q := newWorkQueue()
+	r := &reconciler{adapter: adapter, work: q, backoffFor: make(map[ObjectID]time.Duration)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+	defer func() { cancel(); waitClosed(t, done, "run to exit") }()
+
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+	r.enqueue(1)
+
+	// The pass publishes a due-now and a dispatched-zero on the way; what proves
+	// the alarm is a schedule further out than the floor could ever be.
+	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer waitCancel()
+	for {
+		ev, err := rx.RecvContext(waitCtx)
+		require.NoError(t, err, "a bare Unsettled scheduled nothing further out than the floor")
+		if at := ev.Value.Schedule.NextRequeueAt; at.After(time.Now().Add(5 * time.Second)) {
+			break
+		}
+	}
+}
+
 // An unusable result takes the backoff ladder, never the success path — a
 // negative gate ("not a Fail") would let the zero value through. The adapter
 // normalizes first, so what arrives carries ErrInvalidResult and is logged.
