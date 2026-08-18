@@ -38,8 +38,10 @@ type Controller[Spec, Status any] interface {
 // ControllerClient is the write surface a controller uses to report observed
 // state. It writes only Status and metadata — never Spec, which the user owns.
 //
-// It lives for the one Reconcile it is passed to: afterwards every method
-// returns ErrReconcileReturned, and there is no other way to hold one.
+// It is bound to the object its Reconcile was handed and acts on that object
+// alone; the ids below are the other end of an edge. It lives for the one
+// Reconcile it is passed to: afterwards every method returns
+// ErrReconcileReturned, and there is no other way to hold one.
 type ControllerClient[Status any] interface {
 	// AddDependency records that fromID depends on toID, so beehive reconciles
 	// fromID again when toID changes. Every call that creates the edge records
@@ -78,7 +80,7 @@ type ControllerClient[Status any] interface {
 	// UpdateStatus records status and nothing else — the handshake is beehive's,
 	// recorded by returning Settled. Status that marshals to the stored bytes
 	// writes nothing, so a controller can report on every poll.
-	UpdateStatus(ctx context.Context, id ObjectID, status Status) error
+	UpdateStatus(ctx context.Context, status Status) error
 	// Within runs fn inside a single transaction: writes made with fn's ctx all
 	// commit together or roll back on error. Pass fn's ctx to every store call
 	// it makes — the store runs on one connection, so any other context
@@ -93,13 +95,14 @@ type ControllerClient[Status any] interface {
 type controllerClientImpl[Status any] struct {
 	bh   *Beehive
 	gk   GroupKind
+	id   ObjectID
 	done atomic.Bool
 }
 
 // newPassClient is the only constructor. The pass ends its client; TestClient
-// holds one that is never ended, so live() always passes there.
-func newPassClient[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
-	return &controllerClientImpl[Status]{bh: bh, gk: gk}
+// builds one per call and ends none, so live() always passes there.
+func newPassClient[Status any](bh *Beehive, gk GroupKind, id ObjectID) *controllerClientImpl[Status] {
+	return &controllerClientImpl[Status]{bh: bh, gk: gk, id: id}
 }
 
 // Called once, after Reconcile returns and before beehive's own writes.
@@ -135,7 +138,7 @@ func (c *controllerClientImpl[Status]) wakeAfter(ctx context.Context, err error)
 	return nil
 }
 
-func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
+func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, status Status) error {
 	if err := c.live(); err != nil {
 		return err
 	}
@@ -144,7 +147,7 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 		return err
 	}
 	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
-		ctx, c.gk, id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
+		ctx, c.gk, c.id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {

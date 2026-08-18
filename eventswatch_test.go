@@ -35,7 +35,7 @@ func TestWatchEventsSnapshotCarriesItsPosition(t *testing.T) {
 
 	_, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	stream, err := client.WatchEvents(ctx, obj.ID)
 	require.NoError(t, err)
@@ -43,7 +43,7 @@ func TestWatchEventsSnapshotCarriesItsPosition(t *testing.T) {
 	assert.Equal(t, "Probing", stream.Runs[0].Reason)
 	assert.Equal(t, stream.Runs[0].ResourceVersion, stream.ResourceVersion)
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
 	got := recv(t, stream.Events)
 	assert.Equal(t, "Connected", got.Reason, "only what the snapshot did not hold")
 	assert.Greater(t, got.ResourceVersion, stream.ResourceVersion)
@@ -63,11 +63,11 @@ func TestWatchEventsRedeliversAnExtendedRun(t *testing.T) {
 	require.Empty(t, stream.Runs, "an empty log snapshots empty")
 
 	probe := EventSpec{Type: EventWarning, Reason: "ProbeFailed"}
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, probe))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, probe))
 	first := recv(t, stream.Events)
 	assert.Equal(t, 1, first.Count)
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, probe))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, probe))
 	second := recv(t, stream.Events)
 	assert.Equal(t, first.ID, second.ID, "the same run, not a new one")
 	assert.Equal(t, 2, second.Count)
@@ -88,7 +88,7 @@ func TestWatchEventsDeliversAscending(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, reason := range []string{"R1", "R2", "R3"} {
-		require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
+		require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
 	}
 	var last int64
 	for _, want := range []string{"R1", "R2", "R3"} {
@@ -113,10 +113,10 @@ func TestWatchEventsFiltersTheTail(t *testing.T) {
 	require.NoError(t, err)
 
 	for range 3 {
-		require.NoError(t, cc.AddEvent(ctx, obj.ID,
+		require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID,
 			EventSpec{Category: "other", Type: EventNormal, Reason: "Noise"}))
 	}
-	require.NoError(t, cc.AddEvent(ctx, obj.ID,
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID,
 		EventSpec{Category: "probe", Type: EventNormal, Reason: "Connected"}))
 
 	got := recv(t, stream.Events)
@@ -131,14 +131,14 @@ func TestWatchEventsLimitBoundsTheSnapshotOnly(t *testing.T) {
 	_, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	for _, reason := range []string{"R1", "R2", "R3"} {
-		require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
+		require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
 	}
 
 	stream, err := client.WatchEvents(ctx, obj.ID, WithEventLimit(1))
 	require.NoError(t, err)
 	require.Len(t, stream.Runs, 1, "the newest run only")
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "R4"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "R4"}))
 	assert.Equal(t, "R4", recv(t, stream.Events).Reason, "the tail is not capped")
 }
 
@@ -150,13 +150,13 @@ func TestWatchEventsResumesFromAPosition(t *testing.T) {
 
 	_, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Seen"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Seen"}))
 
 	first, err := client.WatchEvents(ctx, obj.ID)
 	require.NoError(t, err)
 	checkpoint := first.ResourceVersion
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Missed"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Missed"}))
 
 	resumed, err := client.WatchEvents(ctx, obj.ID, WithEventsResumeFrom(checkpoint))
 	require.NoError(t, err)
@@ -173,7 +173,7 @@ func TestWatchEventsResumeAboveTheHeadIsRefused(t *testing.T) {
 
 	_, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	_, err := client.WatchEvents(ctx, obj.ID, WithEventsResumeFrom(1<<40))
 	assert.ErrorIs(t, err, ErrWatchTooNew)
@@ -194,8 +194,8 @@ func TestWatchEventsResumeBelowTheHorizonIsRefused(t *testing.T) {
 	require.NoError(t, err)
 	checkpoint := stream.ResourceVersion
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Old"}))
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Newer"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Old"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Newer"}))
 	_, err = store.Events().Sweep(ctx, 1, 0, 0) // "Old" goes, unread
 	require.NoError(t, err)
 
@@ -219,7 +219,7 @@ func TestWatchEventsHorizonIgnoresClientSideFilters(t *testing.T) {
 	checkpoint := stream.ResourceVersion
 
 	for _, reason := range []string{"Unwanted", "Newer"} {
-		require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
+		require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
 	}
 	_, err = store.Events().Sweep(ctx, 1, 0, 0) // "Unwanted" goes — a run this reader filtered out
 	require.NoError(t, err)
@@ -236,14 +236,14 @@ func TestWatchEventsHorizonIsPerTimeline(t *testing.T) {
 
 	store, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Category: "quiet", Type: EventNormal, Reason: "Q1"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Category: "quiet", Type: EventNormal, Reason: "Q1"}))
 
 	quiet, err := client.WatchEvents(ctx, obj.ID, WithEventCategory("quiet"))
 	require.NoError(t, err)
 	checkpoint := quiet.ResourceVersion
 
 	for _, reason := range []string{"C1", "C2"} {
-		require.NoError(t, cc.AddEvent(ctx, obj.ID,
+		require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID,
 			EventSpec{Category: "chatty", Type: EventNormal, Reason: reason}))
 	}
 	_, err = store.Events().Sweep(ctx, 1, 0, 0) // trims chatty's older run, quiet keeps its one
@@ -275,7 +275,7 @@ func TestWatchEventsWaitsForAnObjectThatDoesNotExistYet(t *testing.T) {
 
 	later := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
 	require.Equal(t, next, later.ID, "the store assigns ids in order")
-	require.NoError(t, cc.AddEvent(ctx, later.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
+	require.NoError(t, cc.at(later.ID).AddEvent(ctx, later.ID, EventSpec{Type: EventNormal, Reason: "Started"}))
 
 	assert.Equal(t, "Started", recv(t, stream.Events).Reason, "the stream picks the object up once it exists")
 }
@@ -288,14 +288,14 @@ func TestWatchEventsIsNotKindScoped(t *testing.T) {
 
 	_, bh, client, _ := watchFixture(t)
 	foreign, otherCC := foreignObject(t, ctx, bh)
-	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
+	require.NoError(t, otherCC.at(foreign).AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
 
 	stream, err := client.WatchEvents(ctx, foreign)
 	require.NoError(t, err)
 	require.Len(t, stream.Runs, 1, "the snapshot carries the foreign object's log")
 	assert.Equal(t, "Started", stream.Runs[0].Reason)
 
-	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, otherCC.at(foreign).AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Probing"}))
 	assert.Equal(t, "Probing", recv(t, stream.Events).Reason, "and what it grows by after")
 }
 
@@ -307,7 +307,7 @@ func TestTheEventReadsAgreeOnAForeignID(t *testing.T) {
 
 	_, bh, client, _ := watchFixture(t)
 	foreign, otherCC := foreignObject(t, ctx, bh)
-	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
+	require.NoError(t, otherCC.at(foreign).AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
 
 	runs, err := client.ListEvents(ctx, foreign)
 	require.NoError(t, err)
@@ -337,7 +337,7 @@ func TestWatchEventsResolvesAnIDCreatedAsAnotherKind(t *testing.T) {
 
 	foreign, otherCC := foreignObject(t, ctx, bh)
 	require.Equal(t, next, foreign, "the store assigns ids in order")
-	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
+	require.NoError(t, otherCC.at(foreign).AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Started"}))
 
 	assert.Equal(t, "Started", recv(t, stream.Events).Reason, "the stream resolves rather than ending")
 }
@@ -349,7 +349,7 @@ func TestWatchEventsEndsWhenAForeignObjectIsCollected(t *testing.T) {
 
 	store, bh, client, _ := watchFixture(t)
 	foreign, otherCC := foreignObject(t, ctx, bh)
-	require.NoError(t, otherCC.AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, otherCC.at(foreign).AddEvent(ctx, foreign, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	stream, err := client.WatchEvents(ctx, foreign)
 	require.NoError(t, err)
@@ -367,7 +367,7 @@ func TestWatchEventsEndsWhenTheObjectIsCollected(t *testing.T) {
 
 	store, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	stream, err := client.WatchEvents(ctx, obj.ID)
 	require.NoError(t, err)
@@ -392,13 +392,13 @@ func TestWatchEventsSurvivesReadFailures(t *testing.T) {
 	require.NoError(t, err)
 
 	store.eventsErr.Store(true)
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 	waitClosed(t, chanAfter(store.eventsFailed, 2), "passes while the log read fails")
 	store.eventsErr.Store(false)
 
 	// A failed page does not advance the cursor, so the run it missed is still
 	// owed: both arrive, oldest first.
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Recovered"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Recovered"}))
 	assert.Equal(t, "Probing", recv(t, stream.Events).Reason, "the run the failed read missed is not lost")
 	assert.Equal(t, "Recovered", recv(t, stream.Events).Reason, "the stream outlived the failure")
 	assert.Contains(t, buf.String(), "event watch step failed", "the retried passes are reported")
@@ -416,7 +416,7 @@ func TestWatchEventsAbandonsASendOnCancel(t *testing.T) {
 
 	// Nobody reads the stream. Waiting for the log read to return puts the
 	// cancellation after it and before the send, the only place left to observe it.
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 	waitClosed(t, chanAfter(store.eventsListed, 1), "the log read that found the run")
 	cancel()
 
@@ -455,7 +455,7 @@ func TestWatchEventsDeliversWithoutTicking(t *testing.T) {
 	stream, err := client.WatchEvents(ctx, obj.ID)
 	require.NoError(t, err)
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 	assert.Equal(t, "Probing", recv(t, stream.Events).Reason)
 }
 
@@ -473,7 +473,7 @@ func TestWatchEventsStreamsAreIndependent(t *testing.T) {
 	probes, err := client.WatchEvents(ctx, obj.ID, WithEventCategory("probe"))
 	require.NoError(t, err)
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID,
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID,
 		EventSpec{Category: "probe", Type: EventNormal, Reason: "Probing"}))
 	assert.Equal(t, "Probing", recv(t, all.Events).Reason)
 	assert.Equal(t, "Probing", recv(t, probes.Events).Reason)
@@ -482,7 +482,7 @@ func TestWatchEventsStreamsAreIndependent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "Probing", recv(t, resumed.Events).Reason, "the resume replays its own gap")
 
-	require.NoError(t, cc.AddEvent(ctx, obj.ID,
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID,
 		EventSpec{Category: "probe", Type: EventNormal, Reason: "Connected"}))
 	assert.Equal(t, "Connected", recv(t, all.Events).Reason, "the live streams carry on")
 	assert.Equal(t, "Connected", recv(t, probes.Events).Reason)
@@ -529,11 +529,11 @@ func TestWatchEventsResumeReportsTheRetentionBound(t *testing.T) {
 
 	_, _, client, cc := watchFixtureWith(t, WithEventRetention(20, time.Hour))
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	snap, err := client.WatchEvents(ctx, obj.ID)
 	require.NoError(t, err)
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Connected"}))
 
 	resumed, err := client.WatchEvents(ctx, obj.ID, WithEventsResumeFrom(snap.ResourceVersion))
 	require.NoError(t, err)
@@ -555,7 +555,7 @@ func TestWatchEventsKeepsAnUndeliveredRunOwed(t *testing.T) {
 
 	// Nobody reads the stream, so this run is read from the log but never
 	// delivered; cancelling after the read leaves the send abandoned.
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Undelivered"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Undelivered"}))
 	waitClosed(t, chanAfter(store.eventsListed, 1), "the log read that found the run")
 	cancel()
 	waitClosed(t, closedWhenDrained(stream.Events), "the abandoned stream to close")
@@ -584,7 +584,7 @@ func TestWatchEventsLeavesNothingBehind(t *testing.T) {
 
 	// The receiver went with it, so the hub has nobody to publish to. A leaked
 	// one would hold a filled slot and TestMain would report its goroutine.
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Unheard"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Unheard"}))
 	assert.NoError(t, bh.eventWriteHub.Send(obj.ID))
 }
 
@@ -597,7 +597,7 @@ func TestWatchEventsSinceAgreesAtSubMillisecond(t *testing.T) {
 
 	_, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	opened, err := client.WatchEvents(ctx, obj.ID)
 	require.NoError(t, err)
@@ -623,7 +623,7 @@ func TestWatchEventsReportsSubscribeReadFailures(t *testing.T) {
 
 	store, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	t.Run("existence probe", func(t *testing.T) {
 		store.metaErr.Store(true)
@@ -670,7 +670,7 @@ func TestWatchEventsEndsWhenRetentionPassesALiveStream(t *testing.T) {
 	// Forced rather than swept, so the horizon crosses this reader's cursor at a
 	// moment the test picks; the next wake is what makes it look.
 	store.forceEventTrimmed.Store(1 << 40)
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probing"}))
 
 	waitClosed(t, closedWhenDrained(stream.Events), "the stream to end below the horizon")
 	assert.ErrorIs(t, stream.Err(), ErrWatchTooOld)
@@ -709,7 +709,7 @@ func TestEventReaderPacesItsDrains(t *testing.T) {
 	_, bh, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	for _, reason := range []string{"R1", "R2"} {
-		require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
+		require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: reason}))
 	}
 
 	clk := &fakeClock{at: time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)}

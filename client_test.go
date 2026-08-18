@@ -841,8 +841,7 @@ func TestClientWithOnCreateFiresOnlyAfterOuterCommit(t *testing.T) {
 				var calls int
 				onCreate := WithOnCreate(func(context.Context) { calls++ })
 
-				cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
-				err = cc.Within(ctx, func(ctx context.Context) error {
+				err = bh.store.Within(ctx, func(ctx context.Context) error {
 					require.NoError(t, w.write(ctx, client, onCreate))
 					assert.Zero(t, calls, "onCreate must wait for the outer commit")
 					if !commit {
@@ -908,8 +907,8 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 				settleRow(t, ctx, store, clientTestGK, seeded.ID)
 				require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
-				cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
-				err = cc.Within(ctx, func(ctx context.Context) error {
+				cc := passClients[cStatus]{bh: bh, gk: clientTestGK}
+				err = cc.at(seeded.ID).Within(ctx, func(ctx context.Context) error {
 					require.NoError(t, w.write(ctx, client, seeded.ID))
 					if !commit {
 						return errBoom
@@ -974,8 +973,8 @@ func TestClientDeleteIsCollectableOnlyAfterOuterCommit(t *testing.T) {
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"}, WithFinalizers("test/hold"))
 
-		cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
-		err = cc.Within(ctx, func(ctx context.Context) error {
+		cc := passClients[cStatus]{bh: bh, gk: clientTestGK}
+		err = cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
 			require.NoError(t, client.Delete(ctx, obj.ID))
 			if !commit {
 				return errBoom
@@ -1705,7 +1704,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 	require.Len(t, stream.Objects, 1)
 	assert.Equal(t, obj.ID, stream.Objects[0].ID)
 
-	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
+	require.NoError(t, cc.at(obj.ID).UpdateStatus(ctx, cStatus{Val: "done"}))
 
 	evt := recv(t, stream.Changes)
 	assert.Equal(t, Modified, evt.Type)
@@ -2762,7 +2761,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	// The prober emits one event per probe; identical consecutive outcomes coalesce.
 	emit := func(typ EventType, reason, msg string, detail any, n int) {
 		for i := 0; i < n; i++ {
-			require.NoError(t, cc.AddEvent(ctx, cluster.ID, EventSpec{
+			require.NoError(t, cc.at(cluster.ID).AddEvent(ctx, cluster.ID, EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: msg, Detail: detail,
 			}))
 		}
@@ -3225,7 +3224,7 @@ func TestGenerateNamePanicsRatherThanReturningTheNilUUID(t *testing.T) {
 // Register builds the work queue, so an enqueue is observable with no driver
 // running at all — which is the point: these tests assert that the *write* queued
 // the object, not that some pass later found it.
-func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], *controllerClientImpl[cStatus], *reconciler) {
+func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], passClients[cStatus], *reconciler) {
 	t.Helper()
 	bh := newTestBeehive(t, newClientTestStore(t))
 	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
@@ -3235,9 +3234,9 @@ func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], *controll
 // settle records the object's generation as observed and empties the queue, so a
 // following step starts from a row that owes nothing. These tests need a settled
 // row without running a reconcile loop to get one.
-func settle(t *testing.T, ctx context.Context, cc *controllerClientImpl[cStatus], r *reconciler, obj *Object[cSpec, cStatus]) {
+func settle(t *testing.T, ctx context.Context, cc passClients[cStatus], r *reconciler, obj *Object[cSpec, cStatus]) {
 	t.Helper()
-	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
+	require.NoError(t, cc.at(obj.ID).UpdateStatus(ctx, cStatus{Val: "done"}))
 	_, err := cc.bh.store.Objects().SetObservedGeneration(ctx, clientTestGK, obj.ID, obj.Generation)
 	require.NoError(t, err)
 	drainQueue(r.work)
@@ -3367,7 +3366,7 @@ func TestDeleteRequestPushesTheBlockedTarget(t *testing.T) {
 	_, client, cc, r := specWriteFixture(t)
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	drainQueue(r.work)
 
@@ -3383,7 +3382,7 @@ func TestDeleteByNamePushesTheBlockedTarget(t *testing.T) {
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	name := uniqueName()
 	dependent := mustCreate(t, ctx, client, name, cSpec{Val: "dependent"})
-	require.NoError(t, cc.AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	drainQueue(r.work)
 
@@ -3398,7 +3397,7 @@ func TestDeleteRequestPushesNoLiveTarget(t *testing.T) {
 	_, client, cc, r := specWriteFixture(t)
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
 	drainQueue(r.work)
 
 	require.NoError(t, client.Delete(ctx, dependent.ID))
@@ -3425,7 +3424,7 @@ func TestRepeatedDeleteRequestPushesOnce(t *testing.T) {
 	_, client, cc, r := specWriteFixture(t)
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	require.NoError(t, client.Delete(ctx, dependent.ID))
 	drainQueue(r.work)
@@ -3460,7 +3459,7 @@ func TestSpecWriteEnqueuesNothingOnRollback(t *testing.T) {
 		settle(t, ctx, cc, r, obj)
 
 		errRollback := errors.New("rollback")
-		err := cc.Within(ctx, func(ctx context.Context) error {
+		err := cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
 			if _, err := client.Update(ctx, obj.ID, cSpec{Val: "b"}); err != nil {
 				return err
 			}
@@ -3509,12 +3508,12 @@ func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
-	require.NoError(t, cc.Within(ctx, func(ctx context.Context) error {
+	require.NoError(t, cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
 		updated, err := client.Update(ctx, obj.ID, cSpec{Val: "b"})
 		if err != nil {
 			return err
 		}
-		if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
+		if err := cc.at(obj.ID).UpdateStatus(ctx, cStatus{Val: "done"}); err != nil {
 			return err
 		}
 		// Settling is beehive's write, so reach the store directly.
