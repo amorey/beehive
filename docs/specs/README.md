@@ -14,7 +14,10 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-No spec is in flight.
+## In flight
+
+- [Reconcile returns one value, and beehive stamps observed_generation](2026-08-18-reconcile-returns-one-value.md)
+  — tracked in [#110](https://github.com/amorey/beehive/issues/110).
 
 The last spec shipped as
 [the event reads taking an id](../adr/2026-08-13-the-event-reads-take-an-id.md).
