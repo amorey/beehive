@@ -3664,15 +3664,18 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 }
 
 // An unusable result is a failure: the backoff ladder, never the success path.
-// A negative gate ("not a Fail") would let the zero value through here.
+// A negative gate ("not a Fail") would let the zero value through here. The
+// adapter normalizes before the worker sees it, so what arrives is the
+// synthesized ErrInvalidResult, which is logged at Error rather than absorbed.
 func TestReconcilerTreatsAnUnusableResultAsAFailure(t *testing.T) {
+	logger, logged := loggerSignallingOn("controller returned an unusable result")
 	calls := 0
 	doneCh := make(chan struct{})
 	adapter := &fakeAdapter{
 		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
 			calls++
 			if calls == 1 {
-				return ReconcileResult{}
+				return ReconcileResult{}.normalize()
 			}
 			close(doneCh)
 			return Settled(0)
@@ -3684,14 +3687,41 @@ func TestReconcilerTreatsAnUnusableResultAsAFailure(t *testing.T) {
 		maxRetryInterval:  time.Second,
 		baseRetryInterval: 5 * time.Millisecond,
 		backoffFor:        make(map[ObjectID]time.Duration),
+		logger:            logger,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := runInBackground(r, ctx)
 
 	r.enqueue(1)
+	waitClosed(t, logged, "the unusable result to be logged at Error")
 	waitClosed(t, doneCh, "the backoff retry after an unusable result")
 	cancel()
 	waitClosed(t, done, "run to exit")
+}
+
+// A controller returning the zero value is normalized at the adapter boundary,
+// so the failure the worker acts on carries ErrInvalidResult and nothing is
+// settled. Pins that normalize runs before any gate reads the result.
+func TestReconcileNormalizesAnUnusableControllerReturn(t *testing.T) {
+	ctx := context.Background()
+	s := newClientTestStore(t)
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	obj, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
+	require.NoError(t, err)
+
+	tc, inner := newSyncController(s)
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+		return ReconcileResult{}
+	}
+	result, _, err := reconcilePass(tc, ctx, obj.ID)
+	require.ErrorIs(t, err, ErrInvalidResult)
+	assert.False(t, result.succeeded())
+
+	got, err := s.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.ObservedGeneration, "an unusable result settles nothing")
 }
 
 // A Settled pass records the generation beehive handed to Reconcile, never a

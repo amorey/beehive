@@ -1466,3 +1466,68 @@ func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
 		assert.ErrorIs(t, err, ErrReconcileReturned, "the only failure a late call may take")
 	}
 }
+
+// Every method of the pass client, in both states: it delegates while the pass
+// runs, and refuses once it has ended. Table-driven over the whole surface
+// because the rule is the surface — a method added to ControllerClient without
+// a gate here is the failure this pins.
+func TestPassClientGatesEveryMethod(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dep"})
+
+	calls := []struct {
+		name string
+		call func(cc ControllerClient[cStatus]) error
+	}{
+		{"AddDependency", func(cc ControllerClient[cStatus]) error { return cc.AddDependency(ctx, dep.ID, obj.ID) }},
+		{"AddEvent", func(cc ControllerClient[cStatus]) error {
+			return cc.AddEvent(ctx, obj.ID, EventSpec{Category: "lifecycle", Reason: "Probed"})
+		}},
+		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, obj.ID, "Synced") }},
+		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, dep.ID, obj.ID) }},
+		{"DeleteFinalizer", func(cc ControllerClient[cStatus]) error {
+			return cc.DeleteFinalizer(ctx, obj.ID, "kstack.sh/none")
+		}},
+		{"GetOwner", func(cc ControllerClient[cStatus]) error { _, _, err := cc.GetOwner(ctx, obj.ID); return err }},
+		{"HasIncomingEdges", func(cc ControllerClient[cStatus]) error { _, err := cc.HasIncomingEdges(ctx, owner.ID); return err }},
+		{"ListDependencies", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependencies(ctx, dep.ID); return err }},
+		{"ListDependents", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependents(ctx, obj.ID); return err }},
+		{"ListOwned", func(cc ControllerClient[cStatus]) error { _, err := cc.ListOwned(ctx, owner.ID); return err }},
+		{"SetCondition", func(cc ControllerClient[cStatus]) error {
+			return cc.SetCondition(ctx, obj.ID, Condition{Type: "Synced", Status: ConditionTrue})
+		}},
+		{"SetConditions", func(cc ControllerClient[cStatus]) error {
+			return cc.SetConditions(ctx, obj.ID, []Condition{{Type: "Ready", Status: ConditionTrue}})
+		}},
+		{"UpdateStatus", func(cc ControllerClient[cStatus]) error { return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "v"}) }},
+		{"Within", func(cc ControllerClient[cStatus]) error {
+			return cc.Within(ctx, func(context.Context) error { return nil })
+		}},
+	}
+
+	inner := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+	live := &scopedControllerClient[cStatus]{inner: inner}
+	for _, c := range calls {
+		t.Run(c.name+" delegates while the pass runs", func(t *testing.T) {
+			// The call reaching inner is the assertion; whether inner likes the
+			// arguments is not this test's business.
+			assert.NotErrorIs(t, c.call(live), ErrReconcileReturned)
+		})
+	}
+
+	ended := &scopedControllerClient[cStatus]{inner: inner}
+	ended.end()
+	for _, c := range calls {
+		t.Run(c.name+" refuses once the pass has ended", func(t *testing.T) {
+			assert.ErrorIs(t, c.call(ended), ErrReconcileReturned)
+		})
+	}
+}
