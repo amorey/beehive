@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/amorey/beehive"
 	"github.com/amorey/beehive/beehivetest"
@@ -99,4 +100,42 @@ func TestUpdateStatusStampsTheMigratorsVersion(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "server-1", got.Status.Server.UID)
+}
+
+func TestUpdateStatusWakesTheWatch(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// No controller: a reconcile pass stamping the generation would wake the
+	// tailer itself, and this test is about the fixture write's own wake.
+	bh := newBeehive(t)
+	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = stop(context.Background()) })
+
+	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+
+	stream, err := objects.WatchList(ctx)
+	require.NoError(t, err)
+
+	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
+	require.NoError(t, c.UpdateStatus(ctx, obj.ID, clusterStatus{Server: serverStatus{UID: "server-1"}}))
+
+	// The watch floor is 30s, so without a commit wake this times out rather
+	// than arriving late.
+	for {
+		select {
+		case change, ok := <-stream.Changes:
+			require.True(t, ok, "stream closed: %v", stream.Err())
+			if change.Object != nil && change.Object.Status != nil {
+				assert.Equal(t, "server-1", change.Object.Status.Server.UID)
+				return
+			}
+		case <-ctx.Done():
+			t.Fatal("no change delivered: the write did not wake the tailer")
+		}
+	}
 }
