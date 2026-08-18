@@ -56,7 +56,7 @@ type ControllerClient[Status any] interface {
 	AddEvent(ctx context.Context, event EventSpec) error
 	DeleteCondition(ctx context.Context, conditionType string) error
 	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
-	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
+	DeleteFinalizer(ctx context.Context, finalizer string) error
 	// GetOwner returns id's owner, if any. ok is false with a nil error when the
 	// object has no owner.
 	GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
@@ -209,16 +209,16 @@ func (c *controllerClientImpl[Status]) AddEvent(ctx context.Context, event Event
 // Clearing the last finalizer on a deleting row pushes the collect it unblocks;
 // gcCollect still re-checks the RESTRICT block. See
 // docs/adr/2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md.
-func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error {
+func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, finalizer string) error {
 	if err := c.live(); err != nil {
 		return err
 	}
-	clearedLast, err := c.bh.store.Objects().DeleteFinalizer(ctx, c.gk, id, finalizer)
+	clearedLast, err := c.bh.store.Objects().DeleteFinalizer(ctx, c.gk, c.id, finalizer)
 	if err := c.wakeAfter(ctx, err); err != nil {
 		return err
 	}
 	if clearedLast {
-		c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
+		c.bh.signalRequeueNow(ctx, ObjectRef{ID: c.id, Group: c.gk.Group, Kind: c.gk.Kind})
 	}
 	return nil
 }

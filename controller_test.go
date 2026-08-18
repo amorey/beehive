@@ -43,7 +43,7 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"}, WithFinalizers("a", "b"))
 
-	require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, obj.ID, "a"))
+	require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, "a"))
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, got.Finalizers, "finalizer removed via ControllerClient")
@@ -59,7 +59,7 @@ func TestDeleteFinalizerPushesTheCollect(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, obj.ID))
 	drainQueue(r.work)
 
-	require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, obj.ID, "f"))
+	require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, "f"))
 	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
 }
 
@@ -87,7 +87,7 @@ func TestDeleteFinalizerPushesNothingOtherwise(t *testing.T) {
 			}
 			drainQueue(r.work)
 
-			require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, obj.ID, tt.remove))
+			require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, tt.remove))
 			assert.Empty(t, queuedIDs(r.work))
 		})
 	}
@@ -106,7 +106,7 @@ func TestDeleteFinalizerPushesNothingWhenRolledBack(t *testing.T) {
 
 	require.NoError(t, cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
 		err := cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
-			require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, obj.ID, "f"))
+			require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, "f"))
 			return errBoom
 		})
 		require.ErrorIs(t, err, errBoom)
@@ -134,7 +134,7 @@ func TestDeleteFinalizerPushesNothingOnWrongKind(t *testing.T) {
 	require.NoError(t, gadgets.Delete(ctx, gadget.ID))
 	drainQueue(gadgetR.work)
 
-	require.ErrorIs(t, cc.at(gadget.ID).DeleteFinalizer(ctx, gadget.ID, "f"), ErrWrongKind)
+	require.ErrorIs(t, cc.at(gadget.ID).DeleteFinalizer(ctx, "f"), ErrWrongKind)
 	assert.Empty(t, queuedIDs(gadgetR.work))
 }
 
@@ -287,6 +287,27 @@ func TestPassClientBindsThePassObject(t *testing.T) {
 	run, err := bh.store.Events().GetLatest(ctx, sibling.ID, "c")
 	require.NoError(t, err)
 	assert.Nil(t, run, "the sibling's event log too")
+}
+
+// TestDeleteFinalizerTargetsThePassObject pins both halves of the bound write:
+// the finalizer leaves the pass's object, and the collect its removal unblocks
+// is pushed for that object.
+func TestDeleteFinalizerTargetsThePassObject(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"}, WithFinalizers("f"))
+	sibling := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"}, WithFinalizers("f"))
+	require.NoError(t, client.Delete(ctx, obj.ID))
+	require.NoError(t, client.Delete(ctx, sibling.ID))
+	drainQueue(r.work)
+
+	require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, "f"))
+
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "only the pass's object is pushed")
+	got, err := client.Get(ctx, sibling.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"f"}, got.Finalizers, "a sibling keeps its finalizer")
 }
 
 // TestControllerClientWithin verifies the opt-in atomicity surface: writes made
@@ -1069,7 +1090,7 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	require.ErrorIs(t, cc.at(gadget.ID).UpdateStatus(ctx, cStatus{Val: "hijacked"}), ErrWrongKind)
 	require.ErrorIs(t, cc.at(gadget.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}), ErrWrongKind)
 	require.ErrorIs(t, cc.at(gadget.ID).DeleteCondition(ctx, "Ready"), ErrWrongKind)
-	require.ErrorIs(t, cc.at(gadget.ID).DeleteFinalizer(ctx, gadget.ID, "f"), ErrWrongKind)
+	require.ErrorIs(t, cc.at(gadget.ID).DeleteFinalizer(ctx, "f"), ErrWrongKind)
 
 	// The Gadget is untouched: no status, no conditions, finalizer intact.
 	got, err := gadgets.Get(ctx, gadget.ID)
@@ -1543,7 +1564,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, "Synced") }},
 		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, dep.ID, obj.ID) }},
 		{"DeleteFinalizer", func(cc ControllerClient[cStatus]) error {
-			return cc.DeleteFinalizer(ctx, obj.ID, "kstack.sh/none")
+			return cc.DeleteFinalizer(ctx, "kstack.sh/none")
 		}},
 		{"GetOwner", func(cc ControllerClient[cStatus]) error { _, _, err := cc.GetOwner(ctx, obj.ID); return err }},
 		{"HasIncomingEdges", func(cc ControllerClient[cStatus]) error { _, err := cc.HasIncomingEdges(ctx, owner.ID); return err }},

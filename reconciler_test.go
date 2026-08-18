@@ -1949,7 +1949,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 		gk: clientTestGK,
 		bh: bh,
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			if err := cc.DeleteFinalizer(ctx, obj.ID, "f"); err != nil {
+			if err := cc.DeleteFinalizer(ctx, "f"); err != nil {
 				return Fail(err)
 			}
 			return Fail(errBoom)
@@ -2021,7 +2021,7 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 		c.deleted.fire()
 		// Clear the finalizer so GC can collect the row now that the deletion has
 		// been observed (idempotent: re-clearing a gone finalizer is a no-op).
-		if err := client.DeleteFinalizer(ctx, obj.ID, deletionTrackingFinalizer); err != nil {
+		if err := client.DeleteFinalizer(ctx, deletionTrackingFinalizer); err != nil {
 			return Fail(err)
 		}
 		return Settled()

@@ -1464,7 +1464,7 @@ func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 			name:  "finalizer clear",
 			setup: create("finalizer", WithFinalizers("f")),
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.at(id).DeleteFinalizer(ctx, id, "f"))
+				require.NoError(t, w.ctrl.at(id).DeleteFinalizer(ctx, "f"))
 			},
 		},
 		{
