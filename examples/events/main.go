@@ -58,8 +58,11 @@ type Probe struct {
 }
 
 // ClusterStatus is the observed state only the controller writes.
+// ProbedGeneration is what makes the probe run once: it is written in the same
+// transaction as the events, so a repeat pass can tell they are already logged.
 type ClusterStatus struct {
-	Reachable bool
+	Reachable        bool
+	ProbedGeneration int64
 }
 
 // ProbeDetail is the structured payload a failure event carries.
@@ -69,16 +72,24 @@ type ProbeDetail struct {
 }
 
 // ClusterController records what probing the cluster observed. Stateless and
-// level-triggered: it reads the outcomes from the spec it was handed, and the
-// handshake is what keeps a repeat pass from appending them twice.
+// level-triggered: it reads the outcomes from the spec it was handed, and it
+// reads its own status to tell whether it has already logged them.
 type ClusterController struct{}
 
 func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
-	if settled(obj) {
+	if probed(obj) {
 		return beehive.Settled(0)
 	}
-	// One transaction for the burst: the store has a single write connection, so
-	// an event apiece would be an event's worth of commits.
+	// The events and the record that they were written commit together, so a
+	// pass that runs again — after a crash, or after a failure beehive retries —
+	// finds them logged instead of appending a second copy. The generation
+	// handshake cannot serve here: beehive stamps it after the pass, outside
+	// this transaction and only on a best effort.
+	//
+	// One transaction also costs one commit, where an event apiece would hold
+	// the store's single write connection for fifty.
+	reachable := len(obj.Spec.Probes) > 0 &&
+		obj.Spec.Probes[len(obj.Spec.Probes)-1].Type == beehive.EventNormal
 	err := client.Within(ctx, func(ctx context.Context) error {
 		for _, p := range obj.Spec.Probes {
 			var detail any
@@ -93,7 +104,10 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
 				}
 			}
 		}
-		return nil
+		return client.UpdateStatus(ctx, obj.ID, ClusterStatus{
+			Reachable:        reachable,
+			ProbedGeneration: obj.Generation,
+		})
 	})
 	if err != nil {
 		return beehive.Fail(err)
@@ -101,8 +115,12 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
 	return beehive.Settled(0)
 }
 
-// settled reports whether this generation's events are already in the log:
-// beehive records the generation a Settled pass observed.
+// probed reports whether this generation's events are already in the log.
+func probed(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
+	return obj.Status != nil && obj.Status.ProbedGeneration >= obj.Generation
+}
+
+// settled reports whether beehive has recorded the generation a pass observed.
 func settled(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
 	return obj.ObservedGeneration != nil && *obj.ObservedGeneration >= obj.Generation
 }
