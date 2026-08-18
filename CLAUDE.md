@@ -327,14 +327,27 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **The schema is amended in place until the first release**: `sqlite/migrations/`
   holds exactly one file, and `TestTheSchemaIsOneMigration` is the tripwire.
   → [ADR](docs/adr/2026-07-31-amend-the-schema-in-place-until-release.md)
-- **The generation handshake.** `Generation` increments on every real spec
-  change; `ObservedGeneration` records what the controller last settled.
-  Byte-identical writes are skipped (except that `UpdateStatus` still advances
-  `observed_generation`), which is what stops a controller re-applying its own
-  spec from waking itself forever. **`SetObservedGeneration` settles without
-  writing status**, for a controller whose whole report is conditions, and
-  clamps unconditionally — which also bounds it to one write per generation.
-  → [ADR](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md)
+- **The generation handshake is beehive's write, not the controller's.**
+  `Generation` increments on every real spec change; `ObservedGeneration` records
+  what the controller last settled. Byte-identical writes are skipped, which is
+  what stops a controller re-applying its own spec from waking itself forever.
+  `Reconcile` returns `Settled`/`Unsettled`/`Fail` and beehive stamps
+  `observed_generation` from **the object it handed out**, never a fresh read —
+  a spec change landing mid-pass must stay unobserved or nothing reconciles it
+  again. The stamp is gated in memory on the loaded value, so a converged pass
+  makes no store call; that gate is equivalent to the store's clamp **only
+  because `observed_generation` is monotonic**, which holds because
+  `advanceObserved` is its sole writer. `UpdateStatus` writes status alone. The
+  stamp lands after the dependency watermark and before GC, and a failure only
+  leaves the object unsettled.
+  → [ADR](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md)
+- **The `ControllerClient` passed to `Reconcile` dies with the pass.** Every
+  method fails with `ErrReconcileReturned` once it returns, because beehive
+  concludes a pass by stamping the generation it handed out. The client
+  `Register` returns is the application's and is unrestricted — that is the
+  documented home for background writes. A fail-fast, not a barrier: nothing
+  waits for calls already in flight.
+  → [ADR](docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md)
 - **A downgraded liveness condition says so.** `downgradeLiveness` sets
   `Condition.Unconfirmed` beside the `Unknown` rewrite, because the predicate
   (`UpdatedAt` before `processStart`) is store-internal and a remote consumer

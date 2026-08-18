@@ -48,7 +48,7 @@ both defects rather than style differences.
 **Gating on "the caller called `Update`" would enqueue a byte-identical write.** The
 store skips such a write entirely, and that skip is what stops a controller
 re-applying its own spec from waking itself forever (see
-[the generation-handshake ADR](2026-07-27-generation-handshake-and-noop-writes.md)).
+[the generation-handshake ADR](2026-08-18-beehive-owns-the-generation-handshake.md)).
 
 **Gating on the row being unsettled has the same defect by a longer route, and this
 one was shipped and then fixed.** A failing reconcile never settles the row, so every

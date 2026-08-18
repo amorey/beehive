@@ -709,14 +709,14 @@ failed while servicing a wake keeps its `reconcile_owed` count, because
 `ReconcileOwed().Decrement` runs only on success, which is case 5. A retry for a
 *settled* object with neither record has nothing to recover it.
 
-### 13. `Result.RequeueAfter`
+### 13. A result's requeue delay
 
-`runWorker` calls `workQueue.addAfter`.
+`runWorker` calls `workQueue.addAfter` for `Settled(d)`/`Unsettled(d)` with `d > 0`.
 
 A chain of these on a settled object is the one case with no durable record at all.
 It does not survive a restart, and no driver brings it back. **This is accepted, not
-planned work: beehive will not add a durable form of `RequeueAfter`.** A
-`RequeueAfter` chain is a controller's private timer, not a fact about the object,
+planned work: beehive will not add a durable form of it.** A
+chain of them is a controller's private timer, not a fact about the object,
 and persisting it would mean a row per poll on the single connection —
 exactly the cost `reconcile_owed` exists to avoid. See [`TODO.md`](TODO.md) for the
 full reasoning. The open question left there is narrower: whether a self-polling
@@ -725,6 +725,34 @@ controller should be written this way at all, or should own its own ticker and c
 
 Tests: `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfterNewestWins`,
 `TestTypedControllerReconcileDropsRequeueWhenCollected`.
+
+### 13b. `Unsettled(0)`
+
+`runWorker` calls `workQueue.add`, so the per-object floor
+(`defaultMinRequeueInterval`, 1s) paces it. It is the return for a pass that can
+make progress as soon as it is called again; a pass waiting on something external
+should return a delay instead, or it polls at the floor forever.
+
+Like the delay above it carries no durable record, and the same reasoning applies:
+what recovers such an object across a restart is that an `Unsettled` pass stamps no
+generation, so the unsettled listing (section A) still holds it.
+
+Tests: `TestReconcilerSchedulesFromTheResultKind`.
+
+### 13c. Beehive's generation stamp
+
+Not a trigger but a write, and it belongs on this map because it is new traffic:
+`typedController.reconcile` calls `Objects().SetObservedGeneration` after a
+`Settled` pass, which appends a write-log entry and wakes the kind's tailers and
+the dependency waker. A settling status write therefore costs **two** entries where
+it once cost one — the status write and the stamp.
+
+It is bounded by the in-memory gate: only a pass that settles a *new* generation
+writes at all, so a converged object re-reporting the same status costs no entry
+and no transaction.
+
+Tests: `TestReconcileStampsTheGenerationItHandedOut`,
+`TestReconcileConvergedPassMakesNoStampCall`.
 
 ### 14. Failure backoff
 
