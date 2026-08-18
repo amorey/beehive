@@ -185,3 +185,30 @@ func TestSetConditions(t *testing.T) {
 		assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
 	})
 }
+
+func TestDeleteCondition(t *testing.T) {
+	ctx := context.Background()
+	bh := newBeehive(t)
+	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
+	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
+
+	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+	require.NoError(t, c.SetCondition(ctx, obj.ID, beehive.Condition{
+		Type: "Ready", Status: beehive.ConditionTrue,
+	}))
+
+	require.NoError(t, c.DeleteCondition(ctx, obj.ID, "Ready"))
+	got, err := objects.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Conditions)
+
+	t.Run("a missing condition is a no-op", func(t *testing.T) {
+		before, err := objects.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		require.NoError(t, c.DeleteCondition(ctx, obj.ID, "NeverSet"))
+		after, err := objects.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
+	})
+}

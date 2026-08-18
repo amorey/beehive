@@ -45,6 +45,12 @@ func (c *Client[Status]) UpdateStatus(ctx context.Context, id beehive.ObjectID, 
 	return c.writer.UpdateStatus(ctx, c.gk, id, b)
 }
 
+// DeleteCondition removes id's condition of that type, as
+// ControllerClient.DeleteCondition does. A missing condition is a no-op.
+func (c *Client[Status]) DeleteCondition(ctx context.Context, id beehive.ObjectID, conditionType string) error {
+	return c.writer.DeleteCondition(ctx, c.gk, id, conditionType)
+}
+
 // SetCondition writes id's condition of that type, as
 // ControllerClient.SetCondition does. The store stamps the times.
 func (c *Client[Status]) SetCondition(ctx context.Context, id beehive.ObjectID, cond beehive.Condition) error {

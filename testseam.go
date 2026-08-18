@@ -21,6 +21,14 @@ func init() {
 // spec/status split reserves for controllers, without a pass to hold.
 type fixtureWriter struct{ bh *Beehive }
 
+func (w fixtureWriter) DeleteCondition(ctx context.Context, gk GroupKind, id ObjectID, conditionType string) error {
+	if err := w.bh.store.Conditions().Delete(ctx, gk, id, conditionType); err != nil {
+		return err
+	}
+	w.bh.signalKindWritten(ctx, gk)
+	return nil
+}
+
 func (w fixtureWriter) SetConditions(ctx context.Context, gk GroupKind, id ObjectID, conds ...storeapi.Condition) error {
 	if err := w.bh.store.Conditions().Set(ctx, gk, id, conds...); err != nil {
 		return err
