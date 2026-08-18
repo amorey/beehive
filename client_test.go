@@ -23,9 +23,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
-	"io/fs"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1998,17 +1996,7 @@ func TestOwnedByIsWrittenInOnePlace(t *testing.T) {
 	// The whole module, not just this package: Store is implemented in sqlite/,
 	// where an owned_by write would be just as invisible to a scoped watch.
 	var sites []string
-	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-		if err != nil {
-			return err
-		}
+	forEachSourceFile(t, func(path string, file *ast.File) {
 		var fn string
 		ast.Inspect(file, func(n ast.Node) bool {
 			switch node := n.(type) {
@@ -2039,8 +2027,7 @@ func TestOwnedByIsWrittenInOnePlace(t *testing.T) {
 			}
 			return true
 		})
-		return nil
-	}))
+	})
 
 	assert.Equal(t, []string{"client.go:insertObject"}, sites)
 }

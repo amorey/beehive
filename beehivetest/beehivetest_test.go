@@ -31,25 +31,30 @@ var clusterGK = beehive.GroupKind{Group: "kstack", Kind: "Cluster"}
 // newBeehive returns an unstarted beehive over a fresh in-memory store, and no
 // controller is registered unless a test registers one — so every test using it
 // covers the client-only kind and the before-Start case.
-func newBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
+func newBeehive(t *testing.T) *beehive.Beehive {
 	t.Helper()
 	store, err := sqlite.OpenMemory()
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.Close() })
-	bh, err := beehive.New(store, opts...)
+	bh, err := beehive.New(store)
 	require.NoError(t, err)
 	return bh
 }
 
-func TestUpdateStatusRoundTrips(t *testing.T) {
+// newFixture is the shared preamble: an unstarted beehive, one stored Cluster,
+// and both clients over it.
+func newFixture(t *testing.T) (context.Context, beehive.Client[clusterSpec, clusterStatus], *beehivetest.Client[clusterStatus], *beehive.Object[clusterSpec, clusterStatus]) {
+	t.Helper()
 	ctx := context.Background()
 	bh := newBeehive(t)
 	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
-
 	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
 	require.NoError(t, err)
+	return ctx, objects, beehivetest.NewClient[clusterStatus](bh, clusterGK), obj
+}
 
-	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
+func TestUpdateStatusRoundTrips(t *testing.T) {
+	ctx, objects, c, obj := newFixture(t)
 	require.NoError(t, c.UpdateStatus(ctx, obj.ID, clusterStatus{Server: serverStatus{UID: "server-1"}}))
 
 	got, err := objects.Get(ctx, obj.ID)
@@ -144,13 +149,7 @@ func TestUpdateStatusWakesTheWatch(t *testing.T) {
 }
 
 func TestSetConditions(t *testing.T) {
-	ctx := context.Background()
-	bh := newBeehive(t)
-	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
-	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
-
-	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
-	require.NoError(t, err)
+	ctx, objects, c, obj := newFixture(t)
 
 	t.Run("a condition round-trips with the store's stamps", func(t *testing.T) {
 		require.NoError(t, c.SetCondition(ctx, obj.ID, beehive.Condition{
@@ -190,13 +189,7 @@ func TestSetConditions(t *testing.T) {
 }
 
 func TestDeleteCondition(t *testing.T) {
-	ctx := context.Background()
-	bh := newBeehive(t)
-	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
-	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
-
-	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
-	require.NoError(t, err)
+	ctx, objects, c, obj := newFixture(t)
 	require.NoError(t, c.SetCondition(ctx, obj.ID, beehive.Condition{
 		Type: "Ready", Status: beehive.ConditionTrue,
 	}))
@@ -225,6 +218,8 @@ func TestNewClientRejectsANilBeehive(t *testing.T) {
 }
 
 func TestScoping(t *testing.T) {
+	// Not newFixture: the foreign-kind case needs a second client over the same
+	// beehive.
 	ctx := context.Background()
 	bh := newBeehive(t)
 	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)

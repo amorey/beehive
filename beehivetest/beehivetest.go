@@ -1,11 +1,10 @@
 // Package beehivetest builds store state that only a controller can otherwise
 // write. For fixtures; not for production code.
 //
-// Reach for it last. A controller test that needs only the object it is handed
-// should call Reconcile directly against a fake ControllerClient — no store, no
-// beehive, and the assertion lands on what the pass decided. This package is
-// for the case that stops covering: a pass that reads another kind's status out
-// of a real store, which a fixture has no other way to write.
+// It exists for one case: a pass that reads another kind's status out of a real
+// store. A controller test that needs only the object it is handed calls
+// Reconcile directly against a fake ControllerClient instead. See
+// docs/adr/2026-08-18-a-beehivetest-client-writes-status.md.
 package beehivetest
 
 import (
@@ -21,17 +20,15 @@ import (
 // built from.
 type Client[Status any] struct {
 	writer testseam.Writer
-	gk     beehive.GroupKind
 }
 
 // NewClient returns a client for gk's status. Needs no registered controller
 // and no running beehive. Panics on a nil Beehive.
 func NewClient[Status any](bh *beehive.Beehive, gk beehive.GroupKind) *Client[Status] {
-	w, ok := testseam.Open(bh)
-	if !ok {
+	if bh == nil {
 		panic("beehivetest: NewClient needs a non-nil *beehive.Beehive")
 	}
-	return &Client[Status]{writer: w, gk: gk}
+	return &Client[Status]{writer: testseam.Open(bh, gk)}
 }
 
 // UpdateStatus records status for id, as ControllerClient.UpdateStatus does.
@@ -42,13 +39,13 @@ func (c *Client[Status]) UpdateStatus(ctx context.Context, id beehive.ObjectID, 
 	if err != nil {
 		return err
 	}
-	return c.writer.UpdateStatus(ctx, c.gk, id, b)
+	return c.writer.UpdateStatus(ctx, id, b)
 }
 
 // DeleteCondition removes id's condition of that type, as
 // ControllerClient.DeleteCondition does. A missing condition is a no-op.
 func (c *Client[Status]) DeleteCondition(ctx context.Context, id beehive.ObjectID, conditionType string) error {
-	return c.writer.DeleteCondition(ctx, c.gk, id, conditionType)
+	return c.writer.DeleteCondition(ctx, id, conditionType)
 }
 
 // SetCondition writes id's condition of that type, as
@@ -76,5 +73,5 @@ func (c *Client[Status]) SetConditions(ctx context.Context, id beehive.ObjectID,
 			Liveness: cond.Liveness,
 		}
 	}
-	return c.writer.SetConditions(ctx, c.gk, id, out...)
+	return c.writer.SetConditions(ctx, id, out...)
 }

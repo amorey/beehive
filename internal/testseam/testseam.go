@@ -8,15 +8,14 @@ import (
 	"github.com/amorey/beehive/internal/storeapi"
 )
 
-// Writer is what beehivetest needs from a *beehive.Beehive. The status blob
-// arrives marshalled: keeping this interface non-generic leaves the type
-// parameter in beehivetest.
+// Writer is one kind's status half, already scoped to a GroupKind. The status
+// blob arrives marshalled, which leaves the type parameter in beehivetest.
 type Writer interface {
-	DeleteCondition(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, conditionType string) error
-	SetConditions(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, conds ...storeapi.Condition) error
-	UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, status []byte) error
+	DeleteCondition(ctx context.Context, id storeapi.ObjectID, conditionType string) error
+	SetConditions(ctx context.Context, id storeapi.ObjectID, conds ...storeapi.Condition) error
+	UpdateStatus(ctx context.Context, id storeapi.ObjectID, status []byte) error
 }
 
-// Open is set by package beehive's init and read by beehivetest. The parameter
-// is any because this package cannot import beehive without a cycle.
-var Open func(bh any) (Writer, bool)
+// Open is set by package beehive's init and read by beehivetest. The beehive is
+// an any because this package cannot import beehive without a cycle.
+var Open func(bh any, gk storeapi.GroupKind) Writer
