@@ -134,6 +134,14 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 			log.WarnContext(ctx, "failed to record the dependency watermark; the next target change re-derives it", "err", err)
 		}
 	}
+	// Last of the three, and after the watermark: a crash between them must
+	// leave an unsettled object with a low watermark, which only over-reports
+	// staleness, never a settled object whose watermark never landed. Before the
+	// GC block, or a collect in this pass leaves the stamp writing to a row that
+	// is gone.
+	if result.settles() {
+		t.bh.stampObserved(ctx, log, t.gk, id, raw)
+	}
 	// GC runs in its own transaction over the controller's committed writes, so
 	// a finalizer the controller just cleared is visible.
 	if deleting {
@@ -150,6 +158,36 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		}
 	}
 	return result, false
+}
+
+// stampObserved records the generation the pass was handed, which raw carries —
+// never a fresh read, or a spec change landing mid-pass would be marked observed
+// by a pass that never saw it.
+//
+// Gated on the generation already in hand: a converged object costs no store
+// call at all, which keeps the steady state off the store's single connection.
+// The gate is equivalent to the store's own clamp only because
+// observed_generation is monotonic, which holds because advanceObserved is its
+// sole writer — do not reintroduce an unclamped handshake write.
+//
+// A failure here is not a failed reconcile: it leaves the object unsettled, and
+// the unsettled listing re-derives it.
+func (bh *Beehive) stampObserved(ctx context.Context, log *slog.Logger, gk GroupKind, id ObjectID, raw *RawObject) {
+	if raw.ObservedGeneration != nil && *raw.ObservedGeneration >= raw.Generation {
+		return
+	}
+	settled, err := bh.store.Objects().SetObservedGeneration(ctx, gk, id, raw.Generation)
+	switch {
+	case err == nil:
+		if settled {
+			bh.signalKindWritten(ctx, gk)
+		}
+	// A cancelled write is shutdown, and a collect from another kind's cascade
+	// can take the row between the load and here: both are normal, not faults.
+	case ctx.Err() != nil, errors.Is(err, ErrNotFound):
+	default:
+		log.WarnContext(ctx, "failed to record the observed generation; the object stays unsettled", "err", err)
+	}
 }
 
 // reconciler drives the reconcile loop for a single registered controller.

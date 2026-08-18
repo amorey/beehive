@@ -762,12 +762,15 @@ type recordingController struct {
 	reconciled chan ObjectID
 }
 
+// Records the pass and reports the object still unconverged, with a delay long
+// enough that only the test's own requeue dispatches it again: what these tests
+// drive is the unsettled listing, which a Settled pass would empty.
 func (c *recordingController) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	select {
 	case c.reconciled <- obj.ID:
 	default:
 	}
-	return Settled(0)
+	return Unsettled(time.Hour)
 }
 
 // TestSelfDrivenRecovery pins the primitives an embedder uses to drive reconciles
@@ -1771,6 +1774,10 @@ func wrapStore(s Store, wrap func(Store) Store) Store {
 // funcController the caller scripts. Nothing here starts a loop: reconcile is
 // called directly, so a pass's bookkeeping writes have landed by the time it
 // returns, which is what lets these tests assert on them without waiting.
+func newSyncControllerOn(s Store) (*typedController[cSpec, cStatus], *funcController) {
+	return newSyncController(s)
+}
+
 func newSyncController(s Store) (*typedController[cSpec, cStatus], *funcController) {
 	bh := &Beehive{store: s}
 	inner := &funcController{}
@@ -3683,4 +3690,163 @@ func TestReconcilerTreatsAnUnusableResultAsAFailure(t *testing.T) {
 	waitClosed(t, doneCh, "the backoff retry after an unusable result")
 	cancel()
 	waitClosed(t, done, "run to exit")
+}
+
+// A Settled pass records the generation beehive handed to Reconcile, never a
+// fresh read of the row. A spec change landing mid-pass must stay unobserved:
+// stamping the newer generation would mark it seen by a pass that never read
+// it, and nothing would reconcile it again.
+func TestReconcileStampsTheGenerationItHandedOut(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	obj, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
+	require.NoError(t, err)
+
+	tc, inner := newSyncController(s)
+	var handed int64
+	inner.fn = func(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+		handed = obj.Generation
+		// The mid-pass spec change, from outside this pass.
+		next, err := json.Marshal(cSpec{Val: "changed"})
+		require.NoError(t, err)
+		_, _, err = s.Objects().UpdateSpec(ctx, clientTestGK, obj.ID, next, 0)
+		require.NoError(t, err)
+		return Settled(0)
+	}
+	_, _, err = reconcilePass(tc, ctx, obj.ID)
+	require.NoError(t, err)
+
+	got, err := s.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.ObservedGeneration)
+	assert.Equal(t, handed, *got.ObservedGeneration, "the generation the pass was handed, not a fresh read")
+	assert.Less(t, *got.ObservedGeneration, got.Generation, "the mid-pass change is still owed a reconcile")
+	assert.Contains(t, unsettledIDs(t, s), obj.ID)
+}
+
+// The stamp is gated on the generation already in hand from the load, so a
+// converged object costs no store call at all — not merely no row write. The
+// gate is what keeps the steady state off the store's single connection.
+func TestReconcileConvergedPassMakesNoStampCall(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	obj, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
+	require.NoError(t, err)
+
+	var calls int
+	probe := &objectsOverrideStore{Store: s}
+	probe.override.Objects = s.Objects()
+	probe.override.setObservedGen = func(ctx context.Context, gk GroupKind, id ObjectID, gen int64) (bool, error) {
+		calls++
+		return s.Objects().SetObservedGeneration(ctx, gk, id, gen)
+	}
+
+	tc, inner := newSyncControllerOn(probe)
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+		return Settled(0)
+	}
+
+	_, _, err = reconcilePass(tc, ctx, obj.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, calls, "the first pass settles a new generation, so it calls the store")
+
+	_, _, err = reconcilePass(tc, ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls, "a converged pass must not reach the store at all")
+}
+
+// Unsettled runs the pass's other two post-reconcile writes but records no
+// generation: the object stays in the unsettled listing until it converges.
+func TestReconcileUnsettledDoesNotStamp(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	obj, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
+	require.NoError(t, err)
+
+	tc, inner := newSyncController(s)
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+		return Unsettled(0)
+	}
+	_, _, err = reconcilePass(tc, ctx, obj.ID)
+	require.NoError(t, err)
+
+	got, err := s.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Nil(t, got.ObservedGeneration, "an unsettled pass records nothing")
+	assert.Contains(t, unsettledIDs(t, s), obj.ID)
+}
+
+// A failed stamp is not a failed reconcile: it leaves the object unsettled, and
+// the unsettled listing is what re-derives it. Turning it into a failure would
+// retry a pass that already committed its writes.
+func TestReconcileFailedStampDoesNotFailThePass(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	obj, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
+	require.NoError(t, err)
+
+	probe := &objectsOverrideStore{Store: s}
+	probe.override.Objects = s.Objects()
+	probe.override.setObservedGen = func(context.Context, GroupKind, ObjectID, int64) (bool, error) {
+		return false, errBoom
+	}
+	tc, inner := newSyncControllerOn(probe)
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+		return Settled(0)
+	}
+
+	result, _, err := reconcilePass(tc, ctx, obj.ID)
+	require.NoError(t, err, "a failed stamp must not fail the pass")
+	assert.True(t, result.succeeded())
+	assert.Contains(t, unsettledIDs(t, s), obj.ID, "left unsettled for the next pass")
+}
+
+// The watermark commits before the stamp. A crash between them must leave an
+// unsettled object with a low watermark — which only over-reports staleness —
+// never a settled object whose watermark never landed.
+func TestReconcileWritesTheWatermarkBeforeTheStamp(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+
+	specJSON, err := json.Marshal(cSpec{})
+	require.NoError(t, err)
+	dep, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
+	require.NoError(t, err)
+	target, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
+	require.NoError(t, err)
+	_, err = s.Edges().Add(ctx, dep.ID, target.ID, RelationDependsOn)
+	require.NoError(t, err)
+
+	var order []string
+	probe := &orderProbeStore{Store: s, record: func(s string) { order = append(order, s) }}
+	tc, inner := newSyncControllerOn(probe)
+	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+		return Settled(0)
+	}
+	_, _, err = reconcilePass(tc, ctx, dep.ID)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"watermark", "stamp"}, order)
 }

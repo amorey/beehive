@@ -767,8 +767,9 @@ func (fakeObjects) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, err
 	return nil, nil
 }
 
+// Reports no write, so a pass over the fake stamps nothing and wakes nobody.
 func (fakeObjects) SetObservedGeneration(context.Context, GroupKind, ObjectID, int64) (bool, error) {
-	panic("not implemented: fakeStore.Objects().SetObservedGeneration")
+	return false, nil
 }
 
 func (fakeObjects) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
@@ -807,6 +808,14 @@ type objectsOverride struct {
 	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
 	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
 	updateStatus       func(context.Context, GroupKind, ObjectID, int64, []byte, int) error
+	setObservedGen     func(context.Context, GroupKind, ObjectID, int64) (bool, error)
+}
+
+func (o objectsOverride) SetObservedGeneration(ctx context.Context, gk GroupKind, id ObjectID, gen int64) (bool, error) {
+	if o.setObservedGen != nil {
+		return o.setObservedGen(ctx, gk, id, gen)
+	}
+	return o.Objects.SetObservedGeneration(ctx, gk, id, gen)
 }
 
 func (o objectsOverride) Create(ctx context.Context, gk GroupKind, in storeapi.ObjectsCreateInput) (*RawObject, error) {
@@ -1227,8 +1236,11 @@ func (s cursorStoreCursors) Set(_ context.Context, name string, cursor int64) er
 // Tests that need a ControllerClient obtain it from Register's return value.
 type noopController[Spec, Status any] struct{}
 
+// Unsettled, and far enough out that nothing re-dispatches inside a test: a
+// Settled pass would stamp the generation, which is a real write, and these
+// tests are asserting on writes they made themselves.
 func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) ReconcileResult {
-	return Settled(0)
+	return Unsettled(time.Hour)
 }
 
 // registerNoop registers a do-nothing controller for gk, making the kind count as
@@ -1956,4 +1968,58 @@ func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, 
 func reconcilePass(a controllerAdapter, ctx context.Context, id ObjectID) (ReconcileResult, bool, error) {
 	result, gone := a.reconcile(ctx, id)
 	return result, gone, result.err
+}
+
+// objectsOverrideStore swaps one kind's Objects sub-API for a hooked one, so a
+// test can count or fail a single store call without a whole fake.
+type objectsOverrideStore struct {
+	Store
+	override objectsOverride
+}
+
+func (s *objectsOverrideStore) Objects() storeapi.Objects {
+	if s.override.Objects == nil {
+		s.override.Objects = s.Store.Objects()
+	}
+	return s.override
+}
+
+// orderProbeStore records the order of the two post-reconcile writes whose
+// ordering is load-bearing: the watermark must commit before the stamp.
+type orderProbeStore struct {
+	Store
+	record func(string)
+}
+
+func (s *orderProbeStore) Objects() storeapi.Objects {
+	return objectsOverride{
+		Objects: s.Store.Objects(),
+		setObservedGen: func(ctx context.Context, gk GroupKind, id ObjectID, gen int64) (bool, error) {
+			s.record("stamp")
+			return s.Store.Objects().SetObservedGeneration(ctx, gk, id, gen)
+		},
+	}
+}
+
+func (s *orderProbeStore) Dependencies() storeapi.Dependencies {
+	return dependenciesOverride{
+		Dependencies: s.Store.Dependencies(),
+		watermarkSet: func(ctx context.Context, id ObjectID, cursor int64) error {
+			s.record("watermark")
+			return s.Store.Dependencies().WatermarkSet(ctx, id, cursor)
+		},
+	}
+}
+
+// dependenciesOverride replaces the hooks that are set and delegates the rest.
+type dependenciesOverride struct {
+	storeapi.Dependencies
+	watermarkSet func(context.Context, ObjectID, int64) error
+}
+
+func (o dependenciesOverride) WatermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
+	if o.watermarkSet != nil {
+		return o.watermarkSet(ctx, id, cursor)
+	}
+	return o.Dependencies.WatermarkSet(ctx, id, cursor)
 }
