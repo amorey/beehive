@@ -27,7 +27,9 @@ type clusterStatus struct {
 
 var clusterGK = beehive.GroupKind{Group: "kstack", Kind: "Cluster"}
 
-// newBeehive returns an unstarted beehive over a fresh in-memory store.
+// newBeehive returns an unstarted beehive over a fresh in-memory store, and no
+// controller is registered unless a test registers one — so every test using it
+// covers the client-only kind and the before-Start case.
 func newBeehive(t *testing.T, opts ...beehive.Option) *beehive.Beehive {
 	t.Helper()
 	store, err := sqlite.OpenMemory()
@@ -219,4 +221,25 @@ func TestNewClientRejectsANilBeehive(t *testing.T) {
 	assert.PanicsWithValue(t,
 		"beehivetest: NewClient needs a non-nil *beehive.Beehive",
 		func() { beehivetest.NewClient[clusterStatus](nil, clusterGK) })
+}
+
+func TestScoping(t *testing.T) {
+	ctx := context.Background()
+	bh := newBeehive(t)
+	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
+	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
+
+	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+
+	t.Run("a foreign kind is refused", func(t *testing.T) {
+		other := beehivetest.NewClient[clusterStatus](bh, beehive.GroupKind{Group: "kstack", Kind: "Cache"})
+		err := other.UpdateStatus(ctx, obj.ID, clusterStatus{})
+		assert.ErrorIs(t, err, beehive.ErrWrongKind)
+	})
+
+	t.Run("a missing id is not found", func(t *testing.T) {
+		err := c.UpdateStatus(ctx, beehive.ObjectID(9999), clusterStatus{})
+		assert.ErrorIs(t, err, beehive.ErrNotFound)
+	})
 }
