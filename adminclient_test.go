@@ -24,20 +24,20 @@ type tcStatus struct {
 
 var tcGK = GroupKind{Group: "kstack", Kind: "Cluster"}
 
-// newTestClientFixture is the shared preamble: an unstarted beehive, one stored
+// newAdminClientFixture is the shared preamble: an unstarted beehive, one stored
 // object, and both clients over it.
-func newTestClientFixture(t *testing.T) (context.Context, Client[tcSpec, tcStatus], *TestClient[tcStatus], *Object[tcSpec, tcStatus]) {
+func newAdminClientFixture(t *testing.T) (context.Context, Client[tcSpec, tcStatus], *AdminClient[tcStatus], *Object[tcSpec, tcStatus]) {
 	t.Helper()
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))
 	objects := NewClient[tcSpec, tcStatus](bh, tcGK)
 	obj, err := objects.Create(ctx, "prod", tcSpec{Region: "us-east-1"})
 	require.NoError(t, err)
-	return ctx, objects, NewTestClient[tcStatus](bh, tcGK), obj
+	return ctx, objects, NewAdminClient[tcStatus](bh, tcGK), obj
 }
 
-func TestTestClientUpdateStatusRoundTrips(t *testing.T) {
-	ctx, objects, c, obj := newTestClientFixture(t)
+func TestAdminClientUpdateStatusRoundTrips(t *testing.T) {
+	ctx, objects, c, obj := newAdminClientFixture(t)
 	require.NoError(t, c.UpdateStatus(ctx, obj.ID, tcStatus{Server: tcServerStatus{UID: "server-1"}}))
 
 	got, err := objects.Get(ctx, obj.ID)
@@ -71,7 +71,7 @@ func (tcStubController) Reconcile(context.Context, ControllerClient[tcStatus], *
 	return Settled()
 }
 
-func TestTestClientStampsTheMigratorsVersion(t *testing.T) {
+func TestAdminClientStampsTheMigratorsVersion(t *testing.T) {
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))
 	require.NoError(t, Register[tcSpec, tcStatus](bh, tcGK, tcStubController{}, WithMigrator(tcStatusV2Migrator{})))
@@ -80,7 +80,7 @@ func TestTestClientStampsTheMigratorsVersion(t *testing.T) {
 	obj, err := objects.Create(ctx, "prod", tcSpec{Region: "us-east-1"})
 	require.NoError(t, err)
 
-	c := NewTestClient[tcStatus](bh, tcGK)
+	c := NewAdminClient[tcStatus](bh, tcGK)
 	require.NoError(t, c.UpdateStatus(ctx, obj.ID, tcStatus{Server: tcServerStatus{UID: "server-1"}}))
 
 	// A row tagged at the migrator's version is not converted on read. Created
@@ -91,7 +91,7 @@ func TestTestClientStampsTheMigratorsVersion(t *testing.T) {
 	assert.Equal(t, "server-1", got.Status.Server.UID)
 }
 
-func TestTestClientWakesTheWatch(t *testing.T) {
+func TestAdminClientWakesTheWatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
@@ -110,7 +110,7 @@ func TestTestClientWakesTheWatch(t *testing.T) {
 	stream, err := objects.WatchList(ctx)
 	require.NoError(t, err)
 
-	c := NewTestClient[tcStatus](bh, tcGK)
+	c := NewAdminClient[tcStatus](bh, tcGK)
 	require.NoError(t, c.UpdateStatus(ctx, obj.ID, tcStatus{Server: tcServerStatus{UID: "server-1"}}))
 
 	// The watch floor is 30s, so without a commit wake this times out rather
@@ -129,8 +129,8 @@ func TestTestClientWakesTheWatch(t *testing.T) {
 	}
 }
 
-func TestTestClientSetConditions(t *testing.T) {
-	ctx, objects, c, obj := newTestClientFixture(t)
+func TestAdminClientSetConditions(t *testing.T) {
+	ctx, objects, c, obj := newAdminClientFixture(t)
 
 	t.Run("a condition round-trips with the store's stamps", func(t *testing.T) {
 		require.NoError(t, c.SetCondition(ctx, obj.ID, Condition{
@@ -169,8 +169,8 @@ func TestTestClientSetConditions(t *testing.T) {
 	})
 }
 
-func TestTestClientDeleteCondition(t *testing.T) {
-	ctx, objects, c, obj := newTestClientFixture(t)
+func TestAdminClientDeleteCondition(t *testing.T) {
+	ctx, objects, c, obj := newAdminClientFixture(t)
 	require.NoError(t, c.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue}))
 
 	require.NoError(t, c.DeleteCondition(ctx, obj.ID, "Ready"))
@@ -188,19 +188,19 @@ func TestTestClientDeleteCondition(t *testing.T) {
 	})
 }
 
-func TestTestClientScoping(t *testing.T) {
+func TestAdminClientScoping(t *testing.T) {
 	// Not the fixture: the foreign-kind case needs a second client over the same
 	// beehive.
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))
 	objects := NewClient[tcSpec, tcStatus](bh, tcGK)
-	c := NewTestClient[tcStatus](bh, tcGK)
+	c := NewAdminClient[tcStatus](bh, tcGK)
 
 	obj, err := objects.Create(ctx, "prod", tcSpec{Region: "us-east-1"})
 	require.NoError(t, err)
 
 	t.Run("a foreign kind is refused", func(t *testing.T) {
-		other := NewTestClient[tcStatus](bh, GroupKind{Group: "kstack", Kind: "Cache"})
+		other := NewAdminClient[tcStatus](bh, GroupKind{Group: "kstack", Kind: "Cache"})
 		assert.ErrorIs(t, other.UpdateStatus(ctx, obj.ID, tcStatus{}), ErrWrongKind)
 	})
 
@@ -220,7 +220,7 @@ func (tcUnmarshalableStatus) MarshalJSON() ([]byte, error) { return nil, errTCNo
 
 var errTCNoJSON = errors.New("this status does not marshal")
 
-func TestTestClientReportsAMarshalFailure(t *testing.T) {
+func TestAdminClientReportsAMarshalFailure(t *testing.T) {
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))
 	objects := NewClient[tcSpec, tcUnmarshalableStatus](bh, tcGK)
@@ -228,6 +228,85 @@ func TestTestClientReportsAMarshalFailure(t *testing.T) {
 	obj, err := objects.Create(ctx, "prod", tcSpec{Region: "us-east-1"})
 	require.NoError(t, err)
 
-	c := NewTestClient[tcUnmarshalableStatus](bh, tcGK)
+	c := NewAdminClient[tcUnmarshalableStatus](bh, tcGK)
 	assert.ErrorIs(t, c.UpdateStatus(ctx, obj.ID, tcUnmarshalableStatus{}), errTCNoJSON)
+}
+
+// The maintenance half of the surface: what only a pass could otherwise write.
+// Each verb forwards to the pass client, so these pin the forwarding and the
+// scoping, not the write itself.
+
+func TestAdminClientAddEvent(t *testing.T) {
+	ctx, _, c, obj := newAdminClientFixture(t)
+
+	require.NoError(t, c.AddEvent(ctx, obj.ID, EventSpec{
+		Category: "maintenance", Type: EventNormal, Reason: "Backfilled",
+	}))
+
+	run, err := c.bh.store.Events().GetLatest(ctx, obj.ID, "maintenance")
+	require.NoError(t, err)
+	require.NotNil(t, run)
+	assert.Equal(t, "Backfilled", run.Reason)
+}
+
+// Unsticking a wedged object is the case the verb exists for here: nothing else
+// clears a finalizer outside that object's own pass.
+func TestAdminClientDeleteFinalizer(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	// WithFinalizers wants a controller registered: it gates on something being
+	// able to clear them, which was true before this client existed.
+	registerNoop[tcSpec, tcStatus](t, bh, tcGK)
+	objects := NewClient[tcSpec, tcStatus](bh, tcGK)
+	obj, err := objects.Create(ctx, "prod", tcSpec{Region: "us-east-1"}, WithFinalizers("stuck"))
+	require.NoError(t, err)
+	require.NoError(t, objects.Delete(ctx, obj.ID))
+
+	c := NewAdminClient[tcStatus](bh, tcGK)
+	require.NoError(t, c.DeleteFinalizer(ctx, obj.ID, "stuck"))
+
+	got, err := objects.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Empty(t, got.Finalizers)
+	assert.ErrorIs(t, c.DeleteFinalizer(ctx, ObjectID(9999), "stuck"), ErrNotFound)
+}
+
+func TestAdminClientDependencyVerbs(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	objects := NewClient[tcSpec, tcStatus](bh, tcGK)
+	from, err := objects.Create(ctx, "from", tcSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+	to, err := objects.Create(ctx, "to", tcSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+	c := NewAdminClient[tcStatus](bh, tcGK)
+
+	require.NoError(t, c.AddDependency(ctx, from.ID, to.ID))
+	refs, err := bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{from.ID}, objectRefIDs(refs))
+
+	require.NoError(t, c.DeleteDependency(ctx, from.ID, to.ID))
+	refs, err = bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Empty(t, refs)
+}
+
+// Edges() takes no GroupKind, so the source is scoped by this client rather than
+// by the store. Both verbs, since each does its own check.
+func TestAdminClientDependencyVerbsScopeTheSource(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	objects := NewClient[tcSpec, tcStatus](bh, tcGK)
+	obj, err := objects.Create(ctx, "prod", tcSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+
+	foreignGK := GroupKind{Group: "kstack", Kind: "Cache"}
+	foreign, err := NewClient[tcSpec, tcStatus](bh, foreignGK).Create(ctx, "cache", tcSpec{})
+	require.NoError(t, err)
+
+	c := NewAdminClient[tcStatus](bh, tcGK)
+	assert.ErrorIs(t, c.AddDependency(ctx, foreign.ID, obj.ID), ErrWrongKind)
+	assert.ErrorIs(t, c.DeleteDependency(ctx, foreign.ID, obj.ID), ErrWrongKind)
+	assert.ErrorIs(t, c.AddDependency(ctx, ObjectID(9999), obj.ID), ErrNotFound)
 }

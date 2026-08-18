@@ -1,0 +1,105 @@
+# An AdminClient writes outside a pass, for fixtures and for maintenance
+
+- **Status:** Accepted — implemented in `adminclient.go`.
+- **Date:** 2026-08-18
+
+## Context
+
+Two callers need writes only a reconcile pass can otherwise make.
+
+A controller that reads another kind's status needs a stored one to read. Since
+a `ControllerClient` exists only for the pass it is handed to
+([ADR](2026-08-18-a-controller-client-exists-only-for-a-pass.md)), the only
+in-API route to a status write is a live `Reconcile` — so a fixture had to start
+beehive, register a stub controller parking statuses, requeue, and wait on a
+probe for the pass to land.
+
+The second is maintenance: a data migration, a backfill, an object wedged by a
+finalizer nothing will clear. `Client` writes spec and requests deletes, so
+rewriting or removing data is already covered; what an operator cannot reach is
+status, conditions, finalizers, events and dependency edges. The pass-scoped
+client made the last three unreachable outside a pass at all, and for a
+client-only kind an edge became undroppable for good.
+
+Writing through `Store` directly is reachable, since `beehive.Store` is a public
+alias and the caller constructs the store, but it is correct in one window only:
+it skips the commit wake, so above `Start` it is the store call behind a running
+beehive's back. It also passes the status schema version by hand, where 0 means
+"keep the stored tag" — the write succeeds and mis-tags the row. Conditions are
+not reachable at all: `Conditions().Set` takes `storeapi.Condition`, which an
+external package cannot name.
+
+## Decision
+
+`NewAdminClient[Status](bh, gk)` returns a `*AdminClient[Status]` carrying the
+pass client's writes, id-keyed: `UpdateStatus`, `SetCondition`, `SetConditions`,
+`DeleteCondition`, `AddEvent`, `DeleteFinalizer`, `AddDependency` and
+`DeleteDependency`. It needs no registered controller and no running beehive.
+
+**One type, two uses, because they want the same writes.** A fixture and a
+migration script both write what a pass writes, from outside a pass, and
+splitting them would mean two names over one implementation. The name says
+*admin* rather than *test* because the second use is real: an operator running
+this against a stopped beehive is using it as intended.
+
+**It builds a `ControllerClient` nothing ever ends.** `controllerClientImpl`'s
+`live()` gate only closes when the reconcile loop calls `end()`, so a client
+built outside a pass stays open, and every verb is forwarded to one. The
+schema version, the condition conversion and the commit wake therefore have one
+implementation rather than a parallel one, and there is nothing to keep in step
+as those writes change.
+
+**It keeps its `ObjectID` arguments**, which is why it builds a client per call
+rather than holding one: a pass client is
+[bound to its object](2026-08-18-a-controller-client-exists-only-for-a-pass.md)
+and cannot take an id. Both callers write for whatever object they name, so the
+id belongs in the signature here. It also leaves `AdminClient` the only surface
+that can return `ErrWrongKind`.
+
+**The two edge verbs scope their source themselves.** Every other verb reaches a
+store call that folds `gk` in; `Edges()` takes no `GroupKind`, so a foreign
+source would write its edge and route the enqueue to this client's reconciler.
+One read of the source stands in — an ops path, not a hot one.
+
+**It is the last resort, not the first.** A controller test that needs only the
+object it is handed should call `Reconcile` directly against a fake
+`ControllerClient`: no store, no beehive, and the assertion lands on what the
+pass decided. `AdminClient` is for what that cannot cover — a pass reading
+another kind's status out of a real store.
+
+**In package `beehive`, not a `beehivetest` sub-package.** A sub-package would be
+wrong by name — a migration script is not a test — and it would have to reach
+`bh.store`, `bh.migratorFor` and `bh.kindWriteHub`, none of which are exported.
+The only ways across are an exported method returning an internal type or a hook
+in an internal package set by `init`, and both cost a seam to buy a package name.
+A generic *method* would not work (`bh.UpdateStatusForTest`), but a package-level
+generic function does, and `NewClient` is already one.
+
+The guard rail is therefore the doc and the remit, not the identifier: nothing
+stops a controller constructing one mid-pass, exactly as nothing stops a second
+process opening the store. Both are scope rules this package documents rather
+than enforces.
+
+## Consequences
+
+The handshake is untouched: nothing here stamps `observed_generation`, so an
+object given a fixture status is still unsettled and the owed pass reconciles it
+once beehive starts.
+
+On a running beehive a fixture write races the object's own pass, last-writer-
+wins at the store. The ordinary hazard of two writers, not a broken invariant; a
+fixture parking state on an object its controller is actively settling sequences
+that itself.
+
+Two names join the root package's godoc, which is the price of not having a
+package name to hide behind. In exchange the write path is the pass client's
+own: a sub-package forced a parallel implementation of every write, plus the
+seam to reach it.
+
+`AddEvent` here does not close the gap [`TODO.md`](../TODO.md) records. That one
+is an ordinary application appending on its own schedule — a background prober —
+and this surface is the wrong answer for it: correctness depends on beehive being
+stopped, which a prober is not. What is closed is the maintenance case. A hand-built `Object` still cannot carry loaded
+relations (`loaded` and `owner` are unexported), so a controller reading
+relations off its object is not testable by calling `Reconcile` directly. That
+is the other half of the same gap and is not closed here.

@@ -64,14 +64,13 @@ it. It goes because it arrived on the same client, and carving one method out
 would restore the which-half-works table. `docs/TODO.md` carries the gap and the
 shape of the fix.
 
-**A declare is now something only the dependent's own pass can make.**
-`Edges().Add` with `RelationDependsOn` has one non-test caller and `Client` has
-no `AddDependency`, so a client-only kind can never be an edge's source, and an
-edge whose source is one cannot be dropped through the package at all. What that
-costs is the third case the unconditional `reconcile_owed` stamp was written to
-cover — a declare made on another object's behalf while that object's own
-reconcile is mid-flight. The stamp stays unconditional for the other two.
-`docs/TODO.md` carries this one too.
+**A declare is now something only the dependent's own pass can make**, during
+reconcile. What that costs is the third case the unconditional `reconcile_owed`
+stamp was written to cover — a declare made on another object's behalf while that
+object's own reconcile is mid-flight. The stamp stays unconditional for the other
+two. Outside a pass the edge verbs live on
+[`AdminClient`](2026-08-18-an-admin-client-writes-outside-a-pass.md), which is
+what keeps an edge droppable when its source has no controller.
 
 **The reads answer for the pass's object.** `GetOwner`, `ListDependencies`,
 `ListDependents` and `ListOwned` have id-keyed twins on `Client`, so a controller
@@ -80,7 +79,7 @@ now pass-scoped outright.
 
 **`ErrWrongKind` no longer reaches a controller.** The id a pass client binds is
 its own kind's by construction, so only a fabricated client can raise it, and
-`Client` reports the store's error as `ErrNotFound`. That leaves `TestClient` —
+`Client` reports the store's error as `ErrNotFound`. That leaves `AdminClient` —
 id-keyed, by design — the only surface a caller can get it from.
 
 **The cleared-finalizer push loses one of its two cases.** A clear landing on a
