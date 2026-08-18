@@ -22,45 +22,39 @@ import "context"
 // other way to write.
 //
 // It writes through a ControllerClient nothing ever ends, so every verb below
-// means exactly what it means during a pass. A pass client is bound to one
-// object, so the id each verb takes is what builds one.
+// means exactly what it means during a pass.
 // See docs/adr/2026-08-18-a-test-client-writes-status.md.
 type TestClient[Status any] struct {
-	bh *Beehive
-	gk GroupKind
+	passClients[Status]
 }
 
 // NewTestClient returns a TestClient for gk. Needs no registered controller and
 // no running beehive.
 func NewTestClient[Status any](bh *Beehive, gk GroupKind) *TestClient[Status] {
-	return &TestClient[Status]{bh: bh, gk: gk}
-}
-
-func (t *TestClient[Status]) client(id ObjectID) *controllerClientImpl[Status] {
-	return newPassClient[Status](t.bh, t.gk, id)
+	return &TestClient[Status]{passClients[Status]{bh: bh, gk: gk}}
 }
 
 // DeleteCondition removes id's condition of that type. See
 // ControllerClient.DeleteCondition.
 func (t *TestClient[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
-	return t.client(id).DeleteCondition(ctx, conditionType)
+	return t.at(id).DeleteCondition(ctx, conditionType)
 }
 
 // SetCondition writes id's condition of that type. See
 // ControllerClient.SetCondition.
 func (t *TestClient[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	return t.client(id).SetCondition(ctx, condition)
+	return t.at(id).SetCondition(ctx, condition)
 }
 
 // SetConditions writes every named condition together. See
 // ControllerClient.SetConditions.
 func (t *TestClient[Status]) SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error {
-	return t.client(id).SetConditions(ctx, conditions)
+	return t.at(id).SetConditions(ctx, conditions)
 }
 
 // UpdateStatus records status for id. See ControllerClient.UpdateStatus. Never
 // stamps observed_generation: the handshake stays beehive's, so an object given
 // a fixture status is still unsettled.
 func (t *TestClient[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
-	return t.client(id).UpdateStatus(ctx, status)
+	return t.at(id).UpdateStatus(ctx, status)
 }

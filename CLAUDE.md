@@ -359,9 +359,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   settle nothing — cannot be expressed. `ErrWrongKind` is unreachable from it as a
   result. What that removes rather than relocates is a declare or an event append
   made on another object's behalf, both in `docs/TODO.md`; the reads relocate to
-  `Client`, `HasIncomingEdges` excepted. The cleared-finalizer push survives the
-  narrowing but nothing depends on it any more — the pass's own tail `gcCollect`
-  covers every ordering.
+  `Client`, `HasIncomingEdges` excepted. The cleared-finalizer push keeps only its
+  second case — a pass whose load predated the delete request, where the tail
+  `gcCollect` is gated on a stale `deleting`.
   → [ADR](docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md)
 - **`TestClient` writes status and conditions outside a pass**, for the fixture
   a `ControllerClient`'s pass scoping made unbuildable: a controller reading

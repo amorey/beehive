@@ -310,8 +310,7 @@ type DeletionRequestResult struct {
 // EdgesAddResult is what a caller needs to follow up on an edge it declared;
 // all of it falls out of work Edges().Add already does.
 type EdgesAddResult struct {
-	// From is the source object's GroupKind, for a caller that declared an edge
-	// for an object other than the one it is reconciling.
+	// From is the source object's GroupKind.
 	From GroupKind
 	// To is the target object's GroupKind, for a caller routing a requeue to
 	// the other end.

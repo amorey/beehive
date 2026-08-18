@@ -59,8 +59,10 @@ never reused, so nothing about that id is answerable again. `discard` became
 The push is redundant in the shape both `examples/cascade` controllers use — a
 controller clearing its own object's last finalizer during that object's pass,
 where the tail `gcCollect` collects it in the same pass. It is load-bearing when
-the clear lands outside a pass over the object it frees: on a sibling, or between
-a load and a delete request issued from elsewhere in this process. The redundant
+the clear lands on a pass whose load predated the delete request: `deleting` is
+sampled once, so the tail is skipped while the store still reports the clear as
+freeing a deletion-pending row. The sibling case it also covered is gone —
+a client is [bound to its pass's object](2026-08-18-a-controller-client-exists-only-for-a-pass.md). The redundant
 case now costs nothing, because that is the dispatch `forget` drops.
 
 Routes 2 and 3 still wait for a sweep. `WithGCInterval` cannot be disabled, so

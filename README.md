@@ -789,7 +789,7 @@ c := beehive.NewTestClient[ClusterStatus](bh, clusterGK)
 require.NoError(t, c.UpdateStatus(ctx, cluster.ID, ClusterStatus{Server: ServerStatus{UID: "server-1"}}))
 ```
 
-It needs no registered controller and no running beehive, and carries `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition`. It holds a `ControllerClient` nothing ever ends, so each verb behaves exactly as it does during a pass — correct before `Start` and while beehive runs, though on a running beehive it races that object's own pass, last-writer-wins.
+It needs no registered controller and no running beehive, and carries `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition`. It keeps the `ObjectID` a `ControllerClient` no longer takes — a fixture writes for whatever object it is seeding — and builds a `ControllerClient` nothing ever ends, so each verb behaves exactly as it does during a pass — correct before `Start` and while beehive runs, though on a running beehive it races that object's own pass, last-writer-wins.
 
 It never stamps `observed_generation`: the handshake stays beehive's, so an object given a fixture status is still unsettled and the owed pass will reconcile it once beehive starts. → [ADR](docs/adr/2026-08-18-a-test-client-writes-status.md)
 

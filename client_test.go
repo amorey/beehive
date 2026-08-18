@@ -3508,12 +3508,13 @@ func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
-	require.NoError(t, cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
+	pass := cc.at(obj.ID)
+	require.NoError(t, pass.Within(ctx, func(ctx context.Context) error {
 		updated, err := client.Update(ctx, obj.ID, cSpec{Val: "b"})
 		if err != nil {
 			return err
 		}
-		if err := cc.at(obj.ID).UpdateStatus(ctx, cStatus{Val: "done"}); err != nil {
+		if err := pass.UpdateStatus(ctx, cStatus{Val: "done"}); err != nil {
 			return err
 		}
 		// Settling is beehive's write, so reach the store directly.

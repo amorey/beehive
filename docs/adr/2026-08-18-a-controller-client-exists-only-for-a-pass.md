@@ -78,18 +78,17 @@ reconcile is mid-flight. The stamp stays unconditional for the other two.
 that needs another object's graph holds one. `HasIncomingEdges` does not, and is
 now pass-scoped outright.
 
-**`ErrWrongKind` is unreachable from a `ControllerClient`.** The bound id is its
-own kind's by construction, and `Client` reports the store's error as
-`ErrNotFound`, which leaves `TestClient` — id-keyed, by design — the only surface
-that returns the sentinel.
+**`ErrWrongKind` no longer reaches a controller.** The id a pass client binds is
+its own kind's by construction, so only a fabricated client can raise it, and
+`Client` reports the store's error as `ErrNotFound`. That leaves `TestClient` —
+id-keyed, by design — the only surface a caller can get it from.
 
-**The cleared-finalizer push survives with nothing depending on it.** It existed
-for a clear landing outside any pass over the object it unblocked, which is what
-binding removes; every remaining ordering ends in the pass's own tail
-`gcCollect`. It is idempotent and cheap, and
-`TestDeleteFinalizerTargetsThePassObject` still pins it, but
-[its record](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md) now
-describes a belt over braces.
+**The cleared-finalizer push loses one of its two cases.** A clear landing on a
+*sibling's* pass is what binding removes. The other survives: `deleting` is
+sampled at load, so a pass that started before the delete request skips its tail
+`gcCollect` while the store still reports the clear as freeing a
+deletion-pending row. [Its record](2026-08-05-a-cleared-finalizer-pushes-its-own-collect.md)
+is narrowed to that case rather than retired.
 
 Everything else an application used the long-lived client for is a round trip
 through `Client.Requeue`: keep what you learned in memory, ask for a pass, write

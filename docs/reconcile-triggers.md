@@ -324,7 +324,7 @@ is what the stamp is for.
 **Tests:** `TestDependencyRequeueLostAcrossRestart` (run under
 `WithStartupFullPass(false)`, so the full pass cannot hide the result),
 `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
-`TestDependencyVerbsBindTheSource`,
+`TestAddDependencyEnqueuesItsSource`,
 `TestANewEdgeOnAnInFlightSourceRespectsTheBackoff`,
 `TestReconcileMidPassDeclareLeavesTheDependentOwed`.
 
@@ -647,7 +647,7 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 `TestIntegrationDroppedDependencyCollectsWithoutThePush`,
 `TestObjects().DeleteFinalizerPushesTheCollect`,
 `TestObjects().DeleteFinalizerPushesNothingOtherwise`,
-`TestDeleteFinalizerTargetsThePassObject`,
+`TestDeleteFinalizerPushesTheCollect`,
 `TestIntegrationClearedFinalizerCollectsWithoutThePush`,
 `TestPhysicalDeletePushesItsOwner`, `TestPhysicalDeletePushBeatsAPendingAlarm`,
 `TestPhysicalDeletePushesNoLiveOwner`, `TestPhysicalDeletePushesNothingWhenBlocked`,

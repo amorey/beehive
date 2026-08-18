@@ -1253,18 +1253,6 @@ func registerNoop[Spec, Status any](t *testing.T, bh *Beehive, gk GroupKind) {
 	require.NoError(t, Register(bh, gk, &noopController[Spec, Status]{}))
 }
 
-// passClients builds pass clients for one kind, standing in for the reconcile
-// loop. A pass client is bound to one object, so a test writing for several
-// holds this and binds per call.
-type passClients[Status any] struct {
-	bh *Beehive
-	gk GroupKind
-}
-
-func (p passClients[Status]) at(id ObjectID) *controllerClientImpl[Status] {
-	return newPassClient[Status](p.bh, p.gk, id)
-}
-
 // registerWithClient registers c for gk and returns pass clients for it,
 // standing in for the pair Register used to return. Live, so it exercises the
 // write surface but not the scoping — that belongs to the pass-client tests.

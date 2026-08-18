@@ -104,9 +104,10 @@ func TestDeleteFinalizerPushesNothingWhenRolledBack(t *testing.T) {
 	require.NoError(t, client.Delete(ctx, obj.ID))
 	drainQueue(r.work)
 
-	require.NoError(t, cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
-		err := cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
-			require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, "f"))
+	pass := cc.at(obj.ID)
+	require.NoError(t, pass.Within(ctx, func(ctx context.Context) error {
+		err := pass.Within(ctx, func(ctx context.Context) error {
+			require.NoError(t, pass.DeleteFinalizer(ctx, "f"))
 			return errBoom
 		})
 		require.ErrorIs(t, err, errBoom)
@@ -287,69 +288,6 @@ func TestPassClientBindsThePassObject(t *testing.T) {
 	run, err := bh.store.Events().GetLatest(ctx, sibling.ID, "c")
 	require.NoError(t, err)
 	assert.Nil(t, run, "the sibling's event log too")
-}
-
-// TestDeleteFinalizerTargetsThePassObject pins both halves of the bound write:
-// the finalizer leaves the pass's object, and the collect its removal unblocks
-// is pushed for that object.
-func TestDeleteFinalizerTargetsThePassObject(t *testing.T) {
-	ctx := context.Background()
-	_, client, cc, r := specWriteFixture(t)
-
-	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"}, WithFinalizers("f"))
-	sibling := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"}, WithFinalizers("f"))
-	require.NoError(t, client.Delete(ctx, obj.ID))
-	require.NoError(t, client.Delete(ctx, sibling.ID))
-	drainQueue(r.work)
-
-	require.NoError(t, cc.at(obj.ID).DeleteFinalizer(ctx, "f"))
-
-	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work), "only the pass's object is pushed")
-	got, err := client.Get(ctx, sibling.ID)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"f"}, got.Finalizers, "a sibling keeps its finalizer")
-}
-
-// TestDependencyVerbsBindTheSource pins the source of both edge verbs: the pass's
-// object declares and drops its own dependencies, and the owed stamp lands on it.
-func TestDependencyVerbsBindTheSource(t *testing.T) {
-	ctx := context.Background()
-	f := newSameKindFixture(t)
-
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
-	refs, err := f.cc.bh.store.Edges().ListIncoming(ctx, f.target.ID, RelationDependsOn)
-	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.dep.ID}, objectRefIDs(refs), "the pass's object is the source")
-	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(), "and is what the new edge enqueues")
-
-	require.NoError(t, f.cc.at(f.dep.ID).DeleteDependency(ctx, f.target.ID))
-	refs, err = f.cc.bh.store.Edges().ListIncoming(ctx, f.target.ID, RelationDependsOn)
-	require.NoError(t, err)
-	assert.Empty(t, refs, "the drop names the same source")
-}
-
-// TestReadsBindThePassObject pins the direction of the edge reads: each answers
-// for the object the pass was handed, so the same edge reads as a dependency at
-// one end and a dependent at the other.
-func TestReadsBindThePassObject(t *testing.T) {
-	ctx := context.Background()
-	f := newSameKindFixture(t)
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
-
-	deps, err := f.cc.at(f.dep.ID).ListDependencies(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.target.ID}, objectRefIDs(deps))
-
-	dependents, err := f.cc.at(f.target.ID).ListDependents(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, []ObjectID{f.dep.ID}, objectRefIDs(dependents))
-
-	held, err := f.cc.at(f.target.ID).HasIncomingEdges(ctx)
-	require.NoError(t, err)
-	assert.True(t, held, "the target is pointed at")
-	held, err = f.cc.at(f.dep.ID).HasIncomingEdges(ctx)
-	require.NoError(t, err)
-	assert.False(t, held, "the source is not")
 }
 
 // TestControllerClientWithin verifies the opt-in atomicity surface: writes made

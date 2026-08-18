@@ -148,7 +148,7 @@ so a rollback or a savepoint unwind discards it.
 **Both enqueue their own kind.** A spec write is always to the client's own kind, and
 a declare is always from the pass's own object, so an edge — cross-kind at its far
 end — still enqueues the source through the client's own reconciler.
-`TestDependencyVerbsBindTheSource` pins the source.
+`TestAddDependencyEnqueuesItsSource` pins it.
 
 ### The backoff ladder now survives a non-converging edge set
 

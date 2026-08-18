@@ -24,9 +24,7 @@ import (
 
 // ErrWrongKind is returned by an id-keyed write whose target belongs to another
 // kind. The store folds the caller's kind into every write, so a wrong id fails
-// loudly instead of corrupting another kind's row. A ControllerClient cannot
-// raise it — it is bound to its own object — and Client reports it as
-// ErrNotFound, which leaves TestClient the only surface that returns it.
+// loudly instead of corrupting another kind's row.
 var ErrWrongKind = storeapi.ErrWrongKind
 
 // Controller is the user-supplied reconcile logic for a resource kind.
@@ -108,6 +106,17 @@ type controllerClientImpl[Status any] struct {
 // builds one per call and ends none, so live() always passes there.
 func newPassClient[Status any](bh *Beehive, gk GroupKind, id ObjectID) *controllerClientImpl[Status] {
 	return &controllerClientImpl[Status]{bh: bh, gk: gk, id: id}
+}
+
+// passClients builds pass clients for one kind, binding an object per call, for
+// the surfaces that take an id where a pass does not.
+type passClients[Status any] struct {
+	bh *Beehive
+	gk GroupKind
+}
+
+func (p passClients[Status]) at(id ObjectID) *controllerClientImpl[Status] {
+	return newPassClient[Status](p.bh, p.gk, id)
 }
 
 // Called once, after Reconcile returns and before beehive's own writes.
