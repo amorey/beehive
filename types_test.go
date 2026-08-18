@@ -16,7 +16,9 @@ package beehive
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -157,5 +159,52 @@ func TestEventDetail(t *testing.T) {
 	t.Run("malformed detail errors", func(t *testing.T) {
 		_, err := EventDetail[probeDetail](Event{Detail: json.RawMessage(`{`)})
 		assert.Error(t, err)
+	})
+}
+
+// The three constructors round-trip their kind and payload, and each reports
+// the scheduling and handshake decisions the reconcile loop reads off them.
+func TestReconcileResultConstructors(t *testing.T) {
+	t.Run("Settled carries its delay and settles", func(t *testing.T) {
+		r := Settled(time.Minute).normalize()
+		assert.Equal(t, kindSettled, r.kind)
+		assert.Equal(t, time.Minute, r.requeueAfter)
+		assert.NoError(t, r.err)
+	})
+
+	t.Run("Unsettled carries its delay and does not settle", func(t *testing.T) {
+		r := Unsettled(time.Minute).normalize()
+		assert.Equal(t, kindUnsettled, r.kind)
+		assert.Equal(t, time.Minute, r.requeueAfter)
+		assert.NoError(t, r.err)
+	})
+
+	t.Run("Fail carries its error", func(t *testing.T) {
+		sentinel := errors.New("boom")
+		r := Fail(sentinel).normalize()
+		assert.Equal(t, kindFail, r.kind)
+		assert.ErrorIs(t, r.err, sentinel)
+	})
+}
+
+// The zero value names no kind, so normalize turns it into a failure rather
+// than letting it reach a gate that would read it as a success and stamp a
+// generation no pass observed. Fail(nil) is the same mistake spelled out.
+func TestReconcileResultNormalizeRejectsUnusableValues(t *testing.T) {
+	t.Run("the zero value fails", func(t *testing.T) {
+		r := ReconcileResult{}.normalize()
+		assert.Equal(t, kindFail, r.kind)
+		assert.ErrorIs(t, r.err, ErrInvalidResult)
+	})
+
+	t.Run("Fail(nil) fails", func(t *testing.T) {
+		r := Fail(nil).normalize()
+		assert.Equal(t, kindFail, r.kind)
+		assert.ErrorIs(t, r.err, ErrInvalidResult)
+	})
+
+	t.Run("normalize is idempotent", func(t *testing.T) {
+		once := ReconcileResult{}.normalize()
+		assert.Equal(t, once, once.normalize())
 	})
 }

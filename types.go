@@ -233,6 +233,76 @@ type Result struct {
 	RequeueAfter time.Duration
 }
 
+// ErrInvalidResult is the error a Reconcile returning an unusable
+// ReconcileResult fails with: the zero value, which names no kind, or
+// Fail(nil). Both are programming errors; the reconcile takes the backoff
+// ladder rather than settling anything.
+var ErrInvalidResult = errors.New("beehive: unusable ReconcileResult")
+
+// resultKind is ReconcileResult's discriminant. Its zero names no kind, which
+// is what makes the zero ReconcileResult detectable.
+type resultKind uint8
+
+const (
+	kindInvalid resultKind = iota
+	kindSettled
+	kindUnsettled
+	kindFail
+)
+
+// ReconcileResult is what a controller's Reconcile returns. Build it with
+// Settled, Unsettled or Fail; the zero value is not usable and fails the pass
+// with ErrInvalidResult.
+type ReconcileResult struct {
+	kind         resultKind
+	requeueAfter time.Duration
+	err          error
+}
+
+// Settled reports that the pass fully observed the object's current
+// generation, which beehive records. It does not claim the object is healthy.
+// requeueAfter schedules the next pass; zero schedules nothing.
+func Settled(requeueAfter time.Duration) ReconcileResult {
+	return ReconcileResult{kind: kindSettled, requeueAfter: requeueAfter}
+}
+
+// Unsettled reports a successful pass over an object that is not caught up to
+// its spec, so no generation is recorded. requeueAfter schedules the next pass;
+// zero requeues as soon as the work queue's per-object floor allows.
+func Unsettled(requeueAfter time.Duration) ReconcileResult {
+	return ReconcileResult{kind: kindUnsettled, requeueAfter: requeueAfter}
+}
+
+// Fail reports that the pass failed, so it settles nothing and takes the
+// backoff ladder. A nil err is itself a failure, reported as ErrInvalidResult.
+func Fail(err error) ReconcileResult {
+	return ReconcileResult{kind: kindFail, err: err}
+}
+
+// normalize folds every unusable value into a failure. It runs once, in the
+// reconcile path, before anything reads the result: every gate downstream tests
+// for the kinds it admits, so an un-normalized zero would read as neither a
+// failure nor a success and slip through a negative test.
+func (r ReconcileResult) normalize() ReconcileResult {
+	if r.kind == kindInvalid {
+		return Fail(fmt.Errorf("%w: the zero value", ErrInvalidResult))
+	}
+	if r.kind == kindFail && r.err == nil {
+		return Fail(fmt.Errorf("%w: Fail(nil)", ErrInvalidResult))
+	}
+	return r
+}
+
+// settles reports whether the pass recorded the generation it was handed.
+func (r ReconcileResult) settles() bool { return r.kind == kindSettled }
+
+// succeeded reports whether the pass ran to completion, settled or not. Every
+// post-reconcile write gates on this, naming the kinds it admits rather than
+// testing for the absence of a failure.
+func (r ReconcileResult) succeeded() bool {
+	return r.kind == kindSettled || r.kind == kindUnsettled
+}
+
 // Schedule reports when an object is next due to reconcile. A struct so fields
 // can be added without a breaking change.
 type Schedule struct {
