@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1366,13 +1367,25 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	var captured ControllerClient[cStatus]
+	var (
+		captured ControllerClient[cStatus]
+		passes   int
+	)
 	ran := make(chan struct{}, 4)
 	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-		captured = cc
+		passes++
+		if passes == 1 {
+			// Only the first pass's client is captured, so the test reads it
+			// after that pass has been signalled and nothing writes it again.
+			captured = cc
+		}
+		// A value per pass: UpdateStatus skips a byte-identical write, so a
+		// constant would make the second pass's write indistinguishable from no
+		// write at all.
+		val := fmt.Sprintf("inside-%d", passes)
 		// Live for the whole of Reconcile, Within included.
 		if err := cc.Within(ctx, func(ctx context.Context) error {
-			return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "inside"})
+			return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: val})
 		}); err != nil {
 			return Fail(err)
 		}
@@ -1382,7 +1395,7 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 		}
 		return Settled(0)
 	}}
-	registerClient := registerWithClient(t, bh, clientTestGK, inner)
+	require.NoError(t, Register(bh, clientTestGK, inner))
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1409,15 +1422,21 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 		got, err := client.Get(ctx, obj.ID)
 		require.NoError(t, err)
 		require.NotNil(t, got.Status)
-		assert.Equal(t, "inside", got.Status.Val)
+		assert.Equal(t, "inside-1", got.Status.Val)
 	})
 
-	// The Register client is the application's and outlives every pass by design.
-	t.Run("the Register client is unaffected", func(t *testing.T) {
-		require.NoError(t, registerClient.UpdateStatus(ctx, obj.ID, cStatus{Val: "from outside"}))
+	// The restriction is on the pass, not on the kind: the next pass gets a
+	// working client for the same object.
+	t.Run("the next pass writes", func(t *testing.T) {
+		require.NoError(t, client.Requeue(ctx, obj.ID))
+		select {
+		case <-ran:
+		case <-time.After(testTimeout):
+			t.Fatal("the requeue never reconciled")
+		}
 		got, err := client.Get(ctx, obj.ID)
 		require.NoError(t, err)
-		assert.Equal(t, "from outside", got.Status.Val)
+		assert.Equal(t, "inside-2", got.Status.Val)
 	})
 }
 
