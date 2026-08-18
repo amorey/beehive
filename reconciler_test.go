@@ -3697,6 +3697,52 @@ func TestReconcilerBareUnsettledSchedulesItself(t *testing.T) {
 	}
 }
 
+// The 30s default is an upper bound, not a period: alarmRequeueAfter does not
+// absorb an arriving add, so a wake landing inside the window dispatches on the
+// floor's schedule instead of waiting the alarm out.
+func TestReconcilerBareUnsettledYieldsToAPush(t *testing.T) {
+	first, second := make(chan struct{}), make(chan struct{})
+	var onceFirst, onceSecond sync.Once
+	calls := 0
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			calls++
+			if calls == 1 {
+				onceFirst.Do(func() { close(first) })
+				return Unsettled()
+			}
+			onceSecond.Do(func() { close(second) })
+			return Settled()
+		},
+	}
+	q := newWorkQueue()
+	q.setFloor(60 * time.Millisecond)
+	r := &reconciler{adapter: adapter, work: q, backoffFor: make(map[ObjectID]time.Duration)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+	defer func() { cancel(); waitClosed(t, done, "run to exit") }()
+
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+	r.enqueue(1)
+	waitClosed(t, first, "the first reconcile")
+
+	// Push only once the alarm is really pending, or a fast dispatch would prove
+	// nothing about outranking it.
+	waitCtx, waitCancel := context.WithTimeout(ctx, testTimeout)
+	defer waitCancel()
+	for {
+		ev, err := rx.RecvContext(waitCtx)
+		require.NoError(t, err, "the bare Unsettled alarm")
+		if ev.Value.Schedule.NextRequeueAt.After(time.Now().Add(5 * time.Second)) {
+			break
+		}
+	}
+
+	r.enqueue(1)
+	waitClosed(t, second, "the pushed reconcile, which must not wait out the 30s alarm")
+}
+
 // An unusable result takes the backoff ladder, never the success path — a
 // negative gate ("not a Fail") would let the zero value through. The adapter
 // normalizes first, so what arrives carries ErrInvalidResult and is logged.
