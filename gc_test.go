@@ -71,8 +71,11 @@ func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc Con
 		return Settled(0)
 	}
 	referenced, err := cc.HasIncomingEdges(ctx, obj.ID)
-	if err != nil || referenced {
-		return Fail(err) // a live user remains; keep the finalizer
+	if err != nil {
+		return Fail(err)
+	}
+	if referenced {
+		return Settled(0) // a live user remains; keep the finalizer
 	}
 	if err := cc.DeleteFinalizer(ctx, obj.ID, c.finalizer); err != nil {
 		return Fail(err)

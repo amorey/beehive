@@ -732,8 +732,13 @@ Tests: `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfterNewestWins`,
 progress as soon as it is called again; one waiting on something external should
 return a delay, or it polls at the floor forever.
 
-No durable record either, but an `Unsettled` pass stamps no generation, so the
-unsettled listing (section A) is what recovers it across a restart.
+No durable record either, and **not** recovered by the unsettled listing in the
+general case: that listing gates on `observed_generation IS NULL OR
+observed_generation < generation`, so declining to stamp does not un-settle a row.
+An object already converged — woken by a dependency, say — that returns
+`Unsettled(0)` is absent from the listing, and a restart drops the chain exactly
+as section 13's does. Only an object whose generation really has moved past what
+was observed is recovered.
 
 Tests: `TestReconcilerSchedulesFromTheResultKind`.
 
