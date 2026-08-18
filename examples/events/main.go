@@ -78,7 +78,7 @@ type ClusterController struct{}
 
 func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
 	if probed(obj) {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 	// The events and the record that they were written commit together, so a
 	// pass that runs again — after a crash, or after a failure beehive retries —
@@ -112,7 +112,7 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
 	if err != nil {
 		return beehive.Fail(err)
 	}
-	return beehive.Settled(0)
+	return beehive.Settled()
 }
 
 // probed reports whether this generation's events are already in the log.

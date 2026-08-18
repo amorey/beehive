@@ -55,12 +55,12 @@ type PanelController struct{}
 
 func (c *PanelController) Reconcile(ctx context.Context, client beehive.ControllerClient[PanelStatus], obj *beehive.Object[PanelSpec, PanelStatus]) beehive.ReconcileResult {
 	if obj.DeletionRequestedAt != nil || (obj.Status != nil && obj.Status.Connected) {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 	if err := client.UpdateStatus(ctx, obj.ID, PanelStatus{Connected: true}); err != nil {
 		return beehive.Fail(err)
 	}
-	return beehive.Settled(0)
+	return beehive.Settled()
 }
 
 func exitOnErr(err error) {

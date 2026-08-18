@@ -1608,7 +1608,7 @@ func (c *settlingCapture) Reconcile(ctx context.Context, cc ControllerClient[cSt
 		return Fail(err)
 	}
 	c.ch <- obj.ID
-	return Settled(0)
+	return Settled()
 }
 
 // TestStaleDependentsPassEnqueuesStaleDependents is the driver end to end, with

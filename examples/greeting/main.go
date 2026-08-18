@@ -53,12 +53,12 @@ type GreetingController struct{}
 func (gc *GreetingController) Reconcile(ctx context.Context, client beehive.ControllerClient[GreetingStatus], obj *beehive.Object[GreetingSpec, GreetingStatus]) beehive.ReconcileResult {
 	want := "Hello, " + obj.Spec.Name
 	if obj.Status != nil && obj.Status.Message == want {
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 	if err := client.UpdateStatus(ctx, obj.ID, GreetingStatus{Message: want}); err != nil {
 		return beehive.Fail(err)
 	}
-	return beehive.Settled(0)
+	return beehive.Settled()
 }
 
 func exitOnErr(err error) {

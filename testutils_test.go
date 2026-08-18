@@ -1239,7 +1239,7 @@ type noopController[Spec, Status any] struct{}
 // Unsettled, and far enough out that nothing re-dispatches inside a test: a
 // Settled pass would stamp the generation, a real write these tests do not expect.
 func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) ReconcileResult {
-	return Unsettled(time.Hour)
+	return Unsettled().RequeueAfter(time.Hour)
 }
 
 // registerNoop registers a do-nothing controller for gk, making the kind count as
@@ -1501,7 +1501,7 @@ type reconcileCapture struct {
 
 func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	c.ch <- obj
-	return Settled(0)
+	return Settled()
 }
 
 // addEdge declares an edge for test scaffolding: it drains the owed-wake stamp

@@ -166,17 +166,17 @@ func TestEventDetail(t *testing.T) {
 // The three constructors round-trip their kind and payload, and each reports
 // the scheduling and handshake decisions the reconcile loop reads off them.
 func TestReconcileResultConstructors(t *testing.T) {
-	t.Run("Settled carries its delay and settles", func(t *testing.T) {
-		r := Settled(time.Minute).normalize()
+	t.Run("Settled settles and schedules nothing of its own", func(t *testing.T) {
+		r := Settled().normalize()
 		assert.Equal(t, kindSettled, r.kind)
-		assert.Equal(t, time.Minute, r.requeueAfter)
+		assert.False(t, r.requeueSet)
 		assert.NoError(t, r.err)
 	})
 
-	t.Run("Unsettled carries its delay and does not settle", func(t *testing.T) {
-		r := Unsettled(time.Minute).normalize()
+	t.Run("Unsettled does not settle and schedules nothing of its own", func(t *testing.T) {
+		r := Unsettled().normalize()
 		assert.Equal(t, kindUnsettled, r.kind)
-		assert.Equal(t, time.Minute, r.requeueAfter)
+		assert.False(t, r.requeueSet)
 		assert.NoError(t, r.err)
 	})
 
@@ -188,12 +188,34 @@ func TestReconcileResultConstructors(t *testing.T) {
 	})
 }
 
+// RequeueAfter sets the delay without touching the kind, and its zero is a
+// schedule of its own rather than the absence of one.
+func TestReconcileResultRequeueAfter(t *testing.T) {
+	t.Run("it carries the delay and keeps the kind", func(t *testing.T) {
+		r := Settled().RequeueAfter(time.Minute)
+		assert.Equal(t, kindSettled, r.kind)
+		assert.True(t, r.requeueSet)
+		assert.Equal(t, time.Minute, r.requeueAfter)
+	})
+
+	t.Run("a zero delay is set, not absent", func(t *testing.T) {
+		assert.True(t, Unsettled().RequeueAfter(0).requeueSet)
+		assert.False(t, Unsettled().requeueSet)
+	})
+
+	t.Run("it does not make the zero value usable", func(t *testing.T) {
+		r := ReconcileResult{}.RequeueAfter(time.Minute).normalize()
+		assert.Equal(t, kindFail, r.kind)
+		assert.ErrorIs(t, r.err, ErrInvalidResult)
+	})
+}
+
 // Err is the only way a caller outside the package reads a failed pass, so it
 // answers for the unusable results too rather than reporting their nil.
 func TestReconcileResultErrReportsTheFailure(t *testing.T) {
 	t.Run("a success carries no error", func(t *testing.T) {
-		assert.NoError(t, Settled(0).Err())
-		assert.NoError(t, Unsettled(0).Err())
+		assert.NoError(t, Settled().Err())
+		assert.NoError(t, Unsettled().Err())
 	})
 
 	t.Run("a failure carries its error through a wrap", func(t *testing.T) {

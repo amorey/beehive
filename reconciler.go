@@ -88,7 +88,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	if errors.Is(err, ErrNotFound) {
 		// Already collected between enqueue and now: a no-op success.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
-		return Settled(0), true
+		return Settled(), true
 	}
 	if err != nil {
 		return Fail(err), false
@@ -111,9 +111,9 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
 				return Fail(gcErr), false
 			}
-			return Settled(0), gone
+			return Settled(), gone
 		}
-		return Settled(0), false
+		return Settled(), false
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
@@ -175,7 +175,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// rescheduling a dead id straight into ErrNotFound.
 		if gone {
 			log.DebugContext(ctx, "object collected")
-			return Settled(0), true
+			return Settled(), true
 		}
 	}
 	return result, false

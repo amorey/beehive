@@ -459,7 +459,7 @@ func TestConditionsOnlyControllerSettlesByReturningSettled(t *testing.T) {
 		case reconciled <- struct{}{}:
 		default:
 		}
-		return Settled(0)
+		return Settled()
 	}}
 	err := Register(bh, clientTestGK, inner)
 	require.NoError(t, err)
@@ -887,7 +887,7 @@ type redeclareController struct {
 
 func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	if obj.ID == c.target {
-		return Settled(0)
+		return Settled()
 	}
 	if c.calls.Add(1) >= hotLoopCalls {
 		c.hot.fire()
@@ -1333,9 +1333,9 @@ func TestObservedGenerationStampWakesTheKindsWatches(t *testing.T) {
 	var settle atomic.Bool
 	ctrl := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		if settle.Load() {
-			return Settled(0)
+			return Settled()
 		}
-		return Unsettled(time.Hour)
+		return Unsettled().RequeueAfter(time.Hour)
 	}}
 	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
@@ -1391,7 +1391,7 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 		case ran <- struct{}{}:
 		default:
 		}
-		return Settled(0)
+		return Settled()
 	}}
 	require.NoError(t, Register(bh, clientTestGK, inner))
 	stop, err := bh.Start(ctx)
@@ -1466,7 +1466,7 @@ func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
 		case ran <- struct{}{}:
 		default:
 		}
-		return Settled(0)
+		return Settled()
 	}}
 	err := Register(bh, clientTestGK, inner)
 	require.NoError(t, err)
