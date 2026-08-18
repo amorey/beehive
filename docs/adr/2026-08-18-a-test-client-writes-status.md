@@ -1,7 +1,6 @@
-# A beehivetest client writes status and conditions outside a pass
+# A TestClient writes status and conditions outside a pass
 
-- **Status:** Accepted — implemented in `beehivetest/`, `internal/testseam/`,
-  `testseam.go`.
+- **Status:** Accepted — implemented in `testclient.go`.
 - **Date:** 2026-08-18
 
 ## Context
@@ -23,34 +22,31 @@ external package cannot name.
 
 ## Decision
 
-`beehivetest.NewClient[Status](bh, gk)` returns a `*beehivetest.Client[Status]`
-with `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition` — the
-pass client's status half, minus `AddEvent`. Both paths write through the same
-non-generic `kindWriter`, so the wake obligation has one site rather than one per
-caller. It needs no registered controller
-and no running beehive, and it resolves the schema version and emits the commit
-wake itself, so it is correct on both sides of `Start`.
+`NewTestClient[Status](bh, gk)` returns a `*TestClient[Status]` with
+`UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition` — the pass
+client's status half, minus `AddEvent`. It needs no registered controller and no
+running beehive, and it writes through the same `kindWriter` a pass does, so the
+schema version and the commit wake are resolved in one place and it is correct on
+both sides of `Start`.
 
 **It is the last resort, not the first.** A controller test that needs only the
 object it is handed should call `Reconcile` directly against a fake
 `ControllerClient`: no store, no beehive, and the assertion lands on what the
-pass decided. This package is for what that cannot cover — a pass reading
-another kind's status out of a real store.
+pass decided. `TestClient` is for what that cannot cover — a pass reading another
+kind's status out of a real store.
 
-**A separate package, not a method on `Beehive`.** A method leaks: an external
-caller can call a method returning an internal type without naming it, and
-`GroupKind`/`ObjectID` are public aliases, so `bh.TestWriter().UpdateStatus(ctx,
-gk, id, blob)` would compile outside the module. The seam is a hook in
-`internal/testseam` that `beehive` sets in `init`, which keeps `Beehive`'s
-exported surface at `Start` alone and puts the warning in the package name.
-`beehivetest` sits under the module path, so it may import `internal/storeapi`
-and construct `storeapi.Condition` — which is why conditions work with no public
-`Condition` alias and no widening of `Store`.
-
-`Open` takes `any` (the seam cannot import `beehive` without a cycle) and must
-reject a **typed** nil: `NewClient(nil, gk)` passes a non-nil interface holding a
-nil `*Beehive`, so the assertion alone admits it and the panic would arrive later
-as a nil dereference.
+**In package `beehive`, not a `beehivetest` sub-package.** A separate package
+would have to reach `bh.store`, `bh.migratorFor` and `bh.kindWriteHub`, none of
+which are exported; the only ways across are an exported method returning an
+internal type — which an external caller can still call, since `GroupKind` and
+`ObjectID` are public aliases — or a hook in an internal package set by `init`.
+Both buy exactly one thing over living in the root: the warning sits in a package
+name instead of an identifier. Neither prevents production use, because the
+constructor is exported either way. `TestClient` carries the warning in the name
+it is called by, and costs no seam, no `any` parameter, no typed-nil trap and no
+tripwire guarding a second producer. A generic *method* would not work
+(`bh.UpdateStatusForTest`), but a package-level generic function does, and
+`NewClient` is already one.
 
 ## Consequences
 
@@ -62,6 +58,11 @@ On a running beehive a fixture write races the object's own pass, last-writer-
 wins at the store. The ordinary hazard of two writers, not a broken invariant; a
 fixture parking state on an object its controller is actively settling sequences
 that itself.
+
+Two names join the root package's godoc, which is the price of not having a
+package name to hide behind. In exchange the `Condition` conversion is shared
+with the pass client (`conditionsToRaw`) rather than copied across a package
+boundary, which is what a sub-package forced.
 
 `AddEvent` is deliberately absent — appending to an event log out of band is the
 capability the pass-client change removed rather than relocated, and it stays in

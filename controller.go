@@ -146,6 +146,22 @@ func (w kindWriter) wakeAfter(ctx context.Context, err error) error {
 	return nil
 }
 
+// conditionsToRaw is the write-side conversion. Unconfirmed and the two stamps
+// are set by the store on read and ignored on write, so they are not carried.
+func conditionsToRaw(conditions []Condition) []storeapi.Condition {
+	conds := make([]storeapi.Condition, len(conditions))
+	for i, condition := range conditions {
+		conds[i] = storeapi.Condition{
+			Type:     condition.Type,
+			Status:   string(condition.Status),
+			Reason:   condition.Reason,
+			Message:  condition.Message,
+			Liveness: condition.Liveness,
+		}
+	}
+	return conds
+}
+
 func (w kindWriter) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
 	return w.wakeAfter(ctx, w.bh.store.Conditions().Delete(ctx, w.gk, id, conditionType))
 }
@@ -181,17 +197,7 @@ func (c *controllerClientImpl[Status]) SetConditions(ctx context.Context, id Obj
 	if len(conditions) == 0 {
 		return nil
 	}
-	conds := make([]storeapi.Condition, len(conditions))
-	for i, condition := range conditions {
-		conds[i] = storeapi.Condition{
-			Type:     condition.Type,
-			Status:   string(condition.Status),
-			Reason:   condition.Reason,
-			Message:  condition.Message,
-			Liveness: condition.Liveness,
-		}
-	}
-	return c.writes().SetConditions(ctx, id, conds...)
+	return c.writes().SetConditions(ctx, id, conditionsToRaw(conditions)...)
 }
 
 func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {

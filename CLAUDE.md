@@ -357,18 +357,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   and calls `Client.Requeue`; appending to an event log out of band is the one
   capability this removes rather than relocates (`docs/TODO.md`).
   → [ADR](docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md)
-- **A `beehivetest` client writes status and conditions outside a pass**, for
-  the fixture a `ControllerClient`'s pass scoping made unbuildable: a controller
-  reading *another kind's* status needs a stored one. Last resort, not first — a
+- **`TestClient` writes status and conditions outside a pass**, for the fixture
+  a `ControllerClient`'s pass scoping made unbuildable: a controller reading
+  *another kind's* status needs a stored one. Last resort, not first — a
   controller test that needs only the object it is handed calls `Reconcile`
-  directly against a fake `ControllerClient`. A separate package rather than a
-  method on `Beehive`, because a method returning an internal type is still
-  callable from outside the module; the seam is a hook in `internal/testseam`
-  that `beehive` sets in `init`, and `beehivetest` sits under the module path so
-  it can name `storeapi.Condition` with no public alias. It resolves the status
-  schema version and emits the commit wake, so it is correct on both sides of
-  `Start`, and it never stamps `observed_generation`.
-  → [ADR](docs/adr/2026-08-18-a-beehivetest-client-writes-status.md)
+  directly against a fake `ControllerClient`. It lives in package `beehive`
+  rather than a `beehivetest` sub-package: a sub-package cannot reach `bh.store`
+  or the write hub, so it would need a seam, and the seam buys only a package
+  name to hide the warning in — the constructor is exported either way. It
+  writes through the same `kindWriter` a pass does, so the schema version and the
+  commit wake have one site, and it never stamps `observed_generation`.
+  → [ADR](docs/adr/2026-08-18-a-test-client-writes-status.md)
 - **A downgraded liveness condition says so.** `downgradeLiveness` sets
   `Condition.Unconfirmed` beside the `Unknown` rewrite, because the predicate
   (`UpdatedAt` before `processStart`) is store-internal and a remote consumer

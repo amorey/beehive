@@ -17,4 +17,4 @@ work we have decided to do.
 No spec is in flight.
 
 The last spec shipped as
-[A beehivetest client writes status and conditions outside a pass](../adr/2026-08-18-a-beehivetest-client-writes-status.md).
+[A TestClient writes status and conditions outside a pass](../adr/2026-08-18-a-test-client-writes-status.md).

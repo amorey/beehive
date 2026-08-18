@@ -777,16 +777,16 @@ A non-nil error triggers an automatic retry with exponential backoff starting at
 
 `Reconcile` takes an interface and the object it acts on, so the cheapest test calls it directly against a fake `ControllerClient` — no store and no beehive, and the assertion lands on what the pass *decided* rather than on what a row ended up holding. Assert a controller's own status writes this way.
 
-That stops covering a pass that reads *another kind's* status out of the store, because calling `Reconcile` directly leaves the read where it was. For that fixture, `beehivetest` writes the columns only a controller can otherwise write:
+That stops covering a pass that reads *another kind's* status out of the store, because calling `Reconcile` directly leaves the read where it was. For that fixture, `TestClient` writes the columns only a controller can otherwise write:
 
 ```go
-c := beehivetest.NewClient[ClusterStatus](bh, clusterGK)
+c := beehive.NewTestClient[ClusterStatus](bh, clusterGK)
 require.NoError(t, c.UpdateStatus(ctx, cluster.ID, ClusterStatus{Server: ServerStatus{UID: "server-1"}}))
 ```
 
-It needs no registered controller and no running beehive, and carries `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition`. It resolves the status schema version from the kind's `Migrator` and wakes the watch tailers itself, so it is correct before `Start` and while beehive runs — though on a running beehive it races that object's own pass, last-writer-wins.
+It needs no registered controller and no running beehive, and carries `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition`. It writes through the same core a pass does, so it resolves the status schema version from the kind's `Migrator` and wakes the watch tailers — correct before `Start` and while beehive runs, though on a running beehive it races that object's own pass, last-writer-wins.
 
-It never stamps `observed_generation`: the handshake stays beehive's, so an object given a fixture status is still unsettled and the owed pass will reconcile it once beehive starts. → [ADR](docs/adr/2026-08-18-a-beehivetest-client-writes-status.md)
+It never stamps `observed_generation`: the handshake stays beehive's, so an object given a fixture status is still unsettled and the owed pass will reconcile it once beehive starts. → [ADR](docs/adr/2026-08-18-a-test-client-writes-status.md)
 
 ### Migrator
 
