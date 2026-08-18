@@ -68,8 +68,7 @@ table derived from the verbs would miss two rows:
 - `bumpObject`, reached by `Conditions().Set` and `Conditions().Delete`. Controllers
   write conditions constantly.
 - The owner cascade. `DeletionRequests().CreateFromOwner` marks children across
-  several kinds in one call, so the wake is routed by the refs it returns —
-  the same way the new-edge enqueue routes by `EdgesAddResult.From` — and
+  several kinds in one call, so the wake is routed by the refs it returns and
   deduped by kind, so a wide cascade queues one commit hook per kind rather
   than per row.
 

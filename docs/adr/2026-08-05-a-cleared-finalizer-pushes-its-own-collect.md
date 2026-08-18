@@ -65,6 +65,15 @@ freeing a deletion-pending row. The sibling case it also covered is gone —
 a client is [bound to its pass's object](2026-08-18-a-controller-client-exists-only-for-a-pass.md). The redundant
 case now costs nothing, because that is the dispatch `forget` drops.
 
+**Nothing constructs the surviving case.** It went with the sibling fixture, and
+it is not isolatable: the delete request that lands mid-pass
+[pushes its own collect](2026-08-04-a-delete-request-pushes-its-own-collect.md),
+which re-dispatches the same object once the pass ends, so a test cannot tell
+which push collected it. That leaves this one the *direct* trigger rather than
+the only one. `TestDeleteFinalizerPushesTheCollect` still pins that it fires, so
+the push cannot be deleted silently — but the interleaving that justifies it is
+argued, not tested.
+
 Routes 2 and 3 still wait for a sweep. `WithGCInterval` cannot be disabled, so
 every block keeps a tick behind it, which is also what covers route 1 after a
 crash.

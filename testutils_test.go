@@ -1514,13 +1514,21 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 	if err != nil {
 		return err
 	}
-	if res.ReconcileOwedStamped {
-		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
-		// the source's own kind is needed here — and res.From already carries it,
-		// projected from the endpoint check EdgesAdd had to do anyway.
-		return store.ReconcileOwed().Decrement(ctx, res.From, from, 1)
+	if !res.ReconcileOwedStamped {
+		return nil
 	}
-	return nil
+	// The decrement is kind-scoped and scaffolding declares edges across kinds, so
+	// the source's own kind is needed here; the edge just written names it.
+	sources, err := store.Edges().ListIncoming(ctx, to, relation)
+	if err != nil {
+		return err
+	}
+	for _, src := range sources {
+		if src.ID == from {
+			return store.ReconcileOwed().Decrement(ctx, src.GroupKind(), from, 1)
+		}
+	}
+	return fmt.Errorf("addEdge: %d is missing from the edge it just wrote", from)
 }
 
 // objectRefIDs projects an ObjectRef slice to its ids, for assertions that care

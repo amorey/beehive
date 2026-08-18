@@ -2612,12 +2612,12 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 		// One round-trip, no blobs. A join, not scalar subqueries: SQLite does no
 		// CSE, so separate subqueries would seek the same row twice. A missing
 		// endpoint yields no row — clean ErrNotFound over an FK violation.
-		var from, to storeapi.GroupKind
+		var to storeapi.GroupKind
 		var toDeletedAt *int64
 		err := s.conn(ctx).QueryRowContext(ctx, `
-			SELECT f."group", f.kind, t."group", t.kind, t.deletion_requested_at
+			SELECT t."group", t.kind, t.deletion_requested_at
 			FROM objects f, objects t WHERE f.id = ? AND t.id = ?`,
-			fromID, toID).Scan(&from.Group, &from.Kind, &to.Group, &to.Kind, &toDeletedAt)
+			fromID, toID).Scan(&to.Group, &to.Kind, &toDeletedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return storeapi.ErrNotFound
 		}
@@ -2667,7 +2667,6 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 			return err
 		}
 		out = storeapi.EdgesAddResult{
-			From:                 from,
 			To:                   to,
 			ToDeleting:           toDeletedAt != nil,
 			ReconcileOwedStamped: stamped,

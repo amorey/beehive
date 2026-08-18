@@ -77,11 +77,9 @@ not a complication of this sweep.
 
 ### Alternatives considered
 
-- **Gate the stamp instead of reclaiming it.** `DependenciesAdd` does not learn
-  `fromID`'s kind until `res.From` comes back *from* the `Edges().Add` call, so gating
-  means either a pre-read on a path controllers re-run every pass, or pushing the
-  registered-kind set into `EdgesAddInput` and gating in SQL — a kind list threaded
-  through every edge write. It also splits the stamp from the edge, which
+- **Gate the stamp instead of reclaiming it.** The store cannot tell whether `fromID`'s kind has a
+  reconcile loop, so gating means pushing the registered-kind set into the edge
+  write and gating in SQL — a kind list threaded through every one. It also splits the stamp from the edge, which
   `DependenciesAdd` exists to keep indivisible. The sweep needs the same kind list,
   once per sweep instead of once per write.
 - **Keep the count, on the grounds that a later controller needs it.** Answered by

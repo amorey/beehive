@@ -395,8 +395,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Every new `depends_on` edge stamps an owed reconcile** (`reconcile_owed`),
   atomically with the edge inside `Edges().Add`, drained by the owed pass. The
   declaration also enqueues the source at commit, gated on
-  `ReconcileOwedStamped` and routed by `EdgesAddResult.From` (the edge is
-  cross-kind). The edge push is throttled; the spec write's is not.
+  `ReconcileOwedStamped` and routed by the client's own kind, the source being
+  its own object. The edge push is throttled; the spec write's is not.
   → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - **Secondary lookups are read on request**, never folded into the blob-carrying

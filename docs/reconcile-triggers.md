@@ -295,8 +295,8 @@ See [the ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md).
 
 **Push:** the declaration enqueues the source. `Beehive.signalRequeueNow`/`signalRequeueThrottled` runs on
 `Store.AfterCommit`. It is gated on `EdgesAddResult.ReconcileOwedStamped` and routed
-by `EdgesAddResult.From`. The route matters because the edge is cross-kind. The
-source's kind can differ from the declarer's kind.
+by the declaring client's own kind. Only the far end of the edge is cross-kind;
+the source is the object the pass was handed.
 
 **The enqueue is throttled**, so a source whose edge set never converges keeps its
 backoff ladder, and a declaration made inside the source's own pass is held to that
@@ -645,9 +645,8 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 `TestDependenciesDeleteSkipsClientOnlyTarget`,
 `TestIntegrationDroppedDependencyCollectsWithoutASweep`,
 `TestIntegrationDroppedDependencyCollectsWithoutThePush`,
-`TestObjects().DeleteFinalizerPushesTheCollect`,
-`TestObjects().DeleteFinalizerPushesNothingOtherwise`,
 `TestDeleteFinalizerPushesTheCollect`,
+`TestDeleteFinalizerPushesNothingOtherwise`,
 `TestIntegrationClearedFinalizerCollectsWithoutThePush`,
 `TestPhysicalDeletePushesItsOwner`, `TestPhysicalDeletePushBeatsAPendingAlarm`,
 `TestPhysicalDeletePushesNoLiveOwner`, `TestPhysicalDeletePushesNothingWhenBlocked`,
