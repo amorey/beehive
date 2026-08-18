@@ -45,11 +45,13 @@ type controllerAdapter interface {
 // typedController adapts a generic Controller[Spec, Status] to the non-generic
 // controllerAdapter interface.
 type typedController[Spec, Status any] struct {
-	gk     GroupKind
-	bh     *Beehive
-	inner  Controller[Spec, Status]
-	client ControllerClient[Status] // built once at Register, passed into each Reconcile
-	logger *slog.Logger             // kind-tagged; set by Register
+	gk    GroupKind
+	bh    *Beehive
+	inner Controller[Spec, Status]
+	// client is built once at Register and is the same value Register returns.
+	// Each pass wraps it in a scopedControllerClient rather than handing it out.
+	client *controllerClientImpl[Status]
+	logger *slog.Logger // kind-tagged; set by Register
 }
 
 // log guards the rare path where a typedController is built outside Register.
@@ -100,10 +102,14 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
+	// The controller gets a client scoped to this pass, ended below: nothing it
+	// captures may write after beehive starts concluding the pass.
+	pass := &scopedControllerClient[Status]{inner: t.client}
 	// normalize runs before anything reads the result: every gate below names
 	// the kinds it admits, and an un-normalized zero would satisfy none of them
 	// while also not being a failure.
-	result := t.inner.Reconcile(ctx, t.client, obj).normalize()
+	result := t.inner.Reconcile(ctx, pass, obj).normalize()
+	pass.end()
 	if !result.succeeded() {
 		// Warn, not Error: the retry loop absorbs failed reconciles. Don't return
 		// yet — committed writes still need their GC follow-up below.

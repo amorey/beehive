@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1347,4 +1348,121 @@ func TestUpdateStatusDoesNotTouchTheHandshake(t *testing.T) {
 	assert.Equal(t, "reported", got.Status.Val)
 	assert.Nil(t, got.ObservedGeneration, "a status write settles nothing")
 	assert.Contains(t, unsettledIDs(t, store), obj.ID)
+}
+
+// The ControllerClient passed into Reconcile stops working when that call
+// returns: beehive concludes the pass with a generation stamp, and a write
+// arriving after it would move status with no pass behind it.
+func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	var captured ControllerClient[cStatus]
+	ran := make(chan struct{}, 4)
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+		captured = cc
+		// Live for the whole of Reconcile, Within included.
+		if err := cc.Within(ctx, func(ctx context.Context) error {
+			return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "inside"})
+		}); err != nil {
+			return Fail(err)
+		}
+		select {
+		case ran <- struct{}{}:
+		default:
+		}
+		return Settled(0)
+	}}
+	registerClient, err := Register(bh, clientTestGK, inner)
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+	select {
+	case <-ran:
+	case <-time.After(testTimeout):
+		t.Fatal("the create's own enqueue never reconciled")
+	}
+	require.NotNil(t, captured)
+
+	t.Run("a write fails", func(t *testing.T) {
+		assert.ErrorIs(t, captured.UpdateStatus(ctx, obj.ID, cStatus{Val: "late"}), ErrReconcileReturned)
+	})
+
+	t.Run("a read fails too", func(t *testing.T) {
+		_, _, err := captured.GetOwner(ctx, obj.ID)
+		assert.ErrorIs(t, err, ErrReconcileReturned, "the whole surface stops, not just the writes")
+	})
+
+	t.Run("the write really did not land", func(t *testing.T) {
+		got, err := client.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.Status)
+		assert.Equal(t, "inside", got.Status.Val)
+	})
+
+	// The client Register hands back is the application's, and outlives every
+	// pass by design: background work is documented to use it.
+	t.Run("the Register client is unaffected", func(t *testing.T) {
+		require.NoError(t, registerClient.UpdateStatus(ctx, obj.ID, cStatus{Val: "from outside"}))
+		got, err := client.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "from outside", got.Status.Val)
+	})
+}
+
+// A goroutine calling the pass client while the pass returns must never race:
+// end() and every method gate go through the same atomic. Run under -race to
+// mean anything; without it this still pins that the calls end in
+// ErrReconcileReturned rather than hanging or panicking.
+func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	var (
+		wg      sync.WaitGroup
+		lateErr atomic.Value
+	)
+	ran := make(chan struct{}, 4)
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Runs across the return: some calls land before end(), some after.
+			for i := 0; i < 50; i++ {
+				if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "late"}); err != nil {
+					lateErr.Store(err)
+					return
+				}
+			}
+		}()
+		select {
+		case ran <- struct{}{}:
+		default:
+		}
+		return Settled(0)
+	}}
+	_, err := Register(bh, clientTestGK, inner)
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+	select {
+	case <-ran:
+	case <-time.After(testTimeout):
+		t.Fatal("the create's own enqueue never reconciled")
+	}
+	wg.Wait()
+
+	if err, ok := lateErr.Load().(error); ok {
+		assert.ErrorIs(t, err, ErrReconcileReturned, "the only failure a late call may take")
+	}
 }
