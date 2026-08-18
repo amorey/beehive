@@ -141,9 +141,9 @@ func main() {
 	bh, err := beehive.New(store, beehive.WithGCInterval(1500*time.Millisecond))
 	exitOnErr(err)
 
-	_, err = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
+	err = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
 	exitOnErr(err)
-	_, err = beehive.Register(bh, ClusterCacheGroupKind, &ClusterCacheController{})
+	err = beehive.Register(bh, ClusterCacheGroupKind, &ClusterCacheController{})
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())

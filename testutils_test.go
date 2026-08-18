@@ -1233,7 +1233,7 @@ func (s cursorStoreCursors) Set(_ context.Context, name string, cursor int64) er
 
 // noopController is a no-op test double for Controller, used wherever a test
 // needs a registered controller but never exercises its reconcile behaviour.
-// Tests that need a ControllerClient obtain it from Register's return value.
+// Tests that need a ControllerClient build one with registerWithClient.
 type noopController[Spec, Status any] struct{}
 
 // Unsettled, and far enough out that nothing re-dispatches inside a test: a
@@ -1250,8 +1250,24 @@ func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerCli
 // otherwise unchanged.
 func registerNoop[Spec, Status any](t *testing.T, bh *Beehive, gk GroupKind) {
 	t.Helper()
-	_, err := Register(bh, gk, &noopController[Spec, Status]{})
-	require.NoError(t, err)
+	require.NoError(t, Register(bh, gk, &noopController[Spec, Status]{}))
+}
+
+// controllerClientFor builds gk's ControllerClient, which Register no longer
+// hands back. Identical to the value a pass is given, and live, so it exercises
+// the write surface but not the scoping — that belongs to the pass-client tests.
+func controllerClientFor[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
+	return &controllerClientImpl[Status]{bh: bh, gk: gk}
+}
+
+// registerWithClient registers c for gk and returns the kind's client, standing
+// in for the pair Register used to return.
+func registerWithClient[Spec, Status any](
+	t *testing.T, bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option,
+) *controllerClientImpl[Status] {
+	t.Helper()
+	require.NoError(t, Register(bh, gk, c, opts...))
+	return controllerClientFor[Status](bh, gk)
 }
 
 // signal is a one-shot notification from a test fake to the test: a callback
@@ -1936,8 +1952,7 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 func foreignObject(t *testing.T, ctx context.Context, bh *Beehive) (ObjectID, ControllerClient[cStatus]) {
 	t.Helper()
 	gk := GroupKind{Kind: "Other"}
-	cc, err := Register(bh, gk, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, gk, &noopController[cSpec, cStatus]{})
 	obj := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, gk), uniqueName(), cSpec{Val: "foreign"})
 	return obj.ID, cc
 }
@@ -1956,8 +1971,7 @@ func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, 
 		tailed:       make(chan struct{}, 256),
 	}
 	bh := newTestBeehive(t, store, fast(opts...)...)
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	return store, bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc
 }
 

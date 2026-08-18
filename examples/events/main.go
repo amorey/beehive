@@ -123,7 +123,7 @@ func main() {
 			{beehive.EventWarning, "ProbeFailed", "i/o timeout", nil, 1},
 		}},
 	}
-	_, err = beehive.Register(bh, ClusterGroupKind, ctrl)
+	err = beehive.Register(bh, ClusterGroupKind, ctrl)
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())

@@ -302,7 +302,7 @@ func TestRegisterStoresReconciler(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
-	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	r, ok := bh.reconcilers[gk]
@@ -318,7 +318,7 @@ func TestWithMigratorRegisters(t *testing.T) {
 
 	gk := GroupKind{Kind: "Widget"}
 	mig := &fakeMigrator{specVersion: 2, statusVersion: 1}
-	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithMigrator(mig))
+	err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithMigrator(mig))
 	require.NoError(t, err)
 
 	assert.Same(t, mig, bh.migratorFor(gk), "the migrator passed to Register is installed for the kind")
@@ -329,7 +329,7 @@ func TestMigratorForReturnsNilWhenUnset(t *testing.T) {
 
 	// Registered without WithMigrator.
 	gk := GroupKind{Kind: "Widget"}
-	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	assert.Nil(t, bh.migratorFor(gk), "a kind registered without a migrator has none")
@@ -340,9 +340,9 @@ func TestRegisterRejectsDuplicate(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
 
 	gk := GroupKind{Kind: "Widget"}
-	_, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
+	err := Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+	err = Register(bh, gk, &noopController[tSpec, tStatus]{})
 	require.Error(t, err)
 }
 
@@ -352,7 +352,7 @@ func TestRegisterRejectedAfterStart(t *testing.T) {
 	require.NoError(t, err)
 	defer stop(context.Background())
 
-	_, err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err = Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.Error(t, err)
 }
 
@@ -362,12 +362,12 @@ func TestRegisterPerControllerOverride(t *testing.T) {
 	assert.Equal(t, 10*time.Second, bh.fullPassInterval)
 
 	overridden := GroupKind{Kind: "Overridden"}
-	_, err := Register(bh, overridden, &noopController[tSpec, tStatus]{},
+	err := Register(bh, overridden, &noopController[tSpec, tStatus]{},
 		WithFullPassInterval(2*time.Second), WithMaxRetryInterval(7*time.Second))
 	require.NoError(t, err)
 
 	inherited := GroupKind{Kind: "Inherited"}
-	_, err = Register(bh, inherited, &noopController[tSpec, tStatus]{})
+	err = Register(bh, inherited, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	assert.Equal(t, 2*time.Second, bh.reconcilers[overridden].fullPassInterval)
@@ -380,7 +380,7 @@ func TestStartStopLifecycle(t *testing.T) {
 	// Disable the full pass so the reconcile loop just blocks on ctx until Stop.
 	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(0))
 
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
@@ -404,7 +404,7 @@ func TestStartRejectsSecondStart(t *testing.T) {
 func TestStopWithoutStartIsNoOp(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
 
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	// never started: must not panic, and reports no error.
@@ -414,7 +414,7 @@ func TestStopWithoutStartIsNoOp(t *testing.T) {
 func TestStopReturnsWithExpiredContext(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(0))
 
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(context.Background())
 	require.NoError(t, err)
@@ -435,7 +435,7 @@ func TestStopReturnsWithExpiredContext(t *testing.T) {
 func TestStartAbortsOnCancelledContext(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
 
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -454,7 +454,7 @@ func TestStartAbortsOnCancelledContext(t *testing.T) {
 func TestStartSeedsTheWakerBeforeItReturns(t *testing.T) {
 	store := &seedProbe{Store: &fakeStore{}, mark: 500}
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
@@ -470,7 +470,7 @@ func TestStartSeedsTheWakerBeforeItReturns(t *testing.T) {
 func TestStartSurvivesAFailedWakerSeed(t *testing.T) {
 	store := &seedProbe{Store: &fakeStore{}, err: errBoom}
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(context.Background())
@@ -488,7 +488,7 @@ func TestStartSkipsPrimingADisabledWaker(t *testing.T) {
 	t.Run("turned off", func(t *testing.T) {
 		store := &seedProbe{Store: &fakeStore{}}
 		bh := newTestBeehive(t, store, WithFullPassInterval(0), withDependencyWakerOff())
-		_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+		err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 		require.NoError(t, err)
 
 		stop, err := bh.Start(context.Background())
@@ -518,7 +518,7 @@ func TestStartAbortsWhenTheStartContextIsCancelledDuringTheSeed(t *testing.T) {
 	defer cancel()
 	store := &seedProbe{Store: &fakeStore{}, err: context.Canceled, onRead: cancel}
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -537,7 +537,7 @@ func TestStartRePrimesAfterAnAbortedStart(t *testing.T) {
 	// The seed itself succeeds; the abort is the caller cancelling around it.
 	store := &seedProbe{Store: &fakeStore{}, mark: 500, onRead: cancel}
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
 
 	_, err = bh.Start(ctx)
@@ -554,7 +554,7 @@ func TestStartRePrimesAfterAnAbortedStart(t *testing.T) {
 
 func TestRegisterPropagatesOptionError(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })
+	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}, func(any) error { return errBoom })
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -636,7 +636,7 @@ func TestSecondStopLeavesTheFirstDrainAlone(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	bh := newTestBeehive(t, newClientTestStore(t))
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)

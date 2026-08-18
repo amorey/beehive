@@ -64,7 +64,7 @@ func TestWatchPollFailureCostsOneTickNotTheStream(t *testing.T) {
 	store := &flakyListStore{Store: newClientTestStore(t)}
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh := newTestBeehive(t, store, fast(WithLogger(logger))...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -97,7 +97,7 @@ func TestWatchEmitsNothingWhileNothingChanges(t *testing.T) {
 
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -128,7 +128,7 @@ func TestWatchDerivesDeletedFromAbsence(t *testing.T) {
 
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -155,7 +155,7 @@ func TestWatchSeesASettleWithNoStatus(t *testing.T) {
 
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -185,10 +185,10 @@ func TestWatchSingleObjectIsKindScoped(t *testing.T) {
 
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	other := GroupKind{Kind: "Other"}
-	_, err = Register(bh, other, &noopController[cSpec, cStatus]{})
+	err = Register(bh, other, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	foreign := mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, other), "foreign", cSpec{Val: "foreign"})
@@ -488,7 +488,7 @@ func TestWatchTakesItsSnapshotBeforeReturning(t *testing.T) {
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -573,7 +573,7 @@ func TestWatchListReturnsASnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Millisecond))
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -1140,7 +1140,7 @@ func TestADeleteWithNoImageIsQuarantined(t *testing.T) {
 	bh := newTestBeehive(t, &imagelessStore{newClientTestStore(t)}, fast()...)
 	logger, buf := captureLogger(slog.LevelWarn)
 	bh.logger = logger
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	doomed := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "doomed"})
@@ -1191,7 +1191,7 @@ func TestWatchSurfacesAFailedRelationLoad(t *testing.T) {
 	store := &edgelessStore{Store: newClientTestStore(t), failed: make(chan struct{}, 256)}
 	store.broken.Store(true)
 	bh := newTestBeehive(t, store, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -1255,7 +1255,7 @@ func TestAnEmptyPageAboveTheCursorIsQuiet(t *testing.T) {
 	store := &emptyPageStore{Store: newClientTestStore(t), listed: make(chan struct{}, 8)}
 
 	bh := newTestBeehive(t, store, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1302,7 +1302,7 @@ func TestAVanishedObjectIsSkipped(t *testing.T) {
 	defer cancel()
 	store := &vanishingStore{Store: newClientTestStore(t), read: make(chan struct{}, 256)}
 	bh := newTestBeehive(t, store, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
@@ -2542,7 +2542,7 @@ func newWriteWorld(t *testing.T) *writeWorld {
 	bh := newTestBeehive(t, newClientTestStore(t))
 	// Registered but never started: WithFinalizers refuses a kind no controller
 	// in this process can clear, and nothing here needs a reconcile loop.
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	return &writeWorld{
 		bh:     bh,
@@ -4042,7 +4042,7 @@ func TestWatchLoadRetryDecodesOnce(t *testing.T) {
 	store := &countingLoadFailStore{Store: newClientTestStore(t)}
 	store.failuresLeft.Store(failures)
 	bh := newTestBeehive(t, store, WithWatchFloorInterval(time.Hour))
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, WithMigrator(mig))
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, WithMigrator(mig))
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 

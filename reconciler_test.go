@@ -303,7 +303,7 @@ func TestDependencyRequeue(t *testing.T) {
 	reconciled := make(chan *Object[tSpec, tStatus], 16)
 	// Full pass disabled so the dependency waker is the only thing that can requeue
 	// an already-settled object — no timer noise.
-	_, err = Register(bh, gk, &reconcileCapture{ch: reconciled}, WithFullPassInterval(0))
+	err = Register(bh, gk, &reconcileCapture{ch: reconciled}, WithFullPassInterval(0))
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -435,8 +435,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	}
 	// Full pass disabled so the dependency waker is the only thing that can requeue
 	// the dependent — the backstop must not paper over the miss.
-	cc, err := Register(bh, gk, ctrl, WithFullPassInterval(0))
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, gk, ctrl, WithFullPassInterval(0))
 
 	client := NewClient[tSpec, tStatus](bh, gk)
 	ctrl.client = client
@@ -509,8 +508,7 @@ func TestDependencyRequeueRaceOnDeclareOutsideReconcile(t *testing.T) {
 	ctrl := &dependentController{observed: make(chan bool, 8)}
 	// Full pass disabled so the dependency waker is the only thing that can requeue
 	// the dependent — the backstop must not paper over the miss.
-	cc, err := Register(bh, gk, ctrl, WithFullPassInterval(0))
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, gk, ctrl, WithFullPassInterval(0))
 
 	client := NewClient[tSpec, tStatus](bh, gk)
 	ctrl.client = client
@@ -605,8 +603,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	ctrl1 := &dependentController{observed: make(chan bool, 8)}
 	// Full pass disabled here and on the restart: the wake must be what requeues the
 	// dependent, not a timer that happens to sweep it up.
-	cc, err := Register(bh1, gk, ctrl1, WithFullPassInterval(0))
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh1, gk, ctrl1, WithFullPassInterval(0))
 
 	client1 := NewClient[tSpec, tStatus](bh1, gk)
 	ctrl1.client = client1
@@ -643,7 +640,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 		depID:    dep.ID,
 		targetID: target.ID,
 	}
-	_, err = Register(bh2, gk, ctrl2,
+	err = Register(bh2, gk, ctrl2,
 		WithFullPassInterval(0),
 		WithStartupFullPass(false))
 	require.NoError(t, err)
@@ -682,7 +679,7 @@ func TestSelfDependentObjectWakesOnSpecChange(t *testing.T) {
 	gk := GroupKind{Kind: "Widget"}
 	reconciled := make(chan ObjectID, 8)
 	// Full pass off: an arriving pass must be the write's own wake, not a tick.
-	_, err := Register(bh, gk, &idCapture{ch: reconciled},
+	err := Register(bh, gk, &idCapture{ch: reconciled},
 		WithFullPassInterval(0), WithConcurrency(1))
 	require.NoError(t, err)
 
@@ -792,7 +789,7 @@ func TestSelfDrivenRecovery(t *testing.T) {
 
 	bh := newTestBeehive(t, store, withOwedPassInterval(0), WithFullPassInterval(0))
 	ctrl := &recordingController{reconciled: make(chan ObjectID, 4)}
-	_, err = Register(bh, gk, ctrl, WithStartupFullPass(false))
+	err = Register(bh, gk, ctrl, WithStartupFullPass(false))
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
 
@@ -2053,7 +2050,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &statusSettingController{reconciled: newSignal()}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2080,7 +2077,7 @@ func TestIntegrationUpdateTriggersReconcile(t *testing.T) {
 		firstDone:  newSignal(),
 		secondDone: newSignal(),
 	}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2114,7 +2111,7 @@ func TestIntegrationDeleteTriggersReconcile(t *testing.T) {
 		reconciled: newSignal(),
 		deleted:    newSignal(),
 	}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2144,7 +2141,7 @@ func TestIntegrationDeleteCollectsWithoutThePush(t *testing.T) {
 		reconciled: newSignal(),
 		deleted:    newSignal(),
 	}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2177,7 +2174,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 			return Fail(errBoom)
 		},
 	}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2216,7 +2213,7 @@ func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
 	ctrl := &conditionSettingController{reconciled: newSignal()}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2257,7 +2254,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 			return Fail(errBoom)
 		},
 	}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2288,7 +2285,7 @@ func TestIntegrationStartupEnqueuesUnsettled(t *testing.T) {
 	bh := newTestBeehive(t, store, WithFullPassInterval(0))
 
 	ctrl := &statusSettingController{reconciled: newSignal()}
-	_, err = Register(bh, clientTestGK, ctrl)
+	err = Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -2395,7 +2392,7 @@ func newOwedPassHarness(t *testing.T, gk GroupKind, seed func(wakeStampingStore)
 	bh, err := New(store, WithFullPassInterval(0), withoutGCSweeper(),
 		withOwedPassInterval(10*time.Millisecond))
 	require.NoError(t, err)
-	_, err = Register(bh, gk, &recordingController{reconciled: reconciled},
+	err = Register(bh, gk, &recordingController{reconciled: reconciled},
 		WithStartupFullPass(false))
 	require.NoError(t, err)
 
@@ -2508,7 +2505,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (id ObjectID, reconciled <-
 	logger, started := loggerSignallingOn(reconcilerStartedMsg)
 	bh := newTestBeehive(t, store, withOwedPassInterval(0), withoutGCSweeper(), WithLogger(logger))
 	opts = append(opts, WithStartupFullPass(false))
-	_, err = Register(bh, gk, &recordingController{reconciled: ch}, opts...)
+	err = Register(bh, gk, &recordingController{reconciled: ch}, opts...)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -2587,7 +2584,7 @@ func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option
 	reconciled := make(chan ObjectID, 8)
 	logger, started := loggerSignallingOn(reconcilerStartedMsg)
 	bh := newTestBeehive(t, store, withOwedPassInterval(0), WithFullPassInterval(0), withoutGCSweeper(), WithLogger(logger))
-	_, err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
+	err = Register(bh, gk, &recordingController{reconciled: reconciled}, opts...)
 	require.NoError(t, err)
 
 	stop, err := bh.Start(ctx)
@@ -2681,7 +2678,7 @@ func TestDisabledBackstopsAnnounceThemselves(t *testing.T) {
 		opts = append(opts, WithLogger(logger))
 		bh, err := New(&fakeStore{}, opts...)
 		require.NoError(t, err)
-		_, err = Register(bh, gk, &noopController[tSpec, tStatus]{})
+		err = Register(bh, gk, &noopController[tSpec, tStatus]{})
 		require.NoError(t, err)
 		stop, err := bh.Start(context.Background())
 		require.NoError(t, err)
@@ -2728,7 +2725,7 @@ func newClientOnlyTargetFixture(t *testing.T) (*Beehive, Store, *depObserver, fu
 	bh := newTestBeehive(t, store, WithGCInterval(time.Hour),
 		withWakeScanMinInterval(0), withMinRequeueInterval(0))
 	observer := &depObserver{store: store, seen: make(chan depObservation, 64)}
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, observer,
+	err := Register(bh, GroupKind{Kind: "Widget"}, observer,
 		WithFullPassInterval(0),
 		withOwedPassInterval(time.Hour),
 		WithStartupFullPass(false))
@@ -3480,8 +3477,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	bh1, err := New(db)
 	require.NoError(t, err)
 	ctrl1 := &dependentController{observed: make(chan bool, 8)}
-	cc, err := Register(bh1, gk, ctrl1, WithFullPassInterval(0))
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh1, gk, ctrl1, WithFullPassInterval(0))
 
 	client1 := NewClient[tSpec, tStatus](bh1, gk)
 	ctrl1.client = client1
@@ -3517,7 +3513,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 		depID:    dep.ID,
 		targetID: target.ID,
 	}
-	_, err = Register(bh2, gk, ctrl2, WithFullPassInterval(0), WithStartupFullPass(false))
+	err = Register(bh2, gk, ctrl2, WithFullPassInterval(0), WithStartupFullPass(false))
 	require.NoError(t, err)
 	ctrl2.client = NewClient[tSpec, tStatus](bh2, gk)
 
@@ -3566,8 +3562,7 @@ func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t),
 		withWakeScanMinInterval(0),
 		withMinRequeueInterval(hotLoopWindow))
-	cc, err := Register(bh, clientTestGK, ctrl)
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, ctrl)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
