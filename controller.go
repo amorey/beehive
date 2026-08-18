@@ -43,19 +43,19 @@ type Controller[Spec, Status any] interface {
 // Reconcile it is passed to: afterwards every method returns
 // ErrReconcileReturned, and there is no other way to hold one.
 type ControllerClient[Status any] interface {
-	// AddDependency records that fromID depends on toID, so beehive reconciles
-	// fromID again when toID changes. Every call that creates the edge records
-	// one owed reconcile for fromID, durably and atomically with the edge, so a
+	// AddDependency records that this pass's object depends on toID, so beehive
+	// reconciles it again when toID changes. Every call that creates the edge
+	// records one owed reconcile, durably and atomically with the edge, so a
 	// declared dependency is a guarantee rather than a subscription.
 	// Re-asserting existing edges records nothing.
-	AddDependency(ctx context.Context, fromID, toID ObjectID) error
+	AddDependency(ctx context.Context, toID ObjectID) error
 	// AddEvent adds an observation to the object's event log. Repeating the
 	// latest run's (Category, Type, Reason) extends that run rather than
 	// appending, so a controller can report every poll without growing the log
 	// per poll.
 	AddEvent(ctx context.Context, event EventSpec) error
 	DeleteCondition(ctx context.Context, conditionType string) error
-	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
+	DeleteDependency(ctx context.Context, toID ObjectID) error
 	DeleteFinalizer(ctx context.Context, finalizer string) error
 	// GetOwner returns id's owner, if any. ok is false with a nil error when the
 	// object has no owner.
@@ -226,21 +226,20 @@ func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, fina
 // AddDependency is one store call, not a composition: the edge and the durable
 // reconcile-owed stamp are indivisible inside Edges().Add, so an edge can never
 // commit without its wake. The enqueue below is the prompt half; the stamp is
-// the guarantee. It is gated on the store reporting the edge as new — which
-// bounds it to one enqueue per edge ever created — and routed by res.From
-// because the edge is cross-kind.
-func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID, toID ObjectID) error {
+// the guarantee. It is gated on the store reporting the edge as new, which
+// bounds it to one enqueue per edge ever created.
+func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, toID ObjectID) error {
 	if err := c.live(); err != nil {
 		return err
 	}
-	res, err := c.bh.store.Edges().Add(ctx, fromID, toID, RelationDependsOn)
+	res, err := c.bh.store.Edges().Add(ctx, c.id, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}
 	if res.ReconcileOwedStamped {
 		// Throttled: a controller can declare on every pass, and the stamp is
 		// durable, so this must not jump the source's backoff ladder.
-		c.bh.signalRequeueThrottled(ctx, ObjectRef{ID: fromID, Group: res.From.Group, Kind: res.From.Kind})
+		c.bh.signalRequeueThrottled(ctx, ObjectRef{ID: c.id, Group: c.gk.Group, Kind: c.gk.Kind})
 	}
 	return nil
 }
@@ -249,11 +248,11 @@ func (c *controllerClientImpl[Status]) AddDependency(ctx context.Context, fromID
 // lifted its RESTRICT block; gcCollect still re-checks it. Routed by res.To,
 // because the edge is cross-kind. See
 // docs/adr/2026-08-05-a-dropped-dependency-pushes-its-target.md.
-func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, fromID, toID ObjectID) error {
+func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, toID ObjectID) error {
 	if err := c.live(); err != nil {
 		return err
 	}
-	res, err := c.bh.store.Edges().Delete(ctx, fromID, toID, RelationDependsOn)
+	res, err := c.bh.store.Edges().Delete(ctx, c.id, toID, RelationDependsOn)
 	if err != nil {
 		return err
 	}

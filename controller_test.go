@@ -310,6 +310,24 @@ func TestDeleteFinalizerTargetsThePassObject(t *testing.T) {
 	assert.Equal(t, []string{"f"}, got.Finalizers, "a sibling keeps its finalizer")
 }
 
+// TestDependencyVerbsBindTheSource pins the source of both edge verbs: the pass's
+// object declares and drops its own dependencies, and the owed stamp lands on it.
+func TestDependencyVerbsBindTheSource(t *testing.T) {
+	ctx := context.Background()
+	f := newSameKindFixture(t)
+
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
+	refs, err := f.cc.bh.store.Edges().ListIncoming(ctx, f.target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{f.dep.ID}, objectRefIDs(refs), "the pass's object is the source")
+	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(), "and is what the new edge enqueues")
+
+	require.NoError(t, f.cc.at(f.dep.ID).DeleteDependency(ctx, f.target.ID))
+	refs, err = f.cc.bh.store.Edges().ListIncoming(ctx, f.target.ID, RelationDependsOn)
+	require.NoError(t, err)
+	assert.Empty(t, refs, "the drop names the same source")
+}
+
 // TestControllerClientWithin verifies the opt-in atomicity surface: writes made
 // inside Within commit together on a nil return and roll back together on error,
 // with the nested ControllerClient writes joining the one transaction.
@@ -549,12 +567,12 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	from := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "from"})
 	to := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "to"})
 
-	require.NoError(t, cc.at(from.ID).AddDependency(ctx, from.ID, to.ID))
+	require.NoError(t, cc.at(from.ID).AddDependency(ctx, to.ID))
 	deps, err := bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectRef{{ID: from.ID, Group: clientTestGK.Group, Kind: clientTestGK.Kind}}, deps)
 
-	require.NoError(t, cc.at(from.ID).DeleteDependency(ctx, from.ID, to.ID))
+	require.NoError(t, cc.at(from.ID).DeleteDependency(ctx, to.ID))
 	deps, err = bh.store.Edges().ListIncoming(ctx, to.ID, RelationDependsOn)
 	require.NoError(t, err)
 	assert.Empty(t, deps, "edge removed via ControllerClient")
@@ -579,9 +597,9 @@ func TestAddDependencyAcceptsCycle(t *testing.T) {
 	a := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 	b := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
-	require.NoError(t, cc.at(a.ID).AddDependency(ctx, a.ID, b.ID))
-	require.NoError(t, cc.at(b.ID).AddDependency(ctx, b.ID, a.ID), "a cycle-closing edge is accepted today")
-	require.NoError(t, cc.at(a.ID).AddDependency(ctx, a.ID, a.ID), "and so is a self-edge")
+	require.NoError(t, cc.at(a.ID).AddDependency(ctx, b.ID))
+	require.NoError(t, cc.at(b.ID).AddDependency(ctx, a.ID), "a cycle-closing edge is accepted today")
+	require.NoError(t, cc.at(a.ID).AddDependency(ctx, a.ID), "and so is a self-edge")
 }
 
 // declareFixture is the shared setup for the dependency-declare tests: a
@@ -595,14 +613,11 @@ func TestAddDependencyAcceptsCycle(t *testing.T) {
 // count into a reconcile is covered end to end by
 // TestDependencyRequeueRaceOnDeclare.
 //
-// The two objects live in *different kinds* on purpose. The edge is deliberately
-// cross-kind, so cc — the ControllerClient the tests declare through — belongs to
-// the target's kind, not the dependent's: every test therefore exercises the
-// routing rule (the stamp follows fromID's own GroupKind, not the caller's) by
-// construction, and a stamp misrouted to the declarer's kind shows up as a
-// dependent that owes nothing.
+// The two objects live in *different kinds* on purpose: the edge is deliberately
+// cross-kind, while cc — the client the tests declare through — is the
+// dependent's own, which is the only thing that can declare for it.
 type declareFixture struct {
-	cc          passClients[tStatus] // the target kind's client: a foreign kind to dep
+	cc          passClients[tStatus] // the dependent's own client
 	bh          *Beehive
 	store       Store
 	targetGK    GroupKind
@@ -626,9 +641,9 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 		targetGK: GroupKind{Kind: "Target"},
 		depGK:    GroupKind{Kind: "Dependent"},
 	}
-	err := Register(bh, f.depGK, &noopController[tSpec, tStatus]{})
+	err := Register(bh, f.targetGK, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
-	f.cc = registerWithClient(t, bh, f.targetGK, &noopController[tSpec, tStatus]{})
+	f.cc = registerWithClient(t, bh, f.depGK, &noopController[tSpec, tStatus]{})
 
 	depClient := NewClient[tSpec, tStatus](bh, f.depGK)
 	f.dep = mustCreate(t, ctx, depClient, "dep", tSpec{})
@@ -747,7 +762,7 @@ func TestAddDependencyWakesOncePerEdge(t *testing.T) {
 	// write-log scan structurally cannot see.
 	f.moveTarget(t)
 
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
 	f.requireOwed(t)
 	require.EqualValues(t, 1, f.owedCount(t))
 
@@ -755,14 +770,14 @@ func TestAddDependencyWakesOncePerEdge(t *testing.T) {
 	// The count is what makes this exact: a re-fire would be invisible in the
 	// listing (already there from the first) but shows up here immediately.
 	for range 3 {
-		require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
+		require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
 	}
 	require.EqualValues(t, 1, f.owedCount(t), "the edge is no longer new, so no later declare stamps again")
 
 	// Nor does the target moving make a re-declare stamp: once the edge exists,
 	// delivering changes is the waker's and the stale pass's job.
 	f.moveTarget(t)
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
 	assert.EqualValues(t, 1, f.owedCount(t), "one wake per edge created, not per declare")
 }
 
@@ -787,7 +802,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 	target := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 
-	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, dep.ID, target.ID))
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID))
 
 	refs, err := real.Edges().ListIncoming(ctx, target.ID, RelationDependsOn)
 	require.NoError(t, err)
@@ -810,7 +825,7 @@ func TestAddDependencyEnqueuesItsSource(t *testing.T) {
 	ctx := context.Background()
 	f := newSameKindFixture(t)
 
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
 	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(), "the new edge queues its source")
 }
 
@@ -830,38 +845,17 @@ func TestAddDependencyEnqueuesItsSource(t *testing.T) {
 func TestAddDependencyEnqueuesOnlyWhatItStamped(t *testing.T) {
 	ctx := context.Background()
 	f := newSameKindFixture(t)
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
 	drainQueue(f.r.work)
 
 	// The edge exists now, so every later declare of it stamps nothing.
 	for range 3 {
-		require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
+		require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
 	}
 	assert.Empty(t, f.queued(), "a re-asserted edge is not new, so it queues nothing")
 
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.dep.ID))
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID))
 	assert.Empty(t, f.queued(), "a self-edge stamps nothing, so it queues nothing")
-}
-
-// TestAddDependencyEnqueueRoutesByTheSourcesKind pins the routing. Edges are
-// cross-kind: a controller may declare a dependency on another kind's behalf, so
-// fromID is not necessarily the caller's kind. The enqueue must reach the
-// reconciler that owns the source.
-//
-// The fixture declares through the target kind's ControllerClient, so the source
-// belongs to a foreign kind by construction. An enqueue routed by the caller's kind
-// would reach the target kind's queue, or a kind with no reconciler at all, and the
-// source would wait for the owed pass. Nothing else in the suite catches that.
-func TestAddDependencyEnqueueRoutesByTheSourcesKind(t *testing.T) {
-	f := newDeclareFixture(t)
-	ctx := context.Background()
-	drainQueue(mustReconciler(t, f.bh, f.depGK).work)
-	drainQueue(mustReconciler(t, f.bh, f.targetGK).work)
-
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
-
-	assert.Equal(t, []ObjectID{f.dep.ID}, f.queued(t, f.depGK), "the source's own kind is queued")
-	assert.Empty(t, f.queued(t, f.targetGK), "the declarer's kind is not")
 }
 
 // TestAddDependencyEnqueuesNothingOnRollback pins that the enqueue rides
@@ -881,7 +875,7 @@ func TestAddDependencyEnqueuesNothingOnRollback(t *testing.T) {
 
 		err := f.cc.at(f.dep.ID).Within(ctx, func(ctx context.Context) error {
 			return f.cc.at(f.dep.ID).Within(ctx, func(ctx context.Context) error {
-				if err := f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID); err != nil {
+				if err := f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID); err != nil {
 					return err
 				}
 				if commit {
@@ -915,7 +909,7 @@ func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 	dep := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnly), uniqueName(), tSpec{})
 	target := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, targetGK), uniqueName(), tSpec{})
 
-	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, dep.ID, target.ID), "an unroutable enqueue is not an error")
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID), "an unroutable enqueue is not an error")
 
 	owed, err := store.ReconcileOwed().ListIDs(ctx, clientOnly)
 	require.NoError(t, err)
@@ -944,7 +938,7 @@ func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient
 		c.hot.fire()
 	}
 	c.first.fire()
-	_ = cc.AddDependency(ctx, obj.ID, c.target)
+	_ = cc.AddDependency(ctx, c.target)
 	return Fail(errBoom)
 }
 
@@ -1006,7 +1000,7 @@ func TestANewEdgeOnAnInFlightSourceRespectsTheBackoff(t *testing.T) {
 	require.Equal(t, f.dep.ID, got)
 
 	// The controller declares a new dependency and then fails.
-	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID))
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
 
 	// runWorker releases the id and only then sets the backoff.
 	f.r.work.done(f.dep.ID)
@@ -1026,7 +1020,7 @@ func TestAddDependencyNoWakeOnRollback(t *testing.T) {
 	ctx := context.Background()
 
 	err := f.cc.at(f.dep.ID).Within(ctx, func(ctx context.Context) error {
-		if err := f.cc.at(f.dep.ID).AddDependency(ctx, f.dep.ID, f.target.ID); err != nil {
+		if err := f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID); err != nil {
 			return err
 		}
 		return errBoom
@@ -1136,7 +1130,7 @@ func (s *failEdgesAddStore) addEdges(context.Context, ObjectID, ObjectID, Relati
 func TestControllerClientAddDependencyStoreError(t *testing.T) {
 	bh := newTestBeehive(t, &failEdgesAddStore{})
 	cc := passClients[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err := cc.at(1).AddDependency(context.Background(), 1, 2)
+	err := cc.at(1).AddDependency(context.Background(), 2)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -1208,7 +1202,7 @@ func (s *failEdgesDeleteStore) deleteEdges(context.Context, ObjectID, ObjectID, 
 func TestControllerClientDeleteDependencyDeleteRefError(t *testing.T) {
 	bh := newTestBeehive(t, &failEdgesDeleteStore{})
 	cc := passClients[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err := cc.at(1).DeleteDependency(context.Background(), 1, 2)
+	err := cc.at(1).DeleteDependency(context.Background(), 2)
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -1220,11 +1214,11 @@ func TestDeleteDependencyPushesTheBlockedTarget(t *testing.T) {
 
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	drainQueue(r.work)
 
-	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, target.ID))
 	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work))
 }
 
@@ -1249,7 +1243,7 @@ func TestDeleteDependencyPushesNothingOtherwise(t *testing.T) {
 			target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 			dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
 			if tt.declare {
-				require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+				require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 			}
 			if tt.deleteTarget {
 				require.NoError(t, client.Delete(ctx, target.ID))
@@ -1259,7 +1253,7 @@ func TestDeleteDependencyPushesNothingOtherwise(t *testing.T) {
 			}
 			drainQueue(r.work)
 
-			require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, dependent.ID, target.ID))
+			require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, target.ID))
 			assert.Empty(t, queuedIDs(r.work))
 		})
 	}
@@ -1277,12 +1271,12 @@ func TestDeleteDependencyPushesAcrossKinds(t *testing.T) {
 
 	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	require.NoError(t, targetClient.Delete(ctx, target.ID))
 	drainQueue(depR.work)
 	drainQueue(targetR.work)
 
-	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, target.ID))
 	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(targetR.work), "the target's own kind is queued")
 	assert.Empty(t, queuedIDs(depR.work), "the dependent's kind is not")
 }
@@ -1295,14 +1289,14 @@ func TestDeleteDependencyPushBeatsAPendingAlarm(t *testing.T) {
 
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	drainQueue(r.work)
 	// Long enough that the alarm firing on its own would be the test hanging,
 	// not the assertion passing.
 	r.work.addAfter(target.ID, time.Hour, alarmBackoff)
 
-	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, target.ID))
 	assert.Equal(t, []ObjectID{target.ID}, queuedIDs(r.work), "the drop beats the backoff alarm")
 }
 
@@ -1314,11 +1308,11 @@ func TestDeleteDependencySkipsClientOnlyTarget(t *testing.T) {
 
 	target := mustCreate(t, ctx, targetClient, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	require.NoError(t, targetClient.Delete(ctx, target.ID))
 	drainQueue(r.work)
 
-	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).DeleteDependency(ctx, target.ID))
 	assert.Empty(t, queuedIDs(r.work))
 }
 
@@ -1557,12 +1551,12 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		name string
 		call func(cc ControllerClient[cStatus]) error
 	}{
-		{"AddDependency", func(cc ControllerClient[cStatus]) error { return cc.AddDependency(ctx, dep.ID, obj.ID) }},
+		{"AddDependency", func(cc ControllerClient[cStatus]) error { return cc.AddDependency(ctx, obj.ID) }},
 		{"AddEvent", func(cc ControllerClient[cStatus]) error {
 			return cc.AddEvent(ctx, EventSpec{Category: "lifecycle", Reason: "Probed"})
 		}},
 		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, "Synced") }},
-		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, dep.ID, obj.ID) }},
+		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, obj.ID) }},
 		{"DeleteFinalizer", func(cc ControllerClient[cStatus]) error {
 			return cc.DeleteFinalizer(ctx, "kstack.sh/none")
 		}},

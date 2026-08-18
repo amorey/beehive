@@ -1076,7 +1076,7 @@ func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClien
 	if target.DeletionRequestedAt == nil {
 		return Settled()
 	}
-	if err := cc.DeleteDependency(ctx, depID, targetID); err != nil {
+	if err := cc.DeleteDependency(ctx, targetID); err != nil {
 		return Fail(err)
 	}
 	return Settled()

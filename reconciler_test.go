@@ -432,7 +432,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 		}
 		// The version the read above reflects — not a fresh one, which would claim
 		// to have seen changes this pass did not.
-		return cc.AddDependency(ctx, ctrl.depID, ctrl.targetID)
+		return cc.AddDependency(ctx, ctrl.targetID)
 	}
 	// Full pass disabled so the dependency waker is the only thing that can requeue
 	// the dependent — the backstop must not paper over the miss.
@@ -545,7 +545,7 @@ func TestDependencyRequeueRaceOnDeclareOutsideReconcile(t *testing.T) {
 	// target is the application's read of the target, taken before the change
 	// above — so the version it carries is the one the decision to depend was
 	// based on, and the target has since moved past it.
-	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, dep.ID, target.ID))
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID))
 
 	// The edge is in place and the target's change is still unobserved, so the
 	// dependent must be reconciled again and see Ready.
@@ -631,7 +631,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	// loops), so the declaration commits normally with no running queue to reach.
 	err = db.Conditions().Set(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, dep.ID, target.ID))
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID))
 
 	// --- the restart: a second process, the first already stopped ---
 	bh2, err := New(db)
@@ -3102,7 +3102,7 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 	second, err := h.store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 	h.inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) ReconcileResult {
-		if err := cc.AddDependency(ctx, h.dep, second.ID); err != nil {
+		if err := cc.AddDependency(ctx, second.ID); err != nil {
 			return Fail(err)
 		}
 		return Settled()
@@ -3184,7 +3184,7 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 	stale := func() []ObjectID { return staleDependentIDs(t, s, clientTestGK) }
 
 	inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) ReconcileResult {
-		if err := cc.AddDependency(ctx, dep.ID, target.ID); err != nil {
+		if err := cc.AddDependency(ctx, target.ID); err != nil {
 			return Fail(err)
 		}
 		return Settled()
@@ -3478,7 +3478,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	// startup reconcile below services and drains it — so by the time the target
 	// moves, nothing durable records that a wake is owed: this is the ordinary
 	// settled dependency, not the declare-time case the stamp covers.
-	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, dep.ID, target.ID))
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID))
 
 	stop1, err := bh1.Start(ctx)
 	require.NoError(t, err)
@@ -3556,8 +3556,8 @@ func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
-	require.NoError(t, cc.at(a.ID).AddDependency(ctx, a.ID, b.ID))
-	require.NoError(t, cc.at(b.ID).AddDependency(ctx, b.ID, a.ID))
+	require.NoError(t, cc.at(a.ID).AddDependency(ctx, b.ID))
+	require.NoError(t, cc.at(b.ID).AddDependency(ctx, a.ID))
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)

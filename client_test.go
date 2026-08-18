@@ -3366,7 +3366,7 @@ func TestDeleteRequestPushesTheBlockedTarget(t *testing.T) {
 	_, client, cc, r := specWriteFixture(t)
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	drainQueue(r.work)
 
@@ -3382,7 +3382,7 @@ func TestDeleteByNamePushesTheBlockedTarget(t *testing.T) {
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	name := uniqueName()
 	dependent := mustCreate(t, ctx, client, name, cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	drainQueue(r.work)
 
@@ -3397,7 +3397,7 @@ func TestDeleteRequestPushesNoLiveTarget(t *testing.T) {
 	_, client, cc, r := specWriteFixture(t)
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	drainQueue(r.work)
 
 	require.NoError(t, client.Delete(ctx, dependent.ID))
@@ -3424,7 +3424,7 @@ func TestRepeatedDeleteRequestPushesOnce(t *testing.T) {
 	_, client, cc, r := specWriteFixture(t)
 	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"})
 	dependent := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dependent"})
-	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, dependent.ID, target.ID))
+	require.NoError(t, cc.at(dependent.ID).AddDependency(ctx, target.ID))
 	require.NoError(t, client.Delete(ctx, target.ID))
 	require.NoError(t, client.Delete(ctx, dependent.ID))
 	drainQueue(r.work)
