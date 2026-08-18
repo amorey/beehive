@@ -129,6 +129,11 @@ func settled(obj *beehive.Object[ClusterSpec, ClusterStatus]) bool {
 // The checkpoint any consumer can wait on, and here it is what says the panel
 // below has something to render.
 func waitSettled(ctx context.Context, client beehive.Client[ClusterSpec, ClusterStatus], id beehive.ObjectID) {
+	// Cancelled on the way out: a watch holds its kind's tailer until its
+	// context ends.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	stream, err := client.Watch(ctx, id)
 	exitOnErr(err)
 	if stream.Object != nil && settled(stream.Object) {
