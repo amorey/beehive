@@ -17,6 +17,7 @@ package beehive
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -184,6 +185,26 @@ func TestReconcileResultConstructors(t *testing.T) {
 		r := Fail(sentinel).normalize()
 		assert.Equal(t, kindFail, r.kind)
 		assert.ErrorIs(t, r.err, sentinel)
+	})
+}
+
+// Err is the only way a caller outside the package reads a failed pass, so it
+// answers for the unusable results too rather than reporting their nil.
+func TestReconcileResultErrReportsTheFailure(t *testing.T) {
+	t.Run("a success carries no error", func(t *testing.T) {
+		assert.NoError(t, Settled(0).Err())
+		assert.NoError(t, Unsettled(0).Err())
+	})
+
+	t.Run("a failure carries its error through a wrap", func(t *testing.T) {
+		sentinel := errors.New("boom")
+		r := Fail(fmt.Errorf("listing clusters: %w", sentinel))
+		assert.ErrorIs(t, r.Err(), sentinel)
+	})
+
+	t.Run("the unusable results report ErrInvalidResult", func(t *testing.T) {
+		assert.ErrorIs(t, ReconcileResult{}.Err(), ErrInvalidResult)
+		assert.ErrorIs(t, Fail(nil).Err(), ErrInvalidResult)
 	})
 }
 

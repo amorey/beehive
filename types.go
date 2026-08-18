@@ -264,6 +264,11 @@ func Fail(err error) ReconcileResult {
 	return ReconcileResult{kind: kindFail, err: err}
 }
 
+// Err returns the error a failed pass carries, or nil for a successful one. The
+// zero value and Fail(nil) report ErrInvalidResult, the failure beehive records
+// for them.
+func (r ReconcileResult) Err() error { return r.normalize().err }
+
 // Must run before any gate reads the result: an un-normalized zero satisfies no
 // positive gate and is not a failure either.
 func (r ReconcileResult) normalize() ReconcileResult {
