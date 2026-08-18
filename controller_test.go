@@ -1544,7 +1544,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		assert.True(t, named[iface.Method(i).Name], "ungated method missing from the table")
 	}
 
-	live := controllerClientFor[cStatus](bh, clientTestGK)
+	live := newPassClient[cStatus](bh, clientTestGK)
 	for _, c := range calls {
 		t.Run(c.name+" runs while the pass runs", func(t *testing.T) {
 			// Reaching the store is the assertion; whether it likes the arguments is not.
@@ -1552,7 +1552,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		})
 	}
 
-	ended := controllerClientFor[cStatus](bh, clientTestGK)
+	ended := newPassClient[cStatus](bh, clientTestGK)
 	ended.end()
 	for _, c := range calls {
 		t.Run(c.name+" refuses once the pass has ended", func(t *testing.T) {

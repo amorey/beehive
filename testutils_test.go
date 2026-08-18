@@ -1253,21 +1253,15 @@ func registerNoop[Spec, Status any](t *testing.T, bh *Beehive, gk GroupKind) {
 	require.NoError(t, Register(bh, gk, &noopController[Spec, Status]{}))
 }
 
-// controllerClientFor builds gk's ControllerClient, which Register no longer
-// hands back. Identical to the value a pass is given, and live, so it exercises
-// the write surface but not the scoping — that belongs to the pass-client tests.
-func controllerClientFor[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
-	return newPassClient[Status](bh, gk)
-}
-
-// registerWithClient registers c for gk and returns the kind's client, standing
-// in for the pair Register used to return.
+// registerWithClient registers c for gk and returns a live client for it,
+// standing in for the pair Register used to return. Live, so it exercises the
+// write surface but not the scoping — that belongs to the pass-client tests.
 func registerWithClient[Spec, Status any](
 	t *testing.T, bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option,
 ) *controllerClientImpl[Status] {
 	t.Helper()
 	require.NoError(t, Register(bh, gk, c, opts...))
-	return controllerClientFor[Status](bh, gk)
+	return newPassClient[Status](bh, gk)
 }
 
 // signal is a one-shot notification from a test fake to the test: a callback

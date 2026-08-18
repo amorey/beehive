@@ -96,9 +96,7 @@ type controllerClientImpl[Status any] struct {
 	done atomic.Bool
 }
 
-// newPassClient builds the client for one pass. The only constructor: tests
-// build the same value through it, so a per-pass field cannot appear in one
-// place and not the other.
+// newPassClient builds the client for one pass, and is the only constructor.
 func newPassClient[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
 	return &controllerClientImpl[Status]{bh: bh, gk: gk}
 }
