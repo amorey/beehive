@@ -17,5 +17,4 @@ work we have decided to do.
 No spec is in flight.
 
 The last spec shipped as
-[RequeueAfter and Err on ReconcileResult](../adr/2026-08-18-beehive-owns-the-generation-handshake.md),
-folded into the generation-handshake record.
+[A TestClient writes status and conditions outside a pass](../adr/2026-08-18-a-test-client-writes-status.md).

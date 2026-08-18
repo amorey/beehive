@@ -96,7 +96,8 @@ type controllerClientImpl[Status any] struct {
 	done atomic.Bool
 }
 
-// newPassClient builds the client for one pass, and is the only constructor.
+// newPassClient is the only constructor. The pass ends its client; TestClient
+// holds one that is never ended, so live() always passes there.
 func newPassClient[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
 	return &controllerClientImpl[Status]{bh: bh, gk: gk}
 }
