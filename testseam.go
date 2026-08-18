@@ -9,8 +9,10 @@ import (
 
 func init() {
 	testseam.Open = func(v any) (testseam.Writer, bool) {
+		// A nil *Beehive arrives as a non-nil any, so the assertion alone admits
+		// it and the caller nil-dereferences on its first write.
 		bh, ok := v.(*Beehive)
-		if !ok {
+		if !ok || bh == nil {
 			return nil, false
 		}
 		return fixtureWriter{bh}, true

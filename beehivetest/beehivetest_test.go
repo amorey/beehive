@@ -212,3 +212,11 @@ func TestDeleteCondition(t *testing.T) {
 		assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
 	})
 }
+
+func TestNewClientRejectsANilBeehive(t *testing.T) {
+	// A nil *Beehive arrives as a non-nil any, so a bare type assertion admits
+	// it and the failure surfaces later as a nil dereference.
+	assert.PanicsWithValue(t,
+		"beehivetest: NewClient needs a non-nil *beehive.Beehive",
+		func() { beehivetest.NewClient[clusterStatus](nil, clusterGK) })
+}
