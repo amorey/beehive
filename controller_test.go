@@ -1339,6 +1339,45 @@ func TestUpdateStatusDoesNotTouchTheHandshake(t *testing.T) {
 	assert.Contains(t, unsettledIDs(t, store), obj.ID)
 }
 
+// The stamp is a write like any other and wakes the kind's watches. Pinned with
+// the floor tick parked, so only the wake can deliver.
+func TestObservedGenerationStampWakesTheKindsWatches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithWatchFloorInterval(time.Hour))...)
+
+	var settle atomic.Bool
+	ctrl := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+		if settle.Load() {
+			return Settled(0)
+		}
+		return Unsettled(time.Hour)
+	}}
+	_, err := Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+
+	// Subscribed before the object can settle, so the stamp is the only write
+	// left to deliver.
+	stream, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	settle.Store(true)
+	require.NoError(t, client.Requeue(ctx, obj.ID))
+
+	select {
+	case ev := <-stream.Changes:
+		require.NotNil(t, ev.Object.ObservedGeneration)
+		assert.Equal(t, ev.Object.Generation, *ev.Object.ObservedGeneration)
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the stamp to wake the watch")
+	}
+}
+
 // The client passed into Reconcile stops working when that call returns: a write
 // arriving later moves status with no pass behind it.
 func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
