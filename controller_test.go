@@ -1027,6 +1027,7 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	gadgetGK := GroupKind{Kind: "Gadget"}
 	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
 	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
 	defer stop(ctx)
 
 	// Give the Gadget a finalizer so the DeleteFinalizer attempt has a target to
@@ -1534,16 +1535,15 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		}},
 	}
 
-	inner := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
-	live := &scopedControllerClient[cStatus]{inner: inner}
+	live := controllerClientFor[cStatus](bh, clientTestGK)
 	for _, c := range calls {
-		t.Run(c.name+" delegates while the pass runs", func(t *testing.T) {
-			// Reaching inner is the assertion; whether inner likes the arguments is not.
+		t.Run(c.name+" runs while the pass runs", func(t *testing.T) {
+			// Reaching the store is the assertion; whether it likes the arguments is not.
 			assert.NotErrorIs(t, c.call(live), ErrReconcileReturned)
 		})
 	}
 
-	ended := &scopedControllerClient[cStatus]{inner: inner}
+	ended := controllerClientFor[cStatus](bh, clientTestGK)
 	ended.end()
 	for _, c := range calls {
 		t.Run(c.name+" refuses once the pass has ended", func(t *testing.T) {

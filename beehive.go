@@ -464,12 +464,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	}
 	r.work.setFloor(bh.minRequeueInterval) // withMinRequeueInterval may override below
 
-	adapter := &typedController[Spec, Status]{
-		gk:     gk,
-		bh:     bh,
-		inner:  c,
-		client: &controllerClientImpl[Status]{bh: bh, gk: gk},
-	}
+	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}
 	r.adapter = adapter
 
 	for _, o := range opts {

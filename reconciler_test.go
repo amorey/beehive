@@ -1354,10 +1354,9 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 		return Settled(0)
 	}}
 	tc := &typedController[cSpec, cStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  inner,
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
 	}
 	res, _, err := reconcilePass(tc, context.Background(), 1)
 	require.NoError(t, err, "an undecodable row must not retry forever")
@@ -1404,9 +1403,8 @@ func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 	store := &owedBadSpecStore{}
 	bh := &Beehive{store: store}
 	tc := &typedController[cSpec, cStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		gk: GroupKind{Kind: "Widget"},
+		bh: bh,
 		inner: &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 			return Settled(0)
 		}},
@@ -1484,10 +1482,9 @@ func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
 		return Settled(0)
 	}}
 	tc := &typedController[cSpec, cStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  inner,
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
 	}
 	_, _, err := reconcilePass(tc, context.Background(), 1)
 	require.ErrorIs(t, err, errBoom, "a failed collect on a poison deleting row must surface for retry")
@@ -1526,10 +1523,9 @@ func TestTypedControllerReconcileCollectErrorAfterASuccessfulPass(t *testing.T) 
 		return Settled(time.Minute)
 	}}
 	tc := &typedController[cSpec, cStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  inner,
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
 	}
 
 	result, _, err := reconcilePass(tc, context.Background(), 1)
@@ -1562,10 +1558,9 @@ func TestTypedControllerReconcileGetObjectError(t *testing.T) {
 	bh := &Beehive{store: &getObjectErrorStore{}}
 	inner := &noopController[tSpec, tStatus]{}
 	tc := &typedController[tSpec, tStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  inner,
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: inner,
 	}
 	_, _, err := reconcilePass(tc, context.Background(), 1)
 	require.Error(t, err)
@@ -1593,10 +1588,9 @@ func (s *notFoundStore) getForReconcileObjects(ctx context.Context, id ObjectID)
 func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
 	bh := &Beehive{store: &notFoundStore{}}
 	tc := &typedController[tSpec, tStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  &noopController[tSpec, tStatus]{},
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: &noopController[tSpec, tStatus]{},
 	}
 	// A gone object is a no-op success, not a retryable error: returning the error
 	// would retry the missing id forever on backoff.
@@ -1628,10 +1622,9 @@ func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 
 	bh := &Beehive{store: s}
 	tc := &typedController[tSpec, tStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  notFoundReturningController{},
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: notFoundReturningController{},
 	}
 	// The object exists; only the controller returned ErrNotFound. It must surface
 	// so the worker retries, not be swallowed as a vanished-object no-op.
@@ -1663,10 +1656,9 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 
 	bh := &Beehive{store: s}
 	tc := &typedController[tSpec, tStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  requeueController{},
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: requeueController{},
 	}
 	// GC removes the unfinalized, deletion-pending row; the controller's
 	// RequeueAfter must be dropped so the worker doesn't reschedule a dead id.
@@ -1694,10 +1686,9 @@ func TestTypedControllerReconcile(t *testing.T) {
 	bh := &Beehive{store: s}
 	capCh := make(chan *Object[tSpec, tStatus], 1)
 	tc := &typedController[tSpec, tStatus]{
-		gk:     GroupKind{Kind: "Widget"},
-		bh:     bh,
-		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
-		inner:  &reconcileCapture{ch: capCh},
+		gk:    GroupKind{Kind: "Widget"},
+		bh:    bh,
+		inner: &reconcileCapture{ch: capCh},
 	}
 	result, _, err := reconcilePass(tc, ctx, raw.ID)
 	require.NoError(t, err)
@@ -1747,9 +1738,8 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 
 	bh := &Beehive{store: s}
 	tc := &typedController[cSpec, cStatus]{
-		gk:     clientTestGK,
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
+		gk: clientTestGK,
+		bh: bh,
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 			if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "written"}); err != nil {
 				return Fail(err)
@@ -1785,10 +1775,9 @@ func newSyncController(s Store) (*typedController[cSpec, cStatus], *funcControll
 	bh := &Beehive{store: s}
 	inner := &funcController{}
 	return &typedController[cSpec, cStatus]{
-		gk:     clientTestGK,
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
-		inner:  inner,
+		gk:    clientTestGK,
+		bh:    bh,
+		inner: inner,
 	}, inner
 }
 
@@ -1956,9 +1945,8 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 
 	bh := &Beehive{store: s}
 	tc := &typedController[cSpec, cStatus]{
-		gk:     clientTestGK,
-		bh:     bh,
-		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
+		gk: clientTestGK,
+		bh: bh,
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 			if err := cc.DeleteFinalizer(ctx, obj.ID, "f"); err != nil {
 				return Fail(err)

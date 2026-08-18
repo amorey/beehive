@@ -46,13 +46,29 @@ type controllerAdapter interface {
 // typedController adapts a generic Controller[Spec, Status] to the non-generic
 // controllerAdapter interface.
 type typedController[Spec, Status any] struct {
-	gk    GroupKind
-	bh    *Beehive
-	inner Controller[Spec, Status]
-	// Built once at Register and returned to the caller; each pass hands the
-	// controller a scopedControllerClient over it, never this.
-	client *controllerClientImpl[Status]
+	gk     GroupKind
+	bh     *Beehive
+	inner  Controller[Spec, Status]
 	logger *slog.Logger // kind-tagged; set by Register
+}
+
+// stampObserved records raw's generation as observed, skipping the store call
+// when the loaded row already carries it. That gate stands in for the store's
+// clamp only while observed_generation is monotonic — keep
+// SetObservedGeneration its sole writer. Beehive's own write, made after the
+// pass client is dead, so it is not on that client.
+func (t *typedController[Spec, Status]) stampObserved(ctx context.Context, raw *RawObject) error {
+	if raw.ObservedGeneration != nil && *raw.ObservedGeneration >= raw.Generation {
+		return nil
+	}
+	settled, err := t.bh.store.Objects().SetObservedGeneration(ctx, t.gk, raw.ID, raw.Generation)
+	if err != nil || !settled {
+		return err
+	}
+	// A stamp is a logged write like any other; forgetting the wake costs a
+	// watch its latency and nothing catches it.
+	t.bh.signalKindWritten(ctx, t.gk)
+	return nil
 }
 
 // log guards the rare path where a typedController is built outside Register.
@@ -105,7 +121,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
 	// Ended below, before beehive's own writes: nothing the controller captured
 	// may write past that point.
-	pass := &scopedControllerClient[Status]{inner: t.client}
+	pass := &controllerClientImpl[Status]{bh: t.bh, gk: t.gk}
 	// Normalized before any gate below reads it.
 	result := t.inner.Reconcile(ctx, pass, obj).normalize()
 	pass.end()
@@ -144,7 +160,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// and a row collected mid-pass are not faults.
 	// See docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md.
 	if result.settles() {
-		if err := t.client.stampObserved(ctx, raw); err != nil &&
+		if err := t.stampObserved(ctx, raw); err != nil &&
 			ctx.Err() == nil && !errors.Is(err, ErrNotFound) {
 			log.WarnContext(ctx, "failed to record the observed generation; the object stays unsettled", "err", err)
 		}
