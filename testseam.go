@@ -21,5 +21,6 @@ func init() {
 type fixtureWriter struct{ bh *Beehive }
 
 func (w fixtureWriter) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte) error {
-	return w.bh.store.Objects().UpdateStatus(ctx, gk, id, status, 0)
+	return w.bh.store.Objects().UpdateStatus(ctx, gk, id, status,
+		migratorStatusVersion(w.bh.migratorFor(gk)))
 }

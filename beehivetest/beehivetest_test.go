@@ -2,6 +2,7 @@ package beehivetest_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -55,4 +56,47 @@ func TestUpdateStatusRoundTrips(t *testing.T) {
 	// The handshake stays beehive's: a fixture status leaves the object unsettled.
 	assert.Nil(t, got.ObservedGeneration)
 	assert.Equal(t, obj.Generation, got.Generation)
+}
+
+// stubController registers a kind without reconciling anything.
+type stubController struct{}
+
+func (stubController) Reconcile(context.Context, beehive.ControllerClient[clusterStatus], *beehive.Object[clusterSpec, clusterStatus]) beehive.ReconcileResult {
+	return beehive.Settled()
+}
+
+// statusV2Migrator reports status version 2 and marks whatever it converts, so
+// a test can see whether a row was tagged at the current version or below it.
+type statusV2Migrator struct{}
+
+func (statusV2Migrator) SchemaVersionSpec() int   { return 0 }
+func (statusV2Migrator) SchemaVersionStatus() int { return 2 }
+
+func (statusV2Migrator) ConvertSpec(_ int, raw json.RawMessage) (json.RawMessage, error) {
+	return raw, nil
+}
+
+func (statusV2Migrator) ConvertStatus(_ int, _ json.RawMessage) (json.RawMessage, error) {
+	return json.RawMessage(`{"Server":{"UID":"converted"}}`), nil
+}
+
+func TestUpdateStatusStampsTheMigratorsVersion(t *testing.T) {
+	ctx := context.Background()
+	bh := newBeehive(t)
+	require.NoError(t, beehive.Register[clusterSpec, clusterStatus](
+		bh, clusterGK, stubController{}, beehive.WithMigrator(statusV2Migrator{})))
+	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
+
+	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+
+	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
+	require.NoError(t, c.UpdateStatus(ctx, obj.ID, clusterStatus{Server: serverStatus{UID: "server-1"}}))
+
+	// A row tagged at the migrator's version is not converted on read. Created
+	// rows sit at 0, so a write that fails to stamp leaves ConvertStatus to run.
+	got, err := objects.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.Status)
+	assert.Equal(t, "server-1", got.Status.Server.UID)
 }
