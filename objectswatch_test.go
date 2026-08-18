@@ -404,7 +404,7 @@ func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
 	drainProbe(store.listed)
 
 	// An event write bumps the shared sequence and no objects row.
-	require.NoError(t, cc.AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probed"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, EventSpec{Type: EventNormal, Reason: "Probed"}))
 
 	waitClosed(t, chanAfter(store.polled, 3), "three polls after the event write")
 	select {
@@ -907,7 +907,7 @@ func TestDeletedChangeComesFromTheLogImage(t *testing.T) {
 	defer cancel()
 	store, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "doomed"})
-	require.NoError(t, cc.SetCondition(ctx, obj.ID, Condition{
+	require.NoError(t, cc.at(obj.ID).SetCondition(ctx, Condition{
 		Type: "Ready", Status: ConditionTrue, Reason: "Settled",
 	}))
 
@@ -1439,32 +1439,32 @@ func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 			name:  "update status",
 			setup: create("status"),
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.UpdateStatus(ctx, id, cStatus{Val: "ok"}))
+				require.NoError(t, w.ctrl.at(id).UpdateStatus(ctx, cStatus{Val: "ok"}))
 			},
 		},
 		{
 			name:  "conditions set",
 			setup: create("cond-set"),
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.SetCondition(ctx, id, Condition{Type: "Ready", Status: ConditionTrue}))
+				require.NoError(t, w.ctrl.at(id).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 			},
 		},
 		{
 			name: "conditions delete",
 			setup: func(t *testing.T, ctx context.Context, w *writeWorld) ObjectID {
 				id := create("cond-del")(t, ctx, w)
-				require.NoError(t, w.ctrl.SetCondition(ctx, id, Condition{Type: "Ready", Status: ConditionTrue}))
+				require.NoError(t, w.ctrl.at(id).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 				return id
 			},
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.DeleteCondition(ctx, id, "Ready"))
+				require.NoError(t, w.ctrl.at(id).DeleteCondition(ctx, "Ready"))
 			},
 		},
 		{
 			name:  "finalizer clear",
 			setup: create("finalizer", WithFinalizers("f")),
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.DeleteFinalizer(ctx, id, "f"))
+				require.NoError(t, w.ctrl.at(id).DeleteFinalizer(ctx, "f"))
 			},
 		},
 		{
@@ -2534,7 +2534,7 @@ func startTailer(t *testing.T, bh *Beehive, gk GroupKind) (*objectTailer, *confl
 type writeWorld struct {
 	bh     *Beehive
 	client Client[cSpec, cStatus]
-	ctrl   *controllerClientImpl[cStatus]
+	ctrl   passClients[cStatus]
 }
 
 func newWriteWorld(t *testing.T) *writeWorld {
@@ -2547,7 +2547,7 @@ func newWriteWorld(t *testing.T) *writeWorld {
 	return &writeWorld{
 		bh:     bh,
 		client: NewClient[cSpec, cStatus](bh, clientTestGK),
-		ctrl:   &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
+		ctrl:   passClients[cStatus]{bh: bh, gk: clientTestGK},
 	}
 }
 

@@ -389,7 +389,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 	}
 	// Settling at obj.Generation is what hides a missed wake from the full pass
 	// backstop: ObjectsListUnsettledIDs sees a converged object.
-	if err := cc.UpdateStatus(ctx, c.depID, tStatus{}); err != nil {
+	if err := cc.UpdateStatus(ctx, tStatus{}); err != nil {
 		return Fail(err)
 	}
 	c.observed <- ready
@@ -432,7 +432,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 		}
 		// The version the read above reflects — not a fresh one, which would claim
 		// to have seen changes this pass did not.
-		return cc.AddDependency(ctx, ctrl.depID, ctrl.targetID)
+		return cc.AddDependency(ctx, ctrl.targetID)
 	}
 	// Full pass disabled so the dependency waker is the only thing that can requeue
 	// the dependent — the backstop must not paper over the miss.
@@ -459,7 +459,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	// dependents — with no edge yet, that lookup comes back empty and the change
 	// is now permanently unclaimed. Only then let the declaration commit.
 	store.resetLooked()
-	require.NoError(t, cc.SetCondition(ctx, target.ID, Condition{Type: "Ready", Status: ConditionTrue}))
+	require.NoError(t, cc.at(target.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 	store.waitLooked(t)
 	close(proceed)
 
@@ -540,12 +540,12 @@ func TestDependencyRequeueRaceOnDeclareOutsideReconcile(t *testing.T) {
 	// makes the window deterministic: with no edge yet it comes back empty, so the
 	// change is already unclaimed by the time AddDependency commits.
 	store.resetLooked()
-	require.NoError(t, cc.SetCondition(ctx, target.ID, Condition{Type: "Ready", Status: ConditionTrue}))
+	require.NoError(t, cc.at(target.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 	store.waitLooked(t)
 	// target is the application's read of the target, taken before the change
 	// above — so the version it carries is the one the decision to depend was
 	// based on, and the target has since moved past it.
-	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID))
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID))
 
 	// The edge is in place and the target's change is still unobserved, so the
 	// dependent must be reconciled again and see Ready.
@@ -631,7 +631,7 @@ func TestDependencyRequeueLostAcrossRestart(t *testing.T) {
 	// loops), so the declaration commits normally with no running queue to reach.
 	err = db.Conditions().Set(ctx, gk, target.ID, storeapi.Condition{Type: "Ready", Status: "True"})
 	require.NoError(t, err)
-	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID))
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID))
 
 	// --- the restart: a second process, the first already stopped ---
 	bh2, err := New(db)
@@ -1742,7 +1742,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 		gk: clientTestGK,
 		bh: bh,
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "written"}); err != nil {
+			if err := cc.UpdateStatus(ctx, cStatus{Val: "written"}); err != nil {
 				return Fail(err)
 			}
 			return Fail(errBoom)
@@ -1949,7 +1949,7 @@ func TestReconcileRunsGCAfterCommittedWritesOnError(t *testing.T) {
 		gk: clientTestGK,
 		bh: bh,
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			if err := cc.DeleteFinalizer(ctx, obj.ID, "f"); err != nil {
+			if err := cc.DeleteFinalizer(ctx, "f"); err != nil {
 				return Fail(err)
 			}
 			return Fail(errBoom)
@@ -1970,7 +1970,7 @@ type statusSettingController struct {
 }
 
 func (c *statusSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	if err := client.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
+	if err := client.UpdateStatus(ctx, cStatus{Val: "done"}); err != nil {
 		return Fail(err)
 	}
 	c.reconciled.fire()
@@ -1987,7 +1987,7 @@ type specEchoController struct {
 }
 
 func (c *specEchoController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	if err := client.UpdateStatus(ctx, obj.ID, cStatus{Val: obj.Spec.Val}); err != nil {
+	if err := client.UpdateStatus(ctx, cStatus{Val: obj.Spec.Val}); err != nil {
 		return Fail(err)
 	}
 	c.firstDone.fire()
@@ -2021,12 +2021,12 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 		c.deleted.fire()
 		// Clear the finalizer so GC can collect the row now that the deletion has
 		// been observed (idempotent: re-clearing a gone finalizer is a no-op).
-		if err := client.DeleteFinalizer(ctx, obj.ID, deletionTrackingFinalizer); err != nil {
+		if err := client.DeleteFinalizer(ctx, deletionTrackingFinalizer); err != nil {
 			return Fail(err)
 		}
 		return Settled()
 	}
-	if err := client.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
+	if err := client.UpdateStatus(ctx, cStatus{Val: "done"}); err != nil {
 		return Fail(err)
 	}
 	c.reconciled.fire()
@@ -2159,7 +2159,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	ctrl := &funcController{
 		signal: newSignal(),
 		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			_ = cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "persisted"})
+			_ = cc.UpdateStatus(ctx, cStatus{Val: "persisted"})
 			return Fail(errBoom)
 		},
 	}
@@ -2187,7 +2187,7 @@ type conditionSettingController struct {
 }
 
 func (c *conditionSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	if err := client.SetCondition(ctx, obj.ID, Condition{
+	if err := client.SetCondition(ctx, Condition{
 		Type: "Ready", Status: ConditionTrue, Reason: "Provisioned",
 	}); err != nil {
 		return Fail(err)
@@ -2239,7 +2239,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	ctrl := &funcController{
 		signal: newSignal(),
 		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			_ = cc.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
+			_ = cc.SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue})
 			return Fail(errBoom)
 		},
 	}
@@ -3102,7 +3102,7 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 	second, err := h.store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 	h.inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) ReconcileResult {
-		if err := cc.AddDependency(ctx, h.dep, second.ID); err != nil {
+		if err := cc.AddDependency(ctx, second.ID); err != nil {
 			return Fail(err)
 		}
 		return Settled()
@@ -3184,7 +3184,7 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 	stale := func() []ObjectID { return staleDependentIDs(t, s, clientTestGK) }
 
 	inner.fn = func(ctx context.Context, cc ControllerClient[cStatus], _ *Object[cSpec, cStatus]) ReconcileResult {
-		if err := cc.AddDependency(ctx, dep.ID, target.ID); err != nil {
+		if err := cc.AddDependency(ctx, target.ID); err != nil {
 			return Fail(err)
 		}
 		return Settled()
@@ -3478,7 +3478,7 @@ func TestDependencyWakeSurvivesRestart(t *testing.T) {
 	// startup reconcile below services and drains it — so by the time the target
 	// moves, nothing durable records that a wake is owed: this is the ordinary
 	// settled dependency, not the declare-time case the stamp covers.
-	require.NoError(t, cc.AddDependency(ctx, dep.ID, target.ID))
+	require.NoError(t, cc.at(dep.ID).AddDependency(ctx, target.ID))
 
 	stop1, err := bh1.Start(ctx)
 	require.NoError(t, err)
@@ -3531,7 +3531,7 @@ func (c *cycleController) Reconcile(ctx context.Context, cc ControllerClient[cSt
 		c.hot.fire()
 	}
 	c.first.fire()
-	if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: fmt.Sprint(n)}); err != nil {
+	if err := cc.UpdateStatus(ctx, cStatus{Val: fmt.Sprint(n)}); err != nil {
 		return Fail(err)
 	}
 	return Settled()
@@ -3556,8 +3556,8 @@ func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
 
 	a := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	b := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "b"})
-	require.NoError(t, cc.AddDependency(ctx, a.ID, b.ID))
-	require.NoError(t, cc.AddDependency(ctx, b.ID, a.ID))
+	require.NoError(t, cc.at(a.ID).AddDependency(ctx, b.ID))
+	require.NoError(t, cc.at(b.ID).AddDependency(ctx, a.ID))
 
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)

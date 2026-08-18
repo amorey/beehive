@@ -349,13 +349,19 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `UpdateStatus` writes status alone, which is what leaves
   `Objects().SetObservedGeneration` the sole writer of that column.
   → [ADR](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md)
-- **A `ControllerClient` exists only for the pass it is handed to**, because
-  beehive concludes a pass by stamping the generation it handed out. Every method
-  fails with `ErrReconcileReturned` once `Reconcile` returns, and `Register` hands
-  back nothing, so there is no other way to hold one. A fail-fast, not a barrier.
-  An application that must write between passes keeps what it learned in memory
-  and calls `Client.Requeue`; appending to an event log out of band is the one
-  capability this removes rather than relocates (`docs/TODO.md`).
+- **A `ControllerClient` exists only for the pass it is handed to, and writes
+  only that pass's object**, because beehive concludes a pass by stamping the
+  generation it handed out. Every method fails with `ErrReconcileReturned` once
+  `Reconcile` returns, and `Register` hands back nothing, so there is no other way
+  to hold one. A fail-fast, not a barrier. **No method takes the object's id**:
+  the client is bound at construction and the only ids left name the *other* end
+  of an edge, so a sibling write — which would race that object's own pass and
+  settle nothing — cannot be expressed. `ErrWrongKind` is unreachable from it as a
+  result. What that removes rather than relocates is a declare or an event append
+  made on another object's behalf, both in `docs/TODO.md`; the reads relocate to
+  `Client`, `HasIncomingEdges` excepted. The cleared-finalizer push keeps only its
+  second case — a pass whose load predated the delete request, where the tail
+  `gcCollect` is gated on a stale `deleting`.
   → [ADR](docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md)
 - **`TestClient` writes status and conditions outside a pass**, for the fixture
   a `ControllerClient`'s pass scoping made unbuildable: a controller reading
@@ -365,9 +371,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   rather than a `beehivetest` sub-package: a sub-package cannot reach `bh.store`
   or the write hub, so it would need a seam, and the seam buys only a package
   name to hide the warning in — the constructor is exported either way. It
-  holds a `ControllerClient` nothing ever ends — `live()` closes only when the
-  reconcile loop calls `end()` — so the writes have one implementation, and it
-  never stamps `observed_generation`.
+  builds, per call, a `ControllerClient` nothing ever ends — `live()` closes only
+  when the reconcile loop calls `end()` — so the writes have one implementation,
+  and it never stamps `observed_generation`. It keeps its `ObjectID` arguments,
+  which is what a bound client cannot take, and is now the only surface that
+  returns `ErrWrongKind`.
   → [ADR](docs/adr/2026-08-18-a-test-client-writes-status.md)
 - **A downgraded liveness condition says so.** `downgradeLiveness` sets
   `Condition.Unconfirmed` beside the `Unknown` rewrite, because the predicate
@@ -387,8 +395,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Every new `depends_on` edge stamps an owed reconcile** (`reconcile_owed`),
   atomically with the edge inside `Edges().Add`, drained by the owed pass. The
   declaration also enqueues the source at commit, gated on
-  `ReconcileOwedStamped` and routed by `EdgesAddResult.From` (the edge is
-  cross-kind). The edge push is throttled; the spec write's is not.
+  `ReconcileOwedStamped` and routed by the client's own kind, the source being
+  its own object. The edge push is throttled; the spec write's is not.
   → [ADR](docs/adr/2026-07-29-stamp-every-new-dependency-edge.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - **Secondary lookups are read on request**, never folded into the blob-carrying

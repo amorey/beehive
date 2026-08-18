@@ -52,7 +52,7 @@ can be read.
 | Push path | Made by | Starts | Gate |
 |---|---|---|---|
 | A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
-| A new edge enqueues the edge's source | `ControllerClient.AddDependency` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
+| A new edge enqueues the edge's source | `ControllerClient.AddDependency` | the declaring pass's own object | `EdgesAddResult.ReconcileOwedStamped` |
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
 | A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
 | A cleared finalizer enqueues its own object | `ControllerClient.DeleteFinalizer` | the object whose block it lifted | the store reports `clearedLast` |
@@ -295,8 +295,8 @@ See [the ADR](adr/2026-07-29-stamp-every-new-dependency-edge.md).
 
 **Push:** the declaration enqueues the source. `Beehive.signalRequeueNow`/`signalRequeueThrottled` runs on
 `Store.AfterCommit`. It is gated on `EdgesAddResult.ReconcileOwedStamped` and routed
-by `EdgesAddResult.From`. The route matters because the edge is cross-kind. The
-source's kind can differ from the declarer's kind.
+by the declaring client's own kind. Only the far end of the edge is cross-kind;
+the source is the object the pass was handed.
 
 **The enqueue is throttled**, so a source whose edge set never converges keeps its
 backoff ladder, and a declaration made inside the source's own pass is held to that
@@ -324,7 +324,7 @@ is what the stamp is for.
 **Tests:** `TestDependencyRequeueLostAcrossRestart` (run under
 `WithStartupFullPass(false)`, so the full pass cannot hide the result),
 `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
-`TestAddDependencyEnqueueRoutesByTheSourcesKind`,
+`TestAddDependencyEnqueuesItsSource`,
 `TestANewEdgeOnAnInFlightSourceRespectsTheBackoff`,
 `TestReconcileMidPassDeclareLeavesTheDependentOwed`.
 
@@ -645,9 +645,8 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 `TestDependenciesDeleteSkipsClientOnlyTarget`,
 `TestIntegrationDroppedDependencyCollectsWithoutASweep`,
 `TestIntegrationDroppedDependencyCollectsWithoutThePush`,
-`TestObjects().DeleteFinalizerPushesTheCollect`,
-`TestObjects().DeleteFinalizerPushesNothingOtherwise`,
-`TestIntegrationClearedFinalizerCollectsWithoutASweep`,
+`TestDeleteFinalizerPushesTheCollect`,
+`TestDeleteFinalizerPushesNothingOtherwise`,
 `TestIntegrationClearedFinalizerCollectsWithoutThePush`,
 `TestPhysicalDeletePushesItsOwner`, `TestPhysicalDeletePushBeatsAPendingAlarm`,
 `TestPhysicalDeletePushesNoLiveOwner`, `TestPhysicalDeletePushesNothingWhenBlocked`,

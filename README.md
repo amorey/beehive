@@ -45,7 +45,7 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
   // Remove any external resources, then clear the finalizer to allow the row to be deleted.
   if obj.DeletionRequestedAt != nil {
     // TODO: clean up external resources for obj.Spec
-    // TODO: remove the finalizer: client.DeleteFinalizer(ctx, obj.ID, "kstack.sh/cluster")
+    // TODO: remove the finalizer: client.DeleteFinalizer(ctx, "kstack.sh/cluster")
     return beehive.Settled()
   }
 
@@ -54,7 +54,7 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
   // return beehive.Unsettled().RequeueAfter(5 * time.Second)
 
   // TODO: update observed state
-  // if err := client.UpdateStatus(ctx, obj.ID, ClusterStatus{}); err != nil {
+  // if err := client.UpdateStatus(ctx, ClusterStatus{}); err != nil {
   //   return beehive.Fail(err)
   // }
 
@@ -568,7 +568,7 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
     }
     if created {
         // AddEvent is about obj (this controller's object), not the child.
-        if err := cc.AddEvent(ctx, obj.ID, beehive.EventSpec{
+        if err := cc.AddEvent(ctx, beehive.EventSpec{
             Category: "lifecycle", Reason: "ClusterCreated",
         }); err != nil {
             return beehive.Fail(err)
@@ -691,7 +691,7 @@ Both are on `Client` only, and both read **per-id timers only**. Neither predict
 
 `ListEvents` returns an object's runs newest first (by `LastAt`). `WithEventCategory` narrows to one timeline, and the other `EventOption`s filter by type, reason or time, or cap how many come back. `GetLatestEvent` returns the current run in a category, with a `bool` that folds away the no-events-yet case like `GetOwner` does.
 
-All three reads — `ListEvents`, `GetLatestEvent`, `WatchEvents` — take an id and read that object's log whatever kind holds it, since an event carries no kind of its own. The write is the asymmetry: `AddEvent` is scoped to the controller's own kind and returns `ErrWrongKind`. (The *object* watches above are kind-scoped, so the two watches differ deliberately.) `WatchEvents` still needs a registered controller for the client's own kind — a property of the caller, not of the target.
+All three reads — `ListEvents`, `GetLatestEvent`, `WatchEvents` — take an id and read that object's log whatever kind holds it, since an event carries no kind of its own. The write is the asymmetry: `AddEvent` appends to the object its pass was handed and takes no id at all. (The *object* watches above are kind-scoped, so the two watches differ deliberately.) `WatchEvents` still needs a registered controller for the client's own kind — a property of the caller, not of the target.
 
 `WatchEvents` hands back an `EventStream`: `Runs` is the snapshot as of `ResourceVersion`, `Events` streams what the log grows by above it — oldest-first — and `Err()` says why the stream ended once `Events` is closed. It reads the log above a cursor, and an `AddEvent` commit wakes it, so a local write arrives at commit rather than on a tick; the floor (`WithWatchFloorInterval`) is what covers a write another process made. An **extend is not a new run**: the row comes back with a higher `ResourceVersion` and a bumped `Count`, which is what lets you update it in place. There are no tombstones, since a run can only appear or grow.
 
@@ -713,23 +713,28 @@ All three reads — `ListEvents`, `GetLatestEvent`, `WatchEvents` — take an id
 
 ```go
 type ControllerClient[Status any] interface {
-    UpdateStatus(ctx context.Context, id ObjectID, status Status) error
-    SetCondition(ctx context.Context, id ObjectID, condition Condition) error
-    SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
-    DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
-    AddEvent(ctx context.Context, id ObjectID, event EventSpec) error
-    DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
-    AddDependency(ctx context.Context, fromID, toID ObjectID) error
-    DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
-    HasIncomingEdges(ctx context.Context, id ObjectID) (bool, error)
-    // Lazy secondary lookups, for reading an object's edges during reconcile.
-    GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
-    ListDependencies(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-    ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-    ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+    UpdateStatus(ctx context.Context, status Status) error
+    SetCondition(ctx context.Context, condition Condition) error
+    SetConditions(ctx context.Context, conditions []Condition) error
+    DeleteCondition(ctx context.Context, conditionType string) error
+    AddEvent(ctx context.Context, event EventSpec) error
+    DeleteFinalizer(ctx context.Context, finalizer string) error
+    AddDependency(ctx context.Context, toID ObjectID) error
+    DeleteDependency(ctx context.Context, toID ObjectID) error
+    HasIncomingEdges(ctx context.Context) (bool, error)
+    // Lazy secondary lookups, for reading the object's edges during reconcile.
+    GetOwner(ctx context.Context) (ObjectRef, bool, error)
+    ListDependencies(ctx context.Context) ([]ObjectRef, error)
+    ListDependents(ctx context.Context) ([]ObjectRef, error)
+    ListOwned(ctx context.Context) ([]ObjectRef, error)
     Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 ```
+
+**The client is bound to the object your `Reconcile` was handed**, and writes and
+reads that object alone; the ids above are the other end of an edge. There is no
+way to write a sibling of your own kind, which would race that object's own pass
+and settle nothing.
 
 `UpdateStatus` **does nothing when the status marshals to the bytes already stored**. There is no `resource_version` bump, so a watch and the dependency waker both find nothing — the same way re-applying an unchanged spec does nothing on the `Client` side. So report observed state unconditionally; you don't need your own equality check, and a dependent riding on this kind's status won't be woken by a pass that found nothing new.
 
@@ -747,11 +752,11 @@ A pass that settles a *new* generation therefore costs two write-log entries whe
 
 `SetCondition` is the one-condition spelling of the same write. Reach for `SetConditions` when one pass observes several conditions; both compose inside `Within`, which is what to use when conditions must land with an `UpdateStatus` or a `DeleteCondition` — `Within` gives you the atomicity, and `SetConditions` additionally collapses what would be one version bump and one log entry per condition into one of each.
 
-`GetOwner`, `ListDependencies`, `ListDependents` and `ListOwned` are the same lazy lookups the `Client` has. `Reconcile` is handed its object directly, with no read call of its own, so these are how it reads related edges. `GetOwner` returns the owner over `owned_by` and `ListOwned` the reverse, the owner's children; `ListDependents` is the reverse of `ListDependencies` over `depends_on`.
+`GetOwner`, `ListDependencies`, `ListDependents` and `ListOwned` are the `Client`'s lazy lookups, bound to the object being reconciled — they are how a pass reads its own edges, and they answer for nothing else. For another object's graph, hold a `Client`. `GetOwner` returns the owner over `owned_by` and `ListOwned` the reverse, the owner's children; `ListDependents` is the reverse of `ListDependencies` over `depends_on`.
 
-`HasIncomingEdges` is a different question, used by GC: does anything with a live claim still point at `id`? That means an owned child, or a dependent that is not itself being deleted — one that is going away has no claim. You cannot rebuild it from `ListDependents`, because it folds in owned children as well. A finalizer can wait on it: a controller holding a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
+`HasIncomingEdges` is a different question, used by GC: does anything with a live claim still point at this object? That means an owned child, or a dependent that is not itself being deleted — one that is going away has no claim. You cannot rebuild it from `ListDependents`, because it folds in owned children as well. A finalizer can wait on it: a controller holding a shared connection clears its finalizer only once nothing with a live claim references the object, so the connection outlives its last real user.
 
-`AddEvent` adds an observation to the object's event log — see [Event](#event). Adding is not always an insert: repeating the latest run's `(Category, Type, Reason)` extends that run instead of appending a second one, which is what lets a controller report every poll without growing the log per poll. Like `SetCondition` it is scoped to the controller's kind (`ErrWrongKind` for another kind's id) and composes inside `Within`, so a controller can record an event and flip a condition together.
+`AddEvent` adds an observation to the object's event log — see [Event](#event). Adding is not always an insert: repeating the latest run's `(Category, Type, Reason)` extends that run instead of appending a second one, which is what lets a controller report every poll without growing the log per poll. Like `SetCondition` it writes the object the pass was handed, and composes inside `Within`, so a controller can record an event and flip a condition together.
 
 ### Controller
 
@@ -784,7 +789,7 @@ c := beehive.NewTestClient[ClusterStatus](bh, clusterGK)
 require.NoError(t, c.UpdateStatus(ctx, cluster.ID, ClusterStatus{Server: ServerStatus{UID: "server-1"}}))
 ```
 
-It needs no registered controller and no running beehive, and carries `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition`. It holds a `ControllerClient` nothing ever ends, so each verb behaves exactly as it does during a pass — correct before `Start` and while beehive runs, though on a running beehive it races that object's own pass, last-writer-wins.
+It needs no registered controller and no running beehive, and carries `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition`. It keeps the `ObjectID` a `ControllerClient` no longer takes — a fixture writes for whatever object it is seeding — and builds a `ControllerClient` nothing ever ends, so each verb behaves exactly as it does during a pass — correct before `Start` and while beehive runs, though on a running beehive it races that object's own pass, last-writer-wins.
 
 It never stamps `observed_generation`: the handshake stays beehive's, so an object given a fixture status is still unsettled and the owed pass will reconcile it once beehive starts. → [ADR](docs/adr/2026-08-18-a-test-client-writes-status.md)
 
@@ -841,13 +846,13 @@ The check is **process-local and evaluated at call time**, since the store recor
 
 `WithOnCreate` is the safe way to run a side effect only if the row is really created — an external call, an in-memory counter. It waits for the *outermost* commit, so it runs once and never after a rollback; it is the only thing in beehive deferred that way. `Create` always fires it, `GetOrCreate` only when it inserts. Prefer it to branching on `GetOrCreate`'s `created` bool, which is returned synchronously: inside an enclosing `ControllerClient.Within` that bool is set before the transaction commits, so acting on it fires your side effect for a row a rollback may still discard.
 
-`AddDependency` and `DeleteDependency` manage `depends_on` edges during reconcile. When a target changes, the next dependency-wake scan queues the dependent. Each commits on its own, or joins a `Within` the controller opened.
+`AddDependency` and `DeleteDependency` manage the `depends_on` edges of the object being reconciled, which is the only object that can declare its own. When a target changes, the next dependency-wake scan queues the dependent. Each commits on its own, or joins a `Within` the controller opened.
 
 The target can be **any** kind, including one you only ever use through `Client` and never register — configuration, secrets, any reference data your app writes and your controllers read. The waker scans the whole store's write log rather than only the kinds with controllers, so such a target wakes its dependents like any other.
 
 **Dropping** an edge is what releases a target you were holding open: a deletion-pending object cannot be collected while a live dependent points at it, and `DeleteDependency` collects it as soon as the edge goes, rather than at the next sweep.
 
-Every call that **creates** the edge records, durably and atomically with the edge itself, that the dependent owes a reconcile (a count on the row, `reconcile_owed`, drained by the owed pass). That one rule covers every way a declare could otherwise miss: a change to the target landing between your read and the edge's commit, a declare made on another object's behalf while that object's own reconcile is mid-flight, and a crash before the wake is serviced. Re-asserting your edges on every pass costs nothing after the first, because only the call that created the edge records anything — the cost is one reconcile per edge ever created.
+Every call that **creates** the edge records, durably and atomically with the edge itself, that the dependent owes a reconcile (a count on the row, `reconcile_owed`, drained by the owed pass). That one rule covers every way a declare could otherwise miss: a change to the target landing between your read and the edge's commit, and a crash before the wake is serviced. Re-asserting your edges on every pass costs nothing after the first, because only the call that created the edge records anything — the cost is one reconcile per edge ever created.
 
 There is nothing else to pass: the call takes no version claim, because nothing conditions on one. An earlier design stamped the wake only when the target had moved past the version the caller read, which made the claim load-bearing and left one interleaving stranded; with the stamp unconditional, a claim would be dead weight in every caller's hands, so it was removed rather than kept as decoration.
 

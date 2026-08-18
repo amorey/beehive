@@ -55,7 +55,7 @@ func (gc *GreetingController) Reconcile(ctx context.Context, client beehive.Cont
 	if obj.Status != nil && obj.Status.Message == want {
 		return beehive.Settled()
 	}
-	if err := client.UpdateStatus(ctx, obj.ID, GreetingStatus{Message: want}); err != nil {
+	if err := client.UpdateStatus(ctx, GreetingStatus{Message: want}); err != nil {
 		return beehive.Fail(err)
 	}
 	return beehive.Settled()

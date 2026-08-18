@@ -25,36 +25,36 @@ import "context"
 // means exactly what it means during a pass.
 // See docs/adr/2026-08-18-a-test-client-writes-status.md.
 type TestClient[Status any] struct {
-	c *controllerClientImpl[Status]
+	passClients[Status]
 }
 
 // NewTestClient returns a TestClient for gk. Needs no registered controller and
 // no running beehive.
 func NewTestClient[Status any](bh *Beehive, gk GroupKind) *TestClient[Status] {
-	return &TestClient[Status]{newPassClient[Status](bh, gk)}
+	return &TestClient[Status]{passClients[Status]{bh: bh, gk: gk}}
 }
 
 // DeleteCondition removes id's condition of that type. See
 // ControllerClient.DeleteCondition.
 func (t *TestClient[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
-	return t.c.DeleteCondition(ctx, id, conditionType)
+	return t.at(id).DeleteCondition(ctx, conditionType)
 }
 
 // SetCondition writes id's condition of that type. See
 // ControllerClient.SetCondition.
 func (t *TestClient[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	return t.c.SetCondition(ctx, id, condition)
+	return t.at(id).SetCondition(ctx, condition)
 }
 
 // SetConditions writes every named condition together. See
 // ControllerClient.SetConditions.
 func (t *TestClient[Status]) SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error {
-	return t.c.SetConditions(ctx, id, conditions)
+	return t.at(id).SetConditions(ctx, conditions)
 }
 
 // UpdateStatus records status for id. See ControllerClient.UpdateStatus. Never
 // stamps observed_generation: the handshake stays beehive's, so an object given
 // a fixture status is still unsettled.
 func (t *TestClient[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
-	return t.c.UpdateStatus(ctx, id, status)
+	return t.at(id).UpdateStatus(ctx, status)
 }

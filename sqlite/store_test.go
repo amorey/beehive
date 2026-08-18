@@ -4227,13 +4227,21 @@ func addEdge(ctx context.Context, store beehive.Store, from, to beehive.ObjectID
 	if err != nil {
 		return err
 	}
-	if res.ReconcileOwedStamped {
-		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
-		// the source's own kind is needed here — and res.From already carries it,
-		// projected from the endpoint check EdgesAdd had to do anyway.
-		return store.ReconcileOwed().Decrement(ctx, res.From, from, 1)
+	if !res.ReconcileOwedStamped {
+		return nil
 	}
-	return nil
+	// The decrement is kind-scoped and scaffolding declares edges across kinds, so
+	// the source's own kind is needed here; the edge just written names it.
+	sources, err := store.Edges().ListIncoming(ctx, to, relation)
+	if err != nil {
+		return err
+	}
+	for _, src := range sources {
+		if src.ID == from {
+			return store.ReconcileOwed().Decrement(ctx, src.GroupKind(), from, 1)
+		}
+	}
+	return fmt.Errorf("addEdge: %d is missing from the edge it just wrote", from)
 }
 
 // dropEdge is EdgesDelete for a caller that only needs the edge gone.
@@ -4277,12 +4285,11 @@ func TestRefsAddNonexistentEndpoint(t *testing.T) {
 	assert.Equal(t, 0, countEdges(t, store, 9999, a.ID, "depends_on"))
 }
 
-// TestRefsAddReportsEndpoints pins what the endpoint check reports back: both
-// endpoints' GroupKinds. The edge is cross-kind, so a caller routing work to
-// either end cannot assume its own kind, and it must come from the same
-// round-trip as the insert. The two ends are different kinds here, so confusing
-// them fails.
-func TestRefsAddReportsEndpoints(t *testing.T) {
+// TestRefsAddReportsTheTarget pins what the endpoint check reports back: the
+// target's GroupKind, which a caller routing work to that end cannot assume from
+// its own, and which must come from the same round-trip as the insert. The two
+// ends are different kinds here, so reporting the source's would fail.
+func TestRefsAddReportsTheTarget(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	otherGK := beehive.GroupKind{Group: "", Kind: "Other"}
@@ -4291,15 +4298,13 @@ func TestRefsAddReportsEndpoints(t *testing.T) {
 
 	res, err := store.Edges().Add(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
-	assert.Equal(t, testGK, res.From, "fromID's kind")
 	assert.Equal(t, otherGK, res.To, "toID's kind")
 	assert.False(t, res.ToDeleting, "a live target")
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "this call created the edge")
 
 	res, err = store.Edges().Add(ctx, a.ID, b.ID, "depends_on")
 	require.NoError(t, err)
-	assert.Equal(t, testGK, res.From, "re-declare reports it too")
-	assert.Equal(t, otherGK, res.To)
+	assert.Equal(t, otherGK, res.To, "re-declare reports it too")
 	assert.Equal(t, 1, countEdges(t, store, a.ID, b.ID, "depends_on"), "the edge already existed; the insert was a no-op")
 }
 

@@ -17,4 +17,4 @@ work we have decided to do.
 No spec is in flight.
 
 The last spec shipped as
-[A TestClient writes status and conditions outside a pass](../adr/2026-08-18-a-test-client-writes-status.md).
+[A ControllerClient exists only for the pass it is handed to, and writes only that pass's object](../adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).

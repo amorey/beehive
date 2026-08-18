@@ -40,7 +40,7 @@ func (c *finalizerClearingController) Reconcile(ctx context.Context, client Cont
 	}
 	for _, f := range obj.Finalizers {
 		if f == c.finalizer {
-			if err := client.DeleteFinalizer(ctx, obj.ID, c.finalizer); err != nil {
+			if err := client.DeleteFinalizer(ctx, c.finalizer); err != nil {
 				return Fail(err)
 			}
 			return Settled()
@@ -70,14 +70,14 @@ func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc Con
 	if !held {
 		return Settled()
 	}
-	referenced, err := cc.HasIncomingEdges(ctx, obj.ID)
+	referenced, err := cc.HasIncomingEdges(ctx)
 	if err != nil {
 		return Fail(err)
 	}
 	if referenced {
 		return Settled() // a live user remains; keep the finalizer
 	}
-	if err := cc.DeleteFinalizer(ctx, obj.ID, c.finalizer); err != nil {
+	if err := cc.DeleteFinalizer(ctx, c.finalizer); err != nil {
 		return Fail(err)
 	}
 	return Settled()
@@ -1076,7 +1076,7 @@ func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClien
 	if target.DeletionRequestedAt == nil {
 		return Settled()
 	}
-	if err := cc.DeleteDependency(ctx, depID, targetID); err != nil {
+	if err := cc.DeleteDependency(ctx, targetID); err != nil {
 		return Fail(err)
 	}
 	return Settled()
@@ -1248,83 +1248,9 @@ func TestIntegrationCascadeMarkCollectsWithoutASweep(t *testing.T) {
 	waitForDeletions(t, stream.Changes, target.ID)
 }
 
-// siblingFinalizerClearingController clears finalizer on targetID — never on the
-// object it is reconciling — the moment that target is finalizing. It models the
-// case the tail gcCollect cannot serve: the clear lands outside any pass over the
-// object it unblocks.
-type siblingFinalizerClearingController struct {
-	mu        sync.Mutex
-	reader    Client[cSpec, cStatus]
-	targetID  ObjectID
-	finalizer string
-}
-
-func (c *siblingFinalizerClearingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	c.mu.Lock()
-	reader, targetID, finalizer := c.reader, c.targetID, c.finalizer
-	c.mu.Unlock()
-	if reader == nil || obj.ID == targetID {
-		return Settled()
-	}
-	target, err := reader.Get(ctx, targetID)
-	if errors.Is(err, ErrNotFound) {
-		return Settled() // already collected
-	}
-	if err != nil {
-		return Fail(err)
-	}
-	if target.DeletionRequestedAt == nil || len(target.Finalizers) == 0 {
-		return Settled()
-	}
-	if err := cc.DeleteFinalizer(ctx, targetID, finalizer); err != nil {
-		return Fail(err)
-	}
-	return Settled()
-}
-
-// With the sweeper stopped and the periodic passes off, the push is the only
-// thing that can dispatch the unblocked object: its own delete push was spent on
-// the pass the finalizer blocked.
-func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
-	ctx := context.Background()
-	store := newClientTestStore(t)
-	bh := newTestBeehive(t, store, fast(
-		WithFullPassInterval(0),
-		withOwedPassInterval(time.Hour),
-		withoutGCSweeper(),
-	)...)
-
-	ctrl := &siblingFinalizerClearingController{finalizer: "f"}
-	err := Register(bh, clientTestGK, ctrl)
-	require.NoError(t, err)
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-
-	target := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "target"}, WithFinalizers("f"))
-	sibling := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "sibling"})
-
-	ctrl.mu.Lock()
-	ctrl.reader, ctrl.targetID = client, target.ID
-	ctrl.mu.Unlock()
-
-	wctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stream, err := client.WatchList(wctx)
-	require.NoError(t, err)
-
-	stop, err := bh.Start(ctx)
-	require.NoError(t, err)
-	defer stop(ctx)
-
-	// The delete push reconciles the target once, where the finalizer blocks the
-	// collect. Requeuing the sibling is what then clears it.
-	require.NoError(t, client.Delete(ctx, target.ID))
-	require.NoError(t, client.Requeue(ctx, sibling.ID))
-	waitForDeletions(t, stream.Changes, target.ID)
-}
-
-// The pull path under this push: TestIntegrationGCDeletesAfterFinalizerCleared
-// clears through a controller, so it now passes via the push. Clearing through
-// the store issues none, leaving the sweeper's tick as the only collector.
+// TestIntegrationGCDeletesAfterFinalizerCleared clears through a controller, so
+// the pass's own tail collect serves it. Clearing through the store runs no pass
+// at all, leaving the sweeper's tick as the only collector.
 func TestIntegrationClearedFinalizerCollectsWithoutThePush(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)

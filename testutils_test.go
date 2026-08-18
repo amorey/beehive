@@ -1253,15 +1253,15 @@ func registerNoop[Spec, Status any](t *testing.T, bh *Beehive, gk GroupKind) {
 	require.NoError(t, Register(bh, gk, &noopController[Spec, Status]{}))
 }
 
-// registerWithClient registers c for gk and returns a live client for it,
+// registerWithClient registers c for gk and returns pass clients for it,
 // standing in for the pair Register used to return. Live, so it exercises the
 // write surface but not the scoping — that belongs to the pass-client tests.
 func registerWithClient[Spec, Status any](
 	t *testing.T, bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option,
-) *controllerClientImpl[Status] {
+) passClients[Status] {
 	t.Helper()
 	require.NoError(t, Register(bh, gk, c, opts...))
-	return newPassClient[Status](bh, gk)
+	return passClients[Status]{bh: bh, gk: gk}
 }
 
 // signal is a one-shot notification from a test fake to the test: a callback
@@ -1514,13 +1514,21 @@ func addEdge(ctx context.Context, store Store, from, to ObjectID, relation Relat
 	if err != nil {
 		return err
 	}
-	if res.ReconcileOwedStamped {
-		// The decrement is kind-scoped and scaffolding declares edges across kinds, so
-		// the source's own kind is needed here — and res.From already carries it,
-		// projected from the endpoint check EdgesAdd had to do anyway.
-		return store.ReconcileOwed().Decrement(ctx, res.From, from, 1)
+	if !res.ReconcileOwedStamped {
+		return nil
 	}
-	return nil
+	// The decrement is kind-scoped and scaffolding declares edges across kinds, so
+	// the source's own kind is needed here; the edge just written names it.
+	sources, err := store.Edges().ListIncoming(ctx, to, relation)
+	if err != nil {
+		return err
+	}
+	for _, src := range sources {
+		if src.ID == from {
+			return store.ReconcileOwed().Decrement(ctx, src.GroupKind(), from, 1)
+		}
+	}
+	return fmt.Errorf("addEdge: %d is missing from the edge it just wrote", from)
 }
 
 // objectRefIDs projects an ObjectRef slice to its ids, for assertions that care
@@ -1935,7 +1943,7 @@ func (s *pollProbeStore) eventsMaxVersion(ctx context.Context, id ObjectID) (int
 // shape all three watch surfaces' tests need, which is why it lives here rather
 // than with any one of them. The ControllerClient comes back because the event
 // watches need something that can write to a log.
-func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], ControllerClient[cStatus]) {
+func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], passClients[cStatus]) {
 	t.Helper()
 	return watchFixtureWith(t)
 }
@@ -1943,7 +1951,7 @@ func watchFixture(t *testing.T) (*pollProbeStore, *Beehive, Client[cSpec, cStatu
 // foreignObject registers a second kind on bh and creates one object of it, for
 // the reads that take an id whatever kind holds it. The ControllerClient comes
 // back because only a controller writes that object's events.
-func foreignObject(t *testing.T, ctx context.Context, bh *Beehive) (ObjectID, ControllerClient[cStatus]) {
+func foreignObject(t *testing.T, ctx context.Context, bh *Beehive) (ObjectID, passClients[cStatus]) {
 	t.Helper()
 	gk := GroupKind{Kind: "Other"}
 	cc := registerWithClient(t, bh, gk, &noopController[cSpec, cStatus]{})
@@ -1952,7 +1960,7 @@ func foreignObject(t *testing.T, ctx context.Context, bh *Beehive) (ObjectID, Co
 }
 
 // watchFixtureWith is watchFixture with extra options on the beehive.
-func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], ControllerClient[cStatus]) {
+func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, Client[cSpec, cStatus], passClients[cStatus]) {
 	t.Helper()
 	store := &pollProbeStore{
 		Store:        newClientTestStore(t),

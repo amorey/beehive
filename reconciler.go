@@ -119,7 +119,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
 	// Ended below, before beehive's own writes: nothing the controller captured
 	// may write past that point.
-	pass := newPassClient[Status](t.bh, t.gk)
+	pass := newPassClient[Status](t.bh, t.gk, obj.ID)
 	// Normalized before any gate below reads it.
 	result := t.inner.Reconcile(ctx, pass, obj).normalize()
 	pass.end()

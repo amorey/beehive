@@ -87,10 +87,10 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 
 	if ready {
 		// Pool is full: clear the transient progress condition and mark Ready.
-		if err := client.DeleteCondition(ctx, obj.ID, condProgressing); err != nil {
+		if err := client.DeleteCondition(ctx, condProgressing); err != nil {
 			return beehive.Fail(err)
 		}
-		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
+		if err := client.SetCondition(ctx, beehive.Condition{
 			Type:     condReady,
 			Status:   beehive.ConditionTrue,
 			Reason:   "AllReplicasOnline",
@@ -102,7 +102,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 	} else {
 		// One pass observed both, so they go in one write: a watcher never sees
 		// this object Progressing beside a Ready left over from the last pass.
-		if err := client.SetConditions(ctx, obj.ID, []beehive.Condition{
+		if err := client.SetConditions(ctx, []beehive.Condition{
 			{
 				Type:    condProgressing,
 				Status:  beehive.ConditionTrue,
@@ -121,7 +121,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 		}
 	}
 
-	if err := client.UpdateStatus(ctx, obj.ID, ServerStatus{OnlineReplicas: have}); err != nil {
+	if err := client.UpdateStatus(ctx, ServerStatus{OnlineReplicas: have}); err != nil {
 		return beehive.Fail(err)
 	}
 
