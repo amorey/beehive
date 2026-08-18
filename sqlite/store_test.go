@@ -1559,6 +1559,23 @@ func TestSetObservedGenerationGuards(t *testing.T) {
 	assert.Equal(t, created.ResourceVersion, reread.ResourceVersion)
 }
 
+// The handshake's own write can fail after its read succeeded. Dropping the
+// write log leaves the scoped read intact, so the fault lands in the log append
+// rather than before it.
+func TestSetObservedGenerationReportsAFailedWrite(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+
+	_, err := store.(*sqliteStore).db.ExecContext(ctx, `DROP TABLE object_writes`)
+	require.NoError(t, err)
+
+	settled, err := store.Objects().SetObservedGeneration(ctx, testGK, created.ID, created.Generation)
+	assert.Error(t, err)
+	assert.False(t, settled)
+}
+
 // The point of the verb: what the owed pass lists.
 func TestSetObservedGenerationLeavesTheUnsettledListing(t *testing.T) {
 	store := newTestStore(t)
