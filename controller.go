@@ -49,10 +49,11 @@ type ControllerClient[Status any] interface {
 	// declared dependency is a guarantee rather than a subscription.
 	// Re-asserting existing edges records nothing.
 	AddDependency(ctx context.Context, fromID, toID ObjectID) error
-	// AddEvent adds an observation to id's event log. Repeating the latest run's
-	// (Category, Type, Reason) extends that run rather than appending, so a
-	// controller can report every poll without growing the log per poll.
-	AddEvent(ctx context.Context, id ObjectID, event EventSpec) error
+	// AddEvent adds an observation to the object's event log. Repeating the
+	// latest run's (Category, Type, Reason) extends that run rather than
+	// appending, so a controller can report every poll without growing the log
+	// per poll.
+	AddEvent(ctx context.Context, event EventSpec) error
 	DeleteCondition(ctx context.Context, conditionType string) error
 	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
 	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
@@ -181,7 +182,7 @@ func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, cond
 	return c.wakeAfter(ctx, c.bh.store.Conditions().Delete(ctx, c.gk, c.id, conditionType))
 }
 
-func (c *controllerClientImpl[Status]) AddEvent(ctx context.Context, id ObjectID, event EventSpec) error {
+func (c *controllerClientImpl[Status]) AddEvent(ctx context.Context, event EventSpec) error {
 	if err := c.live(); err != nil {
 		return err
 	}
@@ -192,7 +193,7 @@ func (c *controllerClientImpl[Status]) AddEvent(ctx context.Context, id ObjectID
 			return err
 		}
 	}
-	if err := c.bh.store.Events().Add(ctx, c.gk, id, storeapi.EventsAddInput{
+	if err := c.bh.store.Events().Add(ctx, c.gk, c.id, storeapi.EventsAddInput{
 		Category: event.Category,
 		Type:     string(event.Type),
 		Reason:   event.Reason,
@@ -201,7 +202,7 @@ func (c *controllerClientImpl[Status]) AddEvent(ctx context.Context, id ObjectID
 	}); err != nil {
 		return err
 	}
-	c.bh.signalEventsWritten(ctx, id)
+	c.bh.signalEventsWritten(ctx, c.id)
 	return nil
 }
 

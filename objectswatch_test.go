@@ -404,7 +404,7 @@ func TestWatchStaysQuietThroughEventWrites(t *testing.T) {
 	drainProbe(store.listed)
 
 	// An event write bumps the shared sequence and no objects row.
-	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "Probed"}))
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, EventSpec{Type: EventNormal, Reason: "Probed"}))
 
 	waitClosed(t, chanAfter(store.polled, 3), "three polls after the event write")
 	select {

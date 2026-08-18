@@ -272,6 +272,7 @@ func TestPassClientBindsThePassObject(t *testing.T) {
 	cc := newPassClient[cStatus](bh, clientTestGK, obj.ID)
 	require.NoError(t, cc.UpdateStatus(ctx, cStatus{Val: "mine"}))
 	require.NoError(t, cc.SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
+	require.NoError(t, cc.AddEvent(ctx, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}))
 
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
@@ -283,6 +284,9 @@ func TestPassClientBindsThePassObject(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, untouched.Status, "a sibling of the same kind is not the pass's object")
 	assert.Empty(t, untouched.Conditions)
+	run, err := bh.store.Events().GetLatest(ctx, sibling.ID, "c")
+	require.NoError(t, err)
+	assert.Nil(t, run, "the sibling's event log too")
 }
 
 // TestControllerClientWithin verifies the opt-in atomicity surface: writes made
@@ -333,7 +337,7 @@ func TestControllerClientAddEvent(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{
+	require.NoError(t, cc.at(obj.ID).AddEvent(ctx, EventSpec{
 		Category: "connection", Type: EventWarning, Reason: "ProbeFailed",
 		Message: "i/o timeout", Detail: probeDetail{Endpoint: "h:443", LatencyMs: 5000},
 	}))
@@ -357,7 +361,7 @@ func TestControllerClientAddEventMarshalError(t *testing.T) {
 	bh := newTestBeehive(t, &fakeStore{})
 	cc := passClients[cStatus]{bh: bh, gk: clientTestGK}
 
-	err := cc.at(1).AddEvent(context.Background(), 1, EventSpec{Detail: make(chan int)})
+	err := cc.at(1).AddEvent(context.Background(), EventSpec{Detail: make(chan int)})
 	assert.Error(t, err, "an unmarshalable Detail fails the write")
 }
 
@@ -371,7 +375,7 @@ func TestControllerClientAddEventWrongKind(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
 	other := passClients[tStatus]{bh: bh, gk: GroupKind{Kind: "Other"}}
-	err := other.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Type: EventNormal, Reason: "X"})
+	err := other.at(obj.ID).AddEvent(ctx, EventSpec{Type: EventNormal, Reason: "X"})
 	assert.ErrorIs(t, err, ErrWrongKind)
 }
 
@@ -387,7 +391,7 @@ func TestControllerClientAddEventWithinRollback(t *testing.T) {
 
 	sentinel := errors.New("boom")
 	err := cc.at(obj.ID).Within(ctx, func(ctx context.Context) error {
-		if err := cc.at(obj.ID).AddEvent(ctx, obj.ID, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
+		if err := cc.at(obj.ID).AddEvent(ctx, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}); err != nil {
 			return err
 		}
 		return sentinel
@@ -1534,7 +1538,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 	}{
 		{"AddDependency", func(cc ControllerClient[cStatus]) error { return cc.AddDependency(ctx, dep.ID, obj.ID) }},
 		{"AddEvent", func(cc ControllerClient[cStatus]) error {
-			return cc.AddEvent(ctx, obj.ID, EventSpec{Category: "lifecycle", Reason: "Probed"})
+			return cc.AddEvent(ctx, EventSpec{Category: "lifecycle", Reason: "Probed"})
 		}},
 		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, "Synced") }},
 		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, dep.ID, obj.ID) }},

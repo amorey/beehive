@@ -2761,7 +2761,7 @@ func TestEventsConnectionPanelTimeline(t *testing.T) {
 	// The prober emits one event per probe; identical consecutive outcomes coalesce.
 	emit := func(typ EventType, reason, msg string, detail any, n int) {
 		for i := 0; i < n; i++ {
-			require.NoError(t, cc.at(cluster.ID).AddEvent(ctx, cluster.ID, EventSpec{
+			require.NoError(t, cc.at(cluster.ID).AddEvent(ctx, EventSpec{
 				Category: "connection", Type: typ, Reason: reason, Message: msg, Detail: detail,
 			}))
 		}
