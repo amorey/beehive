@@ -440,13 +440,18 @@ func (r *reconciler) runWorker(ctx context.Context) {
 					delay := r.backoffNext(id)
 					r.work.addAfter(id, delay, alarmBackoff)
 					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
-				case result.requeueAfter > 0:
+				case result.requeueSet && result.requeueAfter > 0:
 					r.backoffClear(id)
 					r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
 					r.logger.Debug("requeued", "id", id, "after", result.requeueAfter)
+				case result.requeueSet:
+					// RequeueAfter(0): the queue's per-object floor paces it.
+					r.backoffClear(id)
+					r.work.add(id)
+					r.logger.Debug("requeued", "id", id, "after", 0)
 				case result.unsettled():
-					// No delay, so nothing else would schedule it; the queue's
-					// per-object floor paces the re-dispatch.
+					// No delay asked for, so nothing else would schedule it; the
+					// queue's per-object floor paces the re-dispatch.
 					r.backoffClear(id)
 					r.work.add(id)
 					r.logger.Debug("requeued unsettled", "id", id)

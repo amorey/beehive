@@ -3619,6 +3619,29 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 		assert.GreaterOrEqual(t, time.Since(start), 60*time.Millisecond)
 	})
 
+	t.Run("a settled RequeueAfter(0) re-dispatches too", func(t *testing.T) {
+		calls := 0
+		doneCh := make(chan struct{})
+		adapter := &fakeAdapter{
+			reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+				calls++
+				if calls == 1 {
+					return Settled().RequeueAfter(0)
+				}
+				close(doneCh)
+				return Settled()
+			},
+		}
+		r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := runInBackground(r, ctx)
+
+		r.enqueue(1)
+		waitClosed(t, doneCh, "the second reconcile Settled().RequeueAfter(0) asked for")
+		cancel()
+		waitClosed(t, done, "run to exit")
+	})
+
 	t.Run("a bare Settled schedules nothing", func(t *testing.T) {
 		reconciled := make(chan struct{}, 4)
 		adapter := &fakeAdapter{
