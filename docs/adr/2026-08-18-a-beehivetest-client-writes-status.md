@@ -25,7 +25,9 @@ external package cannot name.
 
 `beehivetest.NewClient[Status](bh, gk)` returns a `*beehivetest.Client[Status]`
 with `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition` — the
-pass client's status half, minus `AddEvent`. It needs no registered controller
+pass client's status half, minus `AddEvent`. Both paths write through the same
+non-generic `kindWriter`, so the wake obligation has one site rather than one per
+caller. It needs no registered controller
 and no running beehive, and it resolves the schema version and emits the commit
 wake itself, so it is correct on both sides of `Start`.
 
