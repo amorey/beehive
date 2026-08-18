@@ -711,7 +711,8 @@ failed while servicing a wake keeps its `reconcile_owed` count, because
 
 ### 13. A result's requeue delay
 
-`runWorker` calls `workQueue.addAfter` for `Settled(d)`/`Unsettled(d)` with `d > 0`.
+`runWorker` calls `workQueue.addAfter` for a `RequeueAfter(d)` with `d > 0`, and for
+a bare `Unsettled()` at `defaultUnsettledRequeue` (30s).
 
 A chain of these on a settled object is the one case with no durable record at all.
 It does not survive a restart, and no driver brings it back. **This is accepted, not
@@ -725,22 +726,30 @@ controller should be written this way at all, or should own its own ticker and c
 Tests: `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfterNewestWins`,
 `TestTypedControllerReconcileDropsRequeueWhenCollected`.
 
-### 13b. `Unsettled(0)`
+### 13b. `RequeueAfter(0)`
 
 `runWorker` calls `workQueue.add`, so the per-object floor
 (`defaultMinRequeueInterval`, 1s) paces it. The return for a pass that can make
 progress as soon as it is called again; one waiting on something external should
-return a delay, or it polls at the floor forever.
+return a delay, or it polls at the floor forever. It means the same thing on a
+settled and an unsettled result.
 
 No durable record either, and **not** recovered by the unsettled listing in the
 general case: that listing gates on `observed_generation IS NULL OR
 observed_generation < generation`, so declining to stamp does not un-settle a row.
-An object already converged — woken by a dependency, say — that returns
-`Unsettled(0)` is absent from the listing, and a restart drops the chain exactly
-as section 13's does. Only an object whose generation really has moved past what
-was observed is recovered.
+An object already converged — woken by a dependency, say — that declines to settle
+is absent from the listing, and a restart drops the chain exactly as section 13's
+does. Only an object whose generation really has moved past what was observed is
+recovered.
 
-Tests: `TestReconcilerSchedulesFromTheResultKind`.
+That gap is why a bare `Unsettled()` schedules a 30s alarm rather than nothing:
+in memory it is section 13's chain, and across a restart the listing is all there
+is. A pending floor alarm outranks the 30s one, and an arriving wake is not
+absorbed by it, so the alarm is an upper bound rather than a period.
+
+Tests: `TestReconcilerSchedulesFromTheResultKind`,
+`TestReconcilerBareUnsettledSchedulesItself`,
+`TestReconcilerBareUnsettledYieldsToAPush`.
 
 ### 13c. Beehive's generation stamp
 
