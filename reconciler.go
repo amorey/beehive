@@ -38,7 +38,8 @@ const (
 type controllerAdapter interface {
 	// gone reports that id's row no longer exists, so the worker drops what is
 	// queued for it rather than dispatching an ErrNotFound. The result is
-	// normalized: a failure is a kindFail, never a separate error.
+	// normalized, and on a branch with no controller behind it carries only a
+	// scheduling decision — the handshake is written in here, not by the worker.
 	reconcile(ctx context.Context, id ObjectID) (result ReconcileResult, gone bool)
 }
 
@@ -48,8 +49,8 @@ type typedController[Spec, Status any] struct {
 	gk    GroupKind
 	bh    *Beehive
 	inner Controller[Spec, Status]
-	// client is built once at Register and is the same value Register returns.
-	// Each pass wraps it in a scopedControllerClient rather than handing it out.
+	// Built once at Register and returned to the caller; each pass hands the
+	// controller a scopedControllerClient over it, never this.
 	client *controllerClientImpl[Status]
 	logger *slog.Logger // kind-tagged; set by Register
 }
@@ -102,8 +103,8 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
-	// The controller gets a client scoped to this pass, ended below: nothing it
-	// captures may write after beehive starts concluding the pass.
+	// Ended below, before beehive's own writes: nothing the controller captured
+	// may write past that point.
 	pass := &scopedControllerClient[Status]{inner: t.client}
 	// Normalized before any gate below reads it.
 	result := t.inner.Reconcile(ctx, pass, obj).normalize()
@@ -139,11 +140,9 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		}
 	}
 	// After the watermark and before the GC block; both orderings are
-	// load-bearing. See docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md.
-	//
-	// A failure leaves the object unsettled, which the unsettled listing
-	// re-derives. A cancelled write is shutdown, and ErrNotFound is another
-	// kind's cascade collecting the row mid-pass: neither is a fault.
+	// load-bearing. A failure only leaves the object unsettled; a cancelled write
+	// and a row collected mid-pass are not faults.
+	// See docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md.
 	if result.settles() {
 		if err := t.client.stampObserved(ctx, raw); err != nil &&
 			ctx.Err() == nil && !errors.Is(err, ErrNotFound) {
@@ -432,8 +431,8 @@ func (r *reconciler) runWorker(ctx context.Context) {
 					r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
 					r.logger.Debug("requeued", "id", id, "after", result.requeueAfter)
 				case result.unsettled():
-					// Unsettled with no delay: re-dispatch as soon as the queue's
-					// per-object floor allows, or nothing would schedule it.
+					// No delay, so nothing else would schedule it; the queue's
+					// per-object floor paces the re-dispatch.
 					r.backoffClear(id)
 					r.work.add(id)
 					r.logger.Debug("requeued unsettled", "id", id)

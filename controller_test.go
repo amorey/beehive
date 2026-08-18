@@ -449,10 +449,8 @@ func TestControllerClientSetConditions(t *testing.T) {
 	assert.Nil(t, findCondition(after.Conditions, "Ready"))
 }
 
-// A controller whose whole report is conditions has no status write to carry
-// the handshake, and does not need one: returning Settled is what records the
-// generation, and beehive writes it. Both halves are asserted — a condition
-// write on its own still settles nothing.
+// A controller whose whole report is conditions has no status write to carry the
+// handshake and needs none: returning Settled is what records the generation.
 func TestConditionsOnlyControllerSettlesByReturningSettled(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -1325,8 +1323,7 @@ func TestControllerClientReadEdges(t *testing.T) {
 	assert.Equal(t, []ObjectID{child.ID}, objectRefIDs(owned))
 }
 
-// UpdateStatus writes status and nothing else. The handshake is beehive's, so
-// there is no argument to get wrong and no way for a status write to roll a
+// UpdateStatus writes status and nothing else, so no status write can roll a
 // converged object back to unsettled.
 func TestUpdateStatusDoesNotTouchTheHandshake(t *testing.T) {
 	ctx := context.Background()
@@ -1350,9 +1347,8 @@ func TestUpdateStatusDoesNotTouchTheHandshake(t *testing.T) {
 	assert.Contains(t, unsettledIDs(t, store), obj.ID)
 }
 
-// The ControllerClient passed into Reconcile stops working when that call
-// returns: beehive concludes the pass with a generation stamp, and a write
-// arriving after it would move status with no pass behind it.
+// The client passed into Reconcile stops working when that call returns: a write
+// arriving later moves status with no pass behind it.
 func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -1405,8 +1401,7 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 		assert.Equal(t, "inside", got.Status.Val)
 	})
 
-	// The client Register hands back is the application's, and outlives every
-	// pass by design: background work is documented to use it.
+	// The Register client is the application's and outlives every pass by design.
 	t.Run("the Register client is unaffected", func(t *testing.T) {
 		require.NoError(t, registerClient.UpdateStatus(ctx, obj.ID, cStatus{Val: "from outside"}))
 		got, err := client.Get(ctx, obj.ID)
@@ -1415,10 +1410,8 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 	})
 }
 
-// A goroutine calling the pass client while the pass returns must never race:
-// end() and every method gate go through the same atomic. Run under -race to
-// mean anything; without it this still pins that the calls end in
-// ErrReconcileReturned rather than hanging or panicking.
+// end() and every method gate go through the same atomic. Needs -race to mean
+// much; without it, it still pins that the calls end in ErrReconcileReturned.
 func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -1467,10 +1460,8 @@ func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
 	}
 }
 
-// Every method of the pass client, in both states: it delegates while the pass
-// runs, and refuses once it has ended. Table-driven over the whole surface
-// because the rule is the surface — a method added to ControllerClient without
-// a gate here is the failure this pins.
+// Every method, in both states. Table-driven over the whole surface because the
+// rule is the surface: a method added without a gate is what this pins.
 func TestPassClientGatesEveryMethod(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
@@ -1517,8 +1508,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 	live := &scopedControllerClient[cStatus]{inner: inner}
 	for _, c := range calls {
 		t.Run(c.name+" delegates while the pass runs", func(t *testing.T) {
-			// The call reaching inner is the assertion; whether inner likes the
-			// arguments is not this test's business.
+			// Reaching inner is the assertion; whether inner likes the arguments is not.
 			assert.NotErrorIs(t, c.call(live), ErrReconcileReturned)
 		})
 	}

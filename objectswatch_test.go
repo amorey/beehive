@@ -164,8 +164,7 @@ func TestWatchSeesASettleWithNoStatus(t *testing.T) {
 	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	// The handshake write is beehive's, so drive it through the store: what this
-	// test watches for is the emit it produces.
+	// The handshake write is beehive's; this watches for the emit it produces.
 	_, err = bh.store.Objects().SetObservedGeneration(ctx, clientTestGK, obj.ID, obj.Generation)
 	require.NoError(t, err)
 	bh.signalKindWritten(ctx, clientTestGK)

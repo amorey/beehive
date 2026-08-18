@@ -69,8 +69,8 @@ var ErrStaleTxContext = errors.New("beehive: transaction context is not the live
 // same-goroutine frames unwind before fn returns.
 var ErrConcurrentNestedTx = errors.New("beehive: nested transaction frame still open at commit")
 
-// ErrObservedGenerationFuture is returned by
-// Objects().SetObservedGeneration when observedGeneration exceeds the object's
+// ErrObservedGenerationFuture is returned by Objects().SetObservedGeneration
+// when observedGeneration exceeds the object's
 // current generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
@@ -777,11 +777,11 @@ type Objects interface {
 	// concurrent collect hand the name to a replacement in between.
 	UpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
-	// UpdateStatus replaces an object's status and stamps statusVersion.
-	// Changed bytes bump ResourceVersion and UpdatedAt; bytes identical at the
-	// row's own schema version write nothing at all. It touches no part of the
-	// generation handshake — SetObservedGeneration is the only writer of
-	// observed_generation, which is what makes that column monotonic.
+	// UpdateStatus replaces an object's status and stamps statusVersion. Changed
+	// bytes bump ResourceVersion and UpdatedAt; bytes identical at the row's own
+	// schema version write nothing. It touches no part of the handshake, which
+	// leaves SetObservedGeneration the sole writer of observed_generation and so
+	// that column monotonic.
 	//
 	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
 	// Returns no row.

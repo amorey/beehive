@@ -1436,8 +1436,7 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	probe.expectNone()
 }
 
-// A status write records status and moves the row's version, and touches no
-// part of the handshake — neither the generation nor observed_at.
+// A status write moves the row's version and no part of the handshake.
 func TestUpdateStatusRecordsStatusAlone(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1634,11 +1633,10 @@ func TestSetObservedGenerationWakesDependentsOncePerGeneration(t *testing.T) {
 	assert.Empty(t, probe.writes(), "a repeat settle wakes nobody")
 }
 
-// Re-passing the status you were handed used to be a way to unsettle a
-// converged object: the no-op gate is the schema version too, so on a build
-// where the status version rose the same call took the content path and landed
-// a stale generation unclamped. UpdateStatus no longer writes the handshake at
-// all, so the row is rewritten and the generation is left alone.
+// Re-passing the status you were handed used to unsettle a converged object: the
+// no-op gate is the schema version too, so a raised status version took the
+// content path and landed a stale generation unclamped. UpdateStatus no longer
+// writes the handshake, so the row is rewritten and the generation left alone.
 func TestUpdateStatusReUseAcrossAStatusVersionBumpLeavesTheHandshake(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -3993,10 +3991,9 @@ func TestGatedWritesReadNoBlobToGateOnKind(t *testing.T) {
 		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}), beehive.ErrWrongKind)
 }
 
-// A status write reads two columns of the row it writes, and neither the spec
-// nor the finalizer list is one of them — nor the handshake, which it no longer
-// touches. Both probes at once: a finalizers blob that fails to decode and a
-// spec column no statement can name.
+// A status write reads two columns, and neither the spec nor the finalizer list
+// is one. Both probes at once: a finalizers blob that fails to decode and a spec
+// column no statement can name.
 func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 	ctx := context.Background()
 	store := newRawStore(t)
@@ -8474,9 +8471,9 @@ func TestObjectWritesSweepCapsEachKindWithItsOwnHorizon(t *testing.T) {
 	assert.Zero(t, trimmed, "the quiet kind was never trimmed, so its horizon never moved")
 }
 
-// observed_generation is monotonic: SetObservedGeneration is its only writer and
-// it clamps, so nothing can roll a converged object back to unsettled. The
-// reconcile loop's in-memory stamp gate depends on this.
+// observed_generation is monotonic: its only writer clamps, so nothing rolls a
+// converged object back to unsettled. The reconcile loop's stamp gate depends
+// on it.
 func TestObservedGenerationIsMonotonic(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)

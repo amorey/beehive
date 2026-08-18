@@ -767,7 +767,7 @@ func (fakeObjects) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, err
 	return nil, nil
 }
 
-// Reports no write, so a pass over the fake stamps nothing and wakes nobody.
+// Reports no write, so a pass over the fake wakes nobody.
 func (fakeObjects) SetObservedGeneration(context.Context, GroupKind, ObjectID, int64) (bool, error) {
 	return false, nil
 }
@@ -1237,8 +1237,7 @@ func (s cursorStoreCursors) Set(_ context.Context, name string, cursor int64) er
 type noopController[Spec, Status any] struct{}
 
 // Unsettled, and far enough out that nothing re-dispatches inside a test: a
-// Settled pass would stamp the generation, which is a real write, and these
-// tests are asserting on writes they made themselves.
+// Settled pass would stamp the generation, a real write these tests do not expect.
 func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) ReconcileResult {
 	return Unsettled(time.Hour)
 }
@@ -1962,9 +1961,8 @@ func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, 
 	return store, bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc
 }
 
-// reconcilePass runs one adapter pass and splits the failure back out of the
-// result, which is the shape most reconcile tests assert on. The error is
-// result.err — a normalized failure and nothing else.
+// reconcilePass splits the failure back out of the result, the shape most
+// reconcile tests assert on.
 func reconcilePass(a controllerAdapter, ctx context.Context, id ObjectID) (ReconcileResult, bool, error) {
 	result, gone := a.reconcile(ctx, id)
 	return result, gone, result.err
@@ -2011,9 +2009,8 @@ func (s *orderProbeStore) Dependencies() storeapi.Dependencies {
 	}
 }
 
-// settleRow records id's current generation as observed, which is beehive's
-// write rather than a client's. Tests that need a settled row as a
-// precondition — without standing up a reconcile loop to produce one — use it.
+// settleRow records id's current generation as observed, for tests needing a
+// settled row without a reconcile loop to produce one.
 func settleRow(t *testing.T, ctx context.Context, store Store, gk GroupKind, id ObjectID) {
 	t.Helper()
 	raw, err := store.Objects().GetMeta(ctx, id)

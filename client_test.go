@@ -3237,9 +3237,8 @@ func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], Controlle
 
 // settle drives the generation handshake to "converged" and empties the queue, so
 // a following test step starts from a row that owes nothing.
-// settle records the object's generation as observed, which is beehive's write
-// rather than a client's: these tests need a settled row without running a
-// reconcile loop to get one.
+// settle records the object's generation as observed: these tests need a settled
+// row without running a reconcile loop to get one.
 func settle(t *testing.T, ctx context.Context, cc ControllerClient[cStatus], r *reconciler, obj *Object[cSpec, cStatus]) {
 	t.Helper()
 	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
@@ -3523,8 +3522,7 @@ func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 		if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
 			return err
 		}
-		// Settling is beehive's write, not a client's, so reach the store
-		// directly: what this test needs is a committed row that is settled.
+		// Settling is beehive's write, so reach the store directly.
 		bh := cc.(*controllerClientImpl[cStatus]).bh
 		_, err = bh.store.Objects().SetObservedGeneration(ctx, clientTestGK, obj.ID, updated.Generation)
 		return err

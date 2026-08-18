@@ -72,10 +72,9 @@ type ControllerClient[Status any] interface {
 	// twice is refused with ErrDuplicateConditionType; an empty slice writes
 	// nothing. Same stamping as SetCondition.
 	SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
-	// UpdateStatus records status and nothing else. Status that marshals to the
-	// stored bytes writes nothing, so a controller can report unconditionally
-	// without waking watchers on an unchanged poll. The generation handshake is
-	// beehive's: return Settled from Reconcile to record one.
+	// UpdateStatus records status and nothing else — the handshake is beehive's,
+	// recorded by returning Settled. Status that marshals to the stored bytes
+	// writes nothing, so a controller can report on every poll.
 	UpdateStatus(ctx context.Context, id ObjectID, status Status) error
 	// Within runs fn inside a single transaction: writes made with fn's ctx all
 	// commit together or roll back on error. Pass fn's ctx to every store call
@@ -121,11 +120,10 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 		ctx, c.gk, id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
-// stampObserved records raw's generation as observed, gated on the value the
-// row already carries so a converged pass makes no store call. That gate stands
-// in for the store's clamp only while observed_generation is monotonic — keep
-// SetObservedGeneration its sole writer. Unexported, and deliberately absent
-// from ControllerClient: the handshake is beehive's write.
+// stampObserved records raw's generation as observed, skipping the store call
+// when the loaded row already carries it. That gate stands in for the store's
+// clamp only while observed_generation is monotonic — keep
+// SetObservedGeneration its sole writer.
 func (c *controllerClientImpl[Status]) stampObserved(ctx context.Context, raw *RawObject) error {
 	if raw.ObservedGeneration != nil && *raw.ObservedGeneration >= raw.Generation {
 		return nil
@@ -262,17 +260,16 @@ func (c *controllerClientImpl[Status]) Within(ctx context.Context, fn func(ctx c
 	return c.bh.store.Within(ctx, fn)
 }
 
-// scopedControllerClient is the ControllerClient one Reconcile is handed: it
-// delegates until the pass ends, then refuses everything with
-// ErrReconcileReturned. A fail-fast, not a barrier — nothing waits for calls
-// already in flight. See docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md.
+// scopedControllerClient is the ControllerClient one Reconcile is handed. It
+// refuses everything once the pass ends, and is a fail-fast rather than a
+// barrier: nothing waits for calls already in flight.
+// See docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md.
 type scopedControllerClient[Status any] struct {
 	inner *controllerClientImpl[Status]
 	done  atomic.Bool
 }
 
-// end closes the pass. Called once, after Reconcile returns and before
-// beehive's own post-reconcile writes.
+// Called once, after Reconcile returns and before beehive's own writes.
 func (c *scopedControllerClient[Status]) end() { c.done.Store(true) }
 
 func (c *scopedControllerClient[Status]) live() error {

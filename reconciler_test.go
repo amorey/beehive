@@ -762,9 +762,9 @@ type recordingController struct {
 	reconciled chan ObjectID
 }
 
-// Records the pass and reports the object still unconverged, with a delay long
-// enough that only the test's own requeue dispatches it again: what these tests
-// drive is the unsettled listing, which a Settled pass would empty.
+// Reports the object still unconverged, far enough out that only the test's own
+// requeue dispatches it again: these tests drive the unsettled listing, which a
+// Settled pass would empty.
 func (c *recordingController) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	select {
 	case c.reconciled <- obj.ID:
@@ -1518,10 +1518,9 @@ func (s *deletingCollectErrorStore) getMetaObjects(context.Context, ObjectID) (*
 	return nil, errBoom
 }
 
-// A collect that fails after a successful reconcile is a failure for the whole
-// pass: the writes the pass committed stand, but the retry is the backoff
-// ladder's, so the controller's own delay is dropped rather than competing with
-// it.
+// A collect that fails after a successful reconcile fails the whole pass: the
+// committed writes stand, but the retry is the ladder's, so the controller's own
+// delay is dropped rather than competing with it.
 func TestTypedControllerReconcileCollectErrorAfterASuccessfulPass(t *testing.T) {
 	bh := &Beehive{store: &deletingCollectErrorStore{}}
 	var called bool
@@ -3585,8 +3584,7 @@ func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
 		"a dependency cycle must be floored, not run at wake speed")
 }
 
-// The worker reads each result kind for scheduling alone: Settled(0) schedules
-// nothing, Unsettled(0) re-dispatches, and both clear the backoff.
+// The worker reads each kind for scheduling alone.
 func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 	t.Run("Unsettled(0) re-dispatches", func(t *testing.T) {
 		calls := 0
@@ -3635,8 +3633,7 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 		start := time.Now()
 		r.enqueue(1)
 		waitClosed(t, second, "the floored re-dispatch")
-		// The floor paces it; without one this returns immediately and the
-		// re-dispatch is a spin.
+		// Without the floor this returns immediately and the re-dispatch is a spin.
 		assert.GreaterOrEqual(t, time.Since(start), 60*time.Millisecond)
 	})
 
@@ -3663,10 +3660,9 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 	})
 }
 
-// An unusable result is a failure: the backoff ladder, never the success path.
-// A negative gate ("not a Fail") would let the zero value through here. The
-// adapter normalizes before the worker sees it, so what arrives is the
-// synthesized ErrInvalidResult, which is logged at Error rather than absorbed.
+// An unusable result takes the backoff ladder, never the success path — a
+// negative gate ("not a Fail") would let the zero value through. The adapter
+// normalizes first, so what arrives carries ErrInvalidResult and is logged.
 func TestReconcilerTreatsAnUnusableResultAsAFailure(t *testing.T) {
 	logger, logged := loggerSignallingOn("controller returned an unusable result")
 	calls := 0
@@ -3699,9 +3695,8 @@ func TestReconcilerTreatsAnUnusableResultAsAFailure(t *testing.T) {
 	waitClosed(t, done, "run to exit")
 }
 
-// A controller returning the zero value is normalized at the adapter boundary,
-// so the failure the worker acts on carries ErrInvalidResult and nothing is
-// settled. Pins that normalize runs before any gate reads the result.
+// Pins that normalize runs at the adapter boundary, before any gate reads the
+// result.
 func TestReconcileNormalizesAnUnusableControllerReturn(t *testing.T) {
 	ctx := context.Background()
 	s := newClientTestStore(t)
@@ -3724,10 +3719,9 @@ func TestReconcileNormalizesAnUnusableControllerReturn(t *testing.T) {
 	assert.Nil(t, got.ObservedGeneration, "an unusable result settles nothing")
 }
 
-// A Settled pass records the generation beehive handed to Reconcile, never a
-// fresh read of the row. A spec change landing mid-pass must stay unobserved:
-// stamping the newer generation would mark it seen by a pass that never read
-// it, and nothing would reconcile it again.
+// The generation beehive handed to Reconcile, never a fresh read: stamping a
+// mid-pass spec change would mark it seen by a pass that never read it, and
+// nothing would reconcile it again.
 func TestReconcileStampsTheGenerationItHandedOut(t *testing.T) {
 	ctx := context.Background()
 	s := newClientTestStore(t)
@@ -3741,7 +3735,7 @@ func TestReconcileStampsTheGenerationItHandedOut(t *testing.T) {
 	var handed int64
 	inner.fn = func(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 		handed = obj.Generation
-		// The mid-pass spec change, from outside this pass.
+		// The mid-pass spec change.
 		next, err := json.Marshal(cSpec{Val: "changed"})
 		require.NoError(t, err)
 		_, _, err = s.Objects().UpdateSpec(ctx, clientTestGK, obj.ID, next, 0)
@@ -3759,9 +3753,8 @@ func TestReconcileStampsTheGenerationItHandedOut(t *testing.T) {
 	assert.Contains(t, unsettledIDs(t, s), obj.ID)
 }
 
-// The stamp is gated on the generation already in hand from the load, so a
-// converged object costs no store call at all — not merely no row write. The
-// gate is what keeps the steady state off the store's single connection.
+// Gated on the generation already loaded, so a converged object costs no store
+// call at all — not merely no row write.
 func TestReconcileConvergedPassMakesNoStampCall(t *testing.T) {
 	ctx := context.Background()
 	s := newClientTestStore(t)
@@ -3792,8 +3785,8 @@ func TestReconcileConvergedPassMakesNoStampCall(t *testing.T) {
 	assert.Equal(t, 1, calls, "a converged pass must not reach the store at all")
 }
 
-// Unsettled runs the pass's other two post-reconcile writes but records no
-// generation: the object stays in the unsettled listing until it converges.
+// Unsettled records no generation, so the object stays in the unsettled
+// listing.
 func TestReconcileUnsettledDoesNotStamp(t *testing.T) {
 	ctx := context.Background()
 	s := newClientTestStore(t)
@@ -3816,9 +3809,8 @@ func TestReconcileUnsettledDoesNotStamp(t *testing.T) {
 	assert.Contains(t, unsettledIDs(t, s), obj.ID)
 }
 
-// A failed stamp is not a failed reconcile: it leaves the object unsettled, and
-// the unsettled listing is what re-derives it. Turning it into a failure would
-// retry a pass that already committed its writes.
+// A failed stamp leaves the object unsettled for the listing to re-derive.
+// Failing the pass would retry one that already committed its writes.
 func TestReconcileFailedStampDoesNotFailThePass(t *testing.T) {
 	ctx := context.Background()
 	s := newClientTestStore(t)
@@ -3843,9 +3835,9 @@ func TestReconcileFailedStampDoesNotFailThePass(t *testing.T) {
 	assert.Contains(t, unsettledIDs(t, s), obj.ID, "left unsettled for the next pass")
 }
 
-// The watermark commits before the stamp. A crash between them must leave an
-// unsettled object with a low watermark — which only over-reports staleness —
-// never a settled object whose watermark never landed.
+// A crash between them must leave an unsettled object with a low watermark,
+// which only over-reports staleness — never a settled object whose watermark
+// never landed.
 func TestReconcileWritesTheWatermarkBeforeTheStamp(t *testing.T) {
 	ctx := context.Background()
 	var order []string

@@ -330,7 +330,7 @@ Once loaded, an empty slice — or `ok == false` from `Owner` — means there re
 
 ### ReconcileResult
 
-What `Reconcile` returns. It has no exported fields; three constructors build every value, and the zero value is not usable.
+What `Reconcile` returns. No exported fields; three constructors build every value.
 
 ```go
 func Settled(requeueAfter time.Duration) ReconcileResult   // observed this generation; beehive records it
@@ -344,9 +344,9 @@ func Fail(err error) ReconcileResult                       // the pass failed; b
 | `Unsettled(d)` | no | after `d`; as soon as the queue's per-object floor allows when `d == 0` |
 | `Fail(err)` | no | the backoff ladder |
 
-`Settled` claims only that the pass observed the object's current generation — not that the object is healthy, and not that it wrote any status. `Unsettled(0)` is a poll at the work queue's floor (1s by default), so a controller waiting on something external should pass a delay that matches the wait rather than spinning at the floor.
+`Settled` claims only that the pass observed the object's current generation — not that it is healthy, nor that any status was written. `Unsettled(0)` polls at the queue's floor (1s by default), so a controller waiting on something external should pass a matching delay instead.
 
-`ReconcileResult{}` and `Fail(nil)` are programming errors: both fail the pass with `ErrInvalidResult` and take the backoff ladder, which is capped. Neither can settle anything.
+`ReconcileResult{}` and `Fail(nil)` fail the pass with `ErrInvalidResult`. Neither can settle anything.
 
 ### Schedule
 
@@ -728,13 +728,13 @@ type ControllerClient[Status any] interface {
 
 `UpdateStatus` **does nothing when the status marshals to the bytes already stored**. There is no `resource_version` bump, so a watch and the dependency waker both find nothing — the same way re-applying an unchanged spec does nothing on the `Client` side. So report observed state unconditionally; you don't need your own equality check, and a dependent riding on this kind's status won't be woken by a pass that found nothing new.
 
-**The generation handshake is beehive's, not yours.** `UpdateStatus` writes status and nothing else; returning `Settled` from `Reconcile` is what records `ObservedGeneration`, and beehive writes it after `Reconcile` returns. So a pass that reports only conditions — or nothing at all — settles the same way every other pass does, and there is no argument to get wrong.
+**The generation handshake is beehive's, not yours.** `UpdateStatus` writes status and nothing else; returning `Settled` records `ObservedGeneration`, written after `Reconcile` returns. A pass reporting only conditions — or nothing at all — settles like any other, with no argument to get wrong.
 
-Beehive records **the generation it handed you**, never a fresh read of the row. A spec change landing mid-pass therefore stays unobserved, and the object reconciles again to pick it up. The write is skipped when the generation is already recorded, so a converged object re-reporting the same status costs no write and no store call at all; when the generation does move, the write bumps `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees the object converge.
+Beehive records **the generation it handed you**, never a fresh read, so a spec change landing mid-pass stays unobserved and the object reconciles again to pick it up. The write is skipped when the generation is already recorded, so a converged object re-reporting the same status costs no store call at all; when the generation moves, the write bumps `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees it converge.
 
-A settling status write costs two write-log entries where it once cost one — the status write and the stamp — so it wakes the tailers and the dependency waker twice. That is bounded by the same gate: it applies only to a pass that settles a *new* generation.
+A pass that settles a *new* generation therefore costs two write-log entries where it once cost one, waking the tailers and the dependency waker twice.
 
-`ObservedAt` records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a pass that returns `Unsettled` never moves it. For "when did we last look", record an event instead: `AddEvent` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
+`ObservedAt` records **when the object settled at `ObservedGeneration`**, not when the controller last ran — a pass returning `Unsettled` never moves it, so don't use it as a liveness check. For "when did we last look", record an event: `AddEvent` bumps the current run's `LastAt` every time.
 
 → [ADR: beehive owns the generation handshake](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md), for why the stamp is the generation you were handed and why the in-memory gate is sound. → [ADR: the pass client dies with the pass](docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md)
 
@@ -758,11 +758,11 @@ type Controller[Spec, Status any] interface {
 
 A controller has **no lifecycle** in beehive. It implements `Reconcile` and nothing else, and receives the kind's `ControllerClient` as a parameter. Background work — timers, subscriptions, engines — belongs to your application, which already has its own lifecycle and can get a `ControllerClient` from `Register`. Beehive owns only the reconcile lifecycle: the work queue, backoff, the periodic drivers and shutdown ordering.
 
-**The client you are passed is scoped to that one call.** Once `Reconcile` returns, every method on it fails with `ErrReconcileReturned`: beehive concludes the pass by recording the generation it handed you, and a write arriving after that moves status with no pass behind it, which nothing re-derives. A goroutine that outlives the pass should either use the `ControllerClient` from `Register` — the application's, and unrestricted — or keep its result in memory and call `Client.Requeue`, letting the next `Reconcile` write it. The check is a fail-fast rather than a barrier: beehive does not wait for calls already in flight, so a call that got past it commits whenever it commits.
+**The client you are passed is scoped to that one call.** Once `Reconcile` returns, every method on it fails with `ErrReconcileReturned`: a write arriving after the pass moves status with no pass behind it, which nothing re-derives. A goroutine outliving the pass should use the `ControllerClient` from `Register` — the application's, and unrestricted — or keep its result in memory and call `Client.Requeue`. It is a fail-fast, not a barrier: calls already in flight are not waited for.
 
-`Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed. The next pass works from the stored state, so write `Reconcile` to be idempotent. Each write is still atomic on its own, and the generation handshake covers a concurrent spec change racing the `obj` you were handed: beehive records the generation it gave you, so a newer one is left unobserved and the object reconciles again.
+`Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed. The next pass works from the stored state, so write `Reconcile` to be idempotent. Each write is still atomic on its own, and the handshake covers a concurrent spec change racing the `obj` you were handed: beehive records the generation it gave you, so a newer one is left unobserved and the object reconciles again.
 
-Because the handshake is written after `Reconcile` returns, it cannot join a `Within` of yours. A pass whose report is conditions therefore commits its conditions and then its stamp, in two transactions; a crash between them costs one extra reconcile.
+The handshake is written after `Reconcile` returns, so it cannot join a `Within` of yours: a conditions-only pass commits its conditions and then its stamp, and a crash between them costs one extra reconcile.
 
 When several writes must land together or not at all, wrap them in `ControllerClient.Within(ctx, func(ctx) error { … })`. Writes made with the inner `ctx` join one transaction, which commits when the function returns `nil` and rolls back on error — `Client` writes included. That transaction holds the store's single write lock for as long as the function runs, so keep external I/O out of it. Nothing waits on it, because nothing is scheduled: a rolled-back transaction leaves no rows, so no driver can list them. That makes it safe to create or delete children inside `Within`. The one thing deferred past the commit is `WithOnCreate`, which is skipped on rollback. → [ADR](docs/adr/2026-07-27-name-keyed-writes.md)
 

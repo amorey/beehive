@@ -1492,9 +1492,8 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
-		// Scoped read enforces the kind boundary while doubling as the compare's load
-		// — two columns, not the row: the spec blob and the finalizer list are no
-		// part of a status write, and the handshake is no part of it either.
+		// Scoped read enforces the kind boundary while doubling as the compare's
+		// load — two columns, not the row.
 		var (
 			storedVersion int
 			storedStatus  []byte
@@ -1510,8 +1509,7 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 			return err
 		}
 		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
-			// Content no-op: nothing to write, so no version bump and no wake.
-			return nil
+			return nil // no version bump, so no watch diff and no wake
 		}
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
