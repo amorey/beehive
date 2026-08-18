@@ -459,7 +459,7 @@ func TestDependencyRequeueRaceOnDeclare(t *testing.T) {
 	// dependents — with no edge yet, that lookup comes back empty and the change
 	// is now permanently unclaimed. Only then let the declaration commit.
 	store.resetLooked()
-	require.NoError(t, cc.at(target.ID).SetCondition(ctx, target.ID, Condition{Type: "Ready", Status: ConditionTrue}))
+	require.NoError(t, cc.at(target.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 	store.waitLooked(t)
 	close(proceed)
 
@@ -540,7 +540,7 @@ func TestDependencyRequeueRaceOnDeclareOutsideReconcile(t *testing.T) {
 	// makes the window deterministic: with no edge yet it comes back empty, so the
 	// change is already unclaimed by the time AddDependency commits.
 	store.resetLooked()
-	require.NoError(t, cc.at(target.ID).SetCondition(ctx, target.ID, Condition{Type: "Ready", Status: ConditionTrue}))
+	require.NoError(t, cc.at(target.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 	store.waitLooked(t)
 	// target is the application's read of the target, taken before the change
 	// above — so the version it carries is the one the decision to depend was
@@ -2187,7 +2187,7 @@ type conditionSettingController struct {
 }
 
 func (c *conditionSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	if err := client.SetCondition(ctx, obj.ID, Condition{
+	if err := client.SetCondition(ctx, Condition{
 		Type: "Ready", Status: ConditionTrue, Reason: "Provisioned",
 	}); err != nil {
 		return Fail(err)
@@ -2239,7 +2239,7 @@ func TestIntegrationConditionPersistsAcrossReconcileError(t *testing.T) {
 	ctrl := &funcController{
 		signal: newSignal(),
 		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			_ = cc.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
+			_ = cc.SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue})
 			return Fail(errBoom)
 		},
 	}

@@ -43,19 +43,19 @@ func (t *TestClient[Status]) client(id ObjectID) *controllerClientImpl[Status] {
 // DeleteCondition removes id's condition of that type. See
 // ControllerClient.DeleteCondition.
 func (t *TestClient[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
-	return t.client(id).DeleteCondition(ctx, id, conditionType)
+	return t.client(id).DeleteCondition(ctx, conditionType)
 }
 
 // SetCondition writes id's condition of that type. See
 // ControllerClient.SetCondition.
 func (t *TestClient[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	return t.client(id).SetCondition(ctx, id, condition)
+	return t.client(id).SetCondition(ctx, condition)
 }
 
 // SetConditions writes every named condition together. See
 // ControllerClient.SetConditions.
 func (t *TestClient[Status]) SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error {
-	return t.client(id).SetConditions(ctx, id, conditions)
+	return t.client(id).SetConditions(ctx, conditions)
 }
 
 // UpdateStatus records status for id. See ControllerClient.UpdateStatus. Never

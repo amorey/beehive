@@ -53,7 +53,7 @@ type ControllerClient[Status any] interface {
 	// (Category, Type, Reason) extends that run rather than appending, so a
 	// controller can report every poll without growing the log per poll.
 	AddEvent(ctx context.Context, id ObjectID, event EventSpec) error
-	DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
+	DeleteCondition(ctx context.Context, conditionType string) error
 	DeleteDependency(ctx context.Context, fromID, toID ObjectID) error
 	DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error
 	// GetOwner returns id's owner, if any. ok is false with a nil error when the
@@ -69,14 +69,14 @@ type ControllerClient[Status any] interface {
 	ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error)
 	// ListOwned returns the objects id owns (its incoming owned_by edges).
 	ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-	// SetCondition writes id's condition of that type. The store stamps
+	// SetCondition writes the condition of that type. The store stamps
 	// TransitionedAt and UpdatedAt; the passed values are ignored.
-	SetCondition(ctx context.Context, id ObjectID, condition Condition) error
-	// SetConditions writes every one of id's named conditions together, under a
-	// single version bump, so a watcher never sees half a pass. A type named
-	// twice is refused with ErrDuplicateConditionType; an empty slice writes
-	// nothing. Same stamping as SetCondition.
-	SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
+	SetCondition(ctx context.Context, condition Condition) error
+	// SetConditions writes every named condition together, under a single version
+	// bump, so a watcher never sees half a pass. A type named twice is refused
+	// with ErrDuplicateConditionType; an empty slice writes nothing. Same
+	// stamping as SetCondition.
+	SetConditions(ctx context.Context, conditions []Condition) error
 	// UpdateStatus records status and nothing else — the handshake is beehive's,
 	// recorded by returning Settled. Status that marshals to the stored bytes
 	// writes nothing, so a controller can report on every poll.
@@ -150,11 +150,11 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, status 
 		ctx, c.gk, c.id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
-func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
-	return c.SetConditions(ctx, id, []Condition{condition})
+func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, condition Condition) error {
+	return c.SetConditions(ctx, []Condition{condition})
 }
 
-func (c *controllerClientImpl[Status]) SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error {
+func (c *controllerClientImpl[Status]) SetConditions(ctx context.Context, conditions []Condition) error {
 	if err := c.live(); err != nil {
 		return err
 	}
@@ -171,14 +171,14 @@ func (c *controllerClientImpl[Status]) SetConditions(ctx context.Context, id Obj
 			Liveness: condition.Liveness,
 		}
 	}
-	return c.wakeAfter(ctx, c.bh.store.Conditions().Set(ctx, c.gk, id, conds...))
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Set(ctx, c.gk, c.id, conds...))
 }
 
-func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
+func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, conditionType string) error {
 	if err := c.live(); err != nil {
 		return err
 	}
-	return c.wakeAfter(ctx, c.bh.store.Conditions().Delete(ctx, c.gk, id, conditionType))
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Delete(ctx, c.gk, c.id, conditionType))
 }
 
 func (c *controllerClientImpl[Status]) AddEvent(ctx context.Context, id ObjectID, event EventSpec) error {

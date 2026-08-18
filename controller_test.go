@@ -271,15 +271,18 @@ func TestPassClientBindsThePassObject(t *testing.T) {
 
 	cc := newPassClient[cStatus](bh, clientTestGK, obj.ID)
 	require.NoError(t, cc.UpdateStatus(ctx, cStatus{Val: "mine"}))
+	require.NoError(t, cc.SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "mine", got.Status.Val)
+	assert.NotNil(t, findCondition(got.Conditions, "Ready"))
 
 	untouched, err := client.Get(ctx, sibling.ID)
 	require.NoError(t, err)
 	assert.Nil(t, untouched.Status, "a sibling of the same kind is not the pass's object")
+	assert.Empty(t, untouched.Conditions)
 }
 
 // TestControllerClientWithin verifies the opt-in atomicity surface: writes made
@@ -311,7 +314,7 @@ func TestControllerClientWithin(t *testing.T) {
 		if err := cc.at(obj.ID).UpdateStatus(ctx, cStatus{Val: "committed"}); err != nil {
 			return err
 		}
-		return cc.at(obj.ID).SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
+		return cc.at(obj.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue})
 	}))
 	got, err = client.Get(ctx, obj.ID)
 	require.NoError(t, err)
@@ -409,12 +412,12 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	require.NoError(t, cc.at(obj.ID).SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue}))
+	require.NoError(t, cc.at(obj.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 	got, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(got.Conditions, "Ready"))
 
-	require.NoError(t, cc.at(obj.ID).DeleteCondition(ctx, obj.ID, "Ready"))
+	require.NoError(t, cc.at(obj.ID).DeleteCondition(ctx, "Ready"))
 	got, err = client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Nil(t, findCondition(got.Conditions, "Ready"), "condition removed via ControllerClient")
@@ -436,7 +439,7 @@ func TestControllerClientSetConditions(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	require.NoError(t, cc.at(obj.ID).SetConditions(ctx, obj.ID, []Condition{
+	require.NoError(t, cc.at(obj.ID).SetConditions(ctx, []Condition{
 		{Type: "Connected", Status: ConditionTrue, Reason: "Dialed"},
 		{Type: "Healthy", Status: ConditionFalse, Reason: "ProbeFailed"},
 	}))
@@ -453,12 +456,12 @@ func TestControllerClientSetConditions(t *testing.T) {
 
 	// A type named twice would apply in whichever order the caller happened to
 	// build the slice, so it is refused rather than resolved.
-	assert.ErrorIs(t, cc.at(obj.ID).SetConditions(ctx, obj.ID, []Condition{
+	assert.ErrorIs(t, cc.at(obj.ID).SetConditions(ctx, []Condition{
 		{Type: "Ready", Status: ConditionTrue},
 		{Type: "Ready", Status: ConditionFalse},
 	}), ErrDuplicateConditionType)
 
-	require.NoError(t, cc.at(obj.ID).SetConditions(ctx, obj.ID, nil))
+	require.NoError(t, cc.at(obj.ID).SetConditions(ctx, nil))
 	after, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, got.ResourceVersion, after.ResourceVersion,
@@ -475,7 +478,7 @@ func TestConditionsOnlyControllerSettlesByReturningSettled(t *testing.T) {
 
 	reconciled := make(chan struct{}, 4)
 	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-		if err := cc.SetCondition(ctx, obj.ID, Condition{Type: "Synced", Status: ConditionFalse, Reason: "Paused"}); err != nil {
+		if err := cc.SetCondition(ctx, Condition{Type: "Synced", Status: ConditionFalse, Reason: "Paused"}); err != nil {
 			return Fail(err)
 		}
 		select {
@@ -1060,8 +1063,8 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))
 
 	require.ErrorIs(t, cc.at(gadget.ID).UpdateStatus(ctx, cStatus{Val: "hijacked"}), ErrWrongKind)
-	require.ErrorIs(t, cc.at(gadget.ID).SetCondition(ctx, gadget.ID, Condition{Type: "Ready", Status: ConditionTrue}), ErrWrongKind)
-	require.ErrorIs(t, cc.at(gadget.ID).DeleteCondition(ctx, gadget.ID, "Ready"), ErrWrongKind)
+	require.ErrorIs(t, cc.at(gadget.ID).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}), ErrWrongKind)
+	require.ErrorIs(t, cc.at(gadget.ID).DeleteCondition(ctx, "Ready"), ErrWrongKind)
 	require.ErrorIs(t, cc.at(gadget.ID).DeleteFinalizer(ctx, gadget.ID, "f"), ErrWrongKind)
 
 	// The Gadget is untouched: no status, no conditions, finalizer intact.
@@ -1533,7 +1536,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		{"AddEvent", func(cc ControllerClient[cStatus]) error {
 			return cc.AddEvent(ctx, obj.ID, EventSpec{Category: "lifecycle", Reason: "Probed"})
 		}},
-		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, obj.ID, "Synced") }},
+		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, "Synced") }},
 		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, dep.ID, obj.ID) }},
 		{"DeleteFinalizer", func(cc ControllerClient[cStatus]) error {
 			return cc.DeleteFinalizer(ctx, obj.ID, "kstack.sh/none")
@@ -1544,10 +1547,10 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		{"ListDependents", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependents(ctx, obj.ID); return err }},
 		{"ListOwned", func(cc ControllerClient[cStatus]) error { _, err := cc.ListOwned(ctx, owner.ID); return err }},
 		{"SetCondition", func(cc ControllerClient[cStatus]) error {
-			return cc.SetCondition(ctx, obj.ID, Condition{Type: "Synced", Status: ConditionTrue})
+			return cc.SetCondition(ctx, Condition{Type: "Synced", Status: ConditionTrue})
 		}},
 		{"SetConditions", func(cc ControllerClient[cStatus]) error {
-			return cc.SetConditions(ctx, obj.ID, []Condition{{Type: "Ready", Status: ConditionTrue}})
+			return cc.SetConditions(ctx, []Condition{{Type: "Ready", Status: ConditionTrue}})
 		}},
 		{"UpdateStatus", func(cc ControllerClient[cStatus]) error { return cc.UpdateStatus(ctx, cStatus{Val: "v"}) }},
 		{"Within", func(cc ControllerClient[cStatus]) error {

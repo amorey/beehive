@@ -907,7 +907,7 @@ func TestDeletedChangeComesFromTheLogImage(t *testing.T) {
 	defer cancel()
 	store, _, client, cc := watchFixture(t)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "doomed"})
-	require.NoError(t, cc.at(obj.ID).SetCondition(ctx, obj.ID, Condition{
+	require.NoError(t, cc.at(obj.ID).SetCondition(ctx, Condition{
 		Type: "Ready", Status: ConditionTrue, Reason: "Settled",
 	}))
 
@@ -1446,18 +1446,18 @@ func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 			name:  "conditions set",
 			setup: create("cond-set"),
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.at(id).SetCondition(ctx, id, Condition{Type: "Ready", Status: ConditionTrue}))
+				require.NoError(t, w.ctrl.at(id).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 			},
 		},
 		{
 			name: "conditions delete",
 			setup: func(t *testing.T, ctx context.Context, w *writeWorld) ObjectID {
 				id := create("cond-del")(t, ctx, w)
-				require.NoError(t, w.ctrl.at(id).SetCondition(ctx, id, Condition{Type: "Ready", Status: ConditionTrue}))
+				require.NoError(t, w.ctrl.at(id).SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 				return id
 			},
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.at(id).DeleteCondition(ctx, id, "Ready"))
+				require.NoError(t, w.ctrl.at(id).DeleteCondition(ctx, "Ready"))
 			},
 		},
 		{
