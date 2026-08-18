@@ -28,6 +28,7 @@ import (
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/sqlite"
+	"github.com/amorey/gobus/watch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -161,7 +162,7 @@ func TestReconcilerRequeuesOnError(t *testing.T) {
 				return Fail(errors.New("transient"))
 			}
 			close(doneCh)
-			return Settled(0)
+			return Settled()
 		},
 	}
 
@@ -200,7 +201,7 @@ func TestReconcilerDropsAWakeForACollectedObject(t *testing.T) {
 		case 2:
 			close(reached2)
 		}
-		return Settled(0)
+		return Settled()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -232,7 +233,7 @@ func TestReconcilerClearsBackoffOnSuccess(t *testing.T) {
 			// Object is now gone: reconcile reports success (mirrors the
 			// ErrNotFound -> nil path), which must clear the backoff entry.
 			close(succeeded)
-			return Settled(0)
+			return Settled()
 		},
 	}
 
@@ -265,10 +266,10 @@ func TestReconcilerRequeueAfter(t *testing.T) {
 		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
 			calls++
 			if calls == 1 {
-				return Settled(10 * time.Millisecond)
+				return Settled().RequeueAfter(10 * time.Millisecond)
 			}
 			close(doneCh)
-			return Settled(0)
+			return Settled()
 		},
 	}
 
@@ -369,7 +370,7 @@ type dependentController struct {
 
 func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	if obj.ID != c.depID {
-		return Settled(0) // the target's own reconcile is not under test
+		return Settled() // the target's own reconcile is not under test
 	}
 	target, err := c.client.Get(ctx, c.targetID)
 	if err != nil {
@@ -392,7 +393,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 		return Fail(err)
 	}
 	c.observed <- ready
-	return Settled(0)
+	return Settled()
 }
 
 // TestDependencyRequeueRaceOnDeclare pins the read-then-declare race: a change to
@@ -706,7 +707,7 @@ type idCapture struct{ ch chan ObjectID }
 
 func (c *idCapture) Reconcile(_ context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 	c.ch <- obj.ID
-	return Settled(0)
+	return Settled()
 }
 
 // TestStartupEnqueuesAllNotJustUnsettled verifies that run's startup enqueue
@@ -723,7 +724,7 @@ func TestStartupEnqueuesAllNotJustUnsettled(t *testing.T) {
 			case reconciled <- id:
 			default:
 			}
-			return Settled(0)
+			return Settled()
 		},
 	}
 	r := &reconciler{
@@ -767,7 +768,7 @@ func (c *recordingController) Reconcile(_ context.Context, _ ControllerClient[tS
 	case c.reconciled <- obj.ID:
 	default:
 	}
-	return Unsettled(time.Hour)
+	return Unsettled().RequeueAfter(time.Hour)
 }
 
 // TestSelfDrivenRecovery pins the primitives an embedder uses to drive reconciles
@@ -833,7 +834,7 @@ func TestStartupFullPassDisabledSkipsSettled(t *testing.T) {
 			case reconciled <- id:
 			default:
 			}
-			return Settled(0)
+			return Settled()
 		},
 	}
 	logger, started := loggerSignallingOn(reconcilerStartedMsg)
@@ -969,7 +970,7 @@ func TestOwedPassTickEnqueuesReconcileOwed(t *testing.T) {
 			case reconciled <- id:
 			default:
 			}
-			return Settled(0)
+			return Settled()
 		},
 	}
 	r := &reconciler{
@@ -1009,7 +1010,7 @@ func TestEnqueueUnsettledSkipsInFlight(t *testing.T) {
 		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
 			started.fire()
 			<-block
-			return Settled(0)
+			return Settled()
 		},
 	}
 
@@ -1074,7 +1075,7 @@ func TestReconcilerConcurrency(t *testing.T) {
 			mu.Lock()
 			inFlight--
 			mu.Unlock()
-			return Settled(0)
+			return Settled()
 		},
 	}
 
@@ -1141,7 +1142,7 @@ func TestReconcilerNoConcurrentReconcileOfSameID(t *testing.T) {
 			mu.Lock()
 			active--
 			mu.Unlock()
-			return Settled(0)
+			return Settled()
 		},
 	}
 
@@ -1351,7 +1352,7 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 	var called bool
 	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		called = true
-		return Settled(0)
+		return Settled()
 	}}
 	tc := &typedController[cSpec, cStatus]{
 		gk:    GroupKind{Kind: "Widget"},
@@ -1360,7 +1361,7 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 	}
 	res, _, err := reconcilePass(tc, context.Background(), 1)
 	require.NoError(t, err, "an undecodable row must not retry forever")
-	assert.Equal(t, Settled(0), res)
+	assert.Equal(t, Settled(), res)
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 }
 
@@ -1406,7 +1407,7 @@ func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 		gk: GroupKind{Kind: "Widget"},
 		bh: bh,
 		inner: &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-			return Settled(0)
+			return Settled()
 		}},
 	}
 
@@ -1435,13 +1436,13 @@ func TestTypedControllerReconcileRawToTypedErrorCollectsDeleting(t *testing.T) {
 	var called bool
 	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		called = true
-		return Settled(0)
+		return Settled()
 	}}
 	tc := &typedController[cSpec, cStatus]{gk: gk, bh: bh, inner: inner}
 
 	res, _, err := reconcilePass(tc, ctx, raw.ID)
 	require.NoError(t, err)
-	assert.Equal(t, Settled(0), res)
+	assert.Equal(t, Settled(), res)
 	assert.False(t, called, "Reconcile must not run on a row that failed to decode")
 
 	_, err = store.Objects().Get(ctx, raw.ID)
@@ -1479,7 +1480,7 @@ func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
 	var called bool
 	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		called = true
-		return Settled(0)
+		return Settled()
 	}}
 	tc := &typedController[cSpec, cStatus]{
 		gk:    GroupKind{Kind: "Widget"},
@@ -1520,7 +1521,7 @@ func TestTypedControllerReconcileCollectErrorAfterASuccessfulPass(t *testing.T) 
 	var called bool
 	inner := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		called = true
-		return Settled(time.Minute)
+		return Settled().RequeueAfter(time.Minute)
 	}}
 	tc := &typedController[cSpec, cStatus]{
 		gk:    GroupKind{Kind: "Widget"},
@@ -1596,7 +1597,7 @@ func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
 	// would retry the missing id forever on backoff.
 	result, _, err := reconcilePass(tc, context.Background(), 1)
 	require.NoError(t, err)
-	assert.Equal(t, Settled(0), result, "no requeue for a vanished object")
+	assert.Equal(t, Settled(), result, "no requeue for a vanished object")
 }
 
 // notFoundReturningController returns ErrNotFound from its own reconcile logic —
@@ -1637,7 +1638,7 @@ func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 type requeueController struct{}
 
 func (requeueController) Reconcile(context.Context, ControllerClient[tStatus], *Object[tSpec, tStatus]) ReconcileResult {
-	return Settled(time.Minute)
+	return Settled().RequeueAfter(time.Minute)
 }
 
 func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
@@ -1664,7 +1665,7 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 	// RequeueAfter must be dropped so the worker doesn't reschedule a dead id.
 	result, gone, err := reconcilePass(tc, ctx, raw.ID)
 	require.NoError(t, err)
-	assert.Equal(t, Settled(0), result, "requeue dropped because the row was collected")
+	assert.Equal(t, Settled(), result, "requeue dropped because the row was collected")
 	assert.True(t, gone, "the worker is told the row is gone")
 
 	_, err = s.Objects().Get(ctx, raw.ID)
@@ -1692,7 +1693,7 @@ func TestTypedControllerReconcile(t *testing.T) {
 	}
 	result, _, err := reconcilePass(tc, ctx, raw.ID)
 	require.NoError(t, err)
-	assert.Equal(t, Settled(0), result)
+	assert.Equal(t, Settled(), result)
 
 	select {
 	case obj := <-capCh:
@@ -1820,7 +1821,7 @@ func TestReconcileDecrementsReconcileOwed(t *testing.T) {
 
 	// Success decrements the owed count to zero.
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	require.NoError(t, owe())
 	_, _, err := reconcilePass(tc, ctx, id)
@@ -1849,7 +1850,7 @@ func TestReconcileDrainsMultipleOwedPasses(t *testing.T) {
 	tc, inner, id, count, owe := reconcileOwedHarness(t, nil)
 
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	// Three wakes owed, as a crashed process would have left them.
 	for range 3 {
@@ -1878,7 +1879,7 @@ func TestReconcileOwedSurvivesConcurrentIncrement(t *testing.T) {
 		if err := owe(); err != nil {
 			return Fail(err)
 		}
-		return Settled(0)
+		return Settled()
 	}
 	require.NoError(t, owe()) // the wake this pass loads
 	_, _, err := reconcilePass(tc, ctx, id)
@@ -1912,7 +1913,7 @@ func TestReconcileReconcileOwedDecrementErrorIsNonFatal(t *testing.T) {
 	})
 	require.NoError(t, owe())
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 
 	_, _, err := reconcilePass(tc, ctx, id)
@@ -1973,7 +1974,7 @@ func (c *statusSettingController) Reconcile(ctx context.Context, client Controll
 		return Fail(err)
 	}
 	c.reconciled.fire()
-	return Settled(0)
+	return Settled()
 }
 
 // specEchoController writes cStatus{Val: obj.Spec.Val} on every Reconcile.
@@ -1996,7 +1997,7 @@ func (c *specEchoController) Reconcile(ctx context.Context, client ControllerCli
 	if obj.Generation >= 2 {
 		c.secondDone.fire()
 	}
-	return Settled(0)
+	return Settled()
 }
 
 // deletionTrackingFinalizer gates collection of deletionTrackingController's
@@ -2023,13 +2024,13 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 		if err := client.DeleteFinalizer(ctx, obj.ID, deletionTrackingFinalizer); err != nil {
 			return Fail(err)
 		}
-		return Settled(0)
+		return Settled()
 	}
 	if err := client.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
 		return Fail(err)
 	}
 	c.reconciled.fire()
-	return Settled(0)
+	return Settled()
 }
 
 func TestIntegrationCreateTriggersReconcile(t *testing.T) {
@@ -2192,7 +2193,7 @@ func (c *conditionSettingController) Reconcile(ctx context.Context, client Contr
 		return Fail(err)
 	}
 	c.reconciled.fire()
-	return Settled(0)
+	return Settled()
 }
 
 func TestIntegrationSetConditionCommitsAndFlows(t *testing.T) {
@@ -2782,7 +2783,7 @@ func (c *depObserver) Reconcile(ctx context.Context, _ ControllerClient[tStatus]
 	if obs.release != nil {
 		<-obs.release
 	}
-	return Settled(0)
+	return Settled()
 }
 
 // parkChan hands this reconcile the channel it will wait on, or nil when
@@ -3067,7 +3068,7 @@ func TestReconcileRecordsDependencyWatermark(t *testing.T) {
 	ctx := context.Background()
 	h := newWatermarkHarness(t, nil)
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	require.Equal(t, []ObjectID{h.dep}, h.stale(t), "a dependent that never reconciled is stale")
 
@@ -3090,7 +3091,7 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 	ctx := context.Background()
 	h := newWatermarkHarness(t, nil)
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err := reconcilePass(h.tc, ctx, h.dep)
 	require.NoError(t, err)
@@ -3104,7 +3105,7 @@ func TestReconcileRecordsDependencyWatermarkAfterDeclaringANewEdge(t *testing.T)
 		if err := cc.AddDependency(ctx, h.dep, second.ID); err != nil {
 			return Fail(err)
 		}
-		return Settled(0)
+		return Settled()
 	}
 
 	_, _, err = reconcilePass(h.tc, ctx, h.dep)
@@ -3126,7 +3127,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 	ctx := context.Background()
 	h := newWatermarkHarness(t, nil)
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err := reconcilePass(h.tc, ctx, h.dep)
 	require.NoError(t, err)
@@ -3145,7 +3146,7 @@ func TestReconcileMidPassDeclareLeavesTheDependentOwed(t *testing.T) {
 		if _, err := h.store.Edges().Add(ctx, h.dep, quiet.ID, RelationDependsOn); err != nil {
 			return Fail(err)
 		}
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err = reconcilePass(h.tc, ctx, h.dep)
 	require.NoError(t, err)
@@ -3186,7 +3187,7 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 		if err := cc.AddDependency(ctx, dep.ID, target.ID); err != nil {
 			return Fail(err)
 		}
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err = reconcilePass(tc, ctx, dep.ID)
 	require.NoError(t, err)
@@ -3194,7 +3195,7 @@ func TestReconcileSkipsTheWatermarkWhenTheFirstDependencyIsDeclaredMidPass(t *te
 
 	// And it settles on that pass, which now loads with the edge in place.
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err = reconcilePass(tc, ctx, dep.ID)
 	require.NoError(t, err)
@@ -3235,7 +3236,7 @@ func TestReconcileSkipsDependencyWatermarkWithoutDependencies(t *testing.T) {
 		return probe
 	})
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 
 	_, _, err := reconcilePass(h.tc, ctx, h.target)
@@ -3260,7 +3261,7 @@ func TestALostWatermarkStillFindsAnUnobservedChange(t *testing.T) {
 		return probe
 	})
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	// One sweeper for the whole test: a live process, the case no restart repairs.
 	sd := sweeperOver(h.store)
@@ -3274,7 +3275,7 @@ func TestALostWatermarkStillFindsAnUnobservedChange(t *testing.T) {
 	probe.err = errBoom
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		h.touchTarget(t, `{"val":"moved mid-pass"}`)
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err = reconcilePass(h.tc, ctx, h.dep)
 	require.NoError(t, err, "the reconcile succeeded; only the watermark write failed")
@@ -3306,7 +3307,7 @@ func TestALostWatermarkCostsOnlyAnObservedChange(t *testing.T) {
 		target, err := h.store.Objects().Get(ctx, h.target)
 		require.NoError(t, err)
 		observed = target.ResourceVersion
-		return Settled(0)
+		return Settled()
 	}
 	sd := sweeperOver(h.store)
 	_, _, err := reconcilePass(h.tc, ctx, h.dep)
@@ -3350,7 +3351,7 @@ func TestReconcileIsQuietWhenShutdownLosesTheWatermark(t *testing.T) {
 	// bookkeeping that follows meets a dead context.
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		cancel()
-		return Settled(0)
+		return Settled()
 	}
 
 	_, _, err := reconcilePass(h.tc, ctx, h.dep)
@@ -3369,7 +3370,7 @@ func TestReconcileRecordsCursorFromTheLoad(t *testing.T) {
 	h := newWatermarkHarness(t, nil)
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		h.touchTarget(t, `{"val":"moved mid-pass"}`)
-		return Settled(0)
+		return Settled()
 	}
 
 	_, _, err := reconcilePass(h.tc, ctx, h.dep)
@@ -3429,7 +3430,7 @@ func TestReconcileWarnsAndContinuesOnCursorWriteFailure(t *testing.T) {
 	logger, logs := captureLogger(slog.LevelWarn)
 	h.tc.logger = logger
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 
 	_, _, err := reconcilePass(h.tc, ctx, h.dep)
@@ -3533,7 +3534,7 @@ func (c *cycleController) Reconcile(ctx context.Context, cc ControllerClient[cSt
 	if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: fmt.Sprint(n)}); err != nil {
 		return Fail(err)
 	}
-	return Settled(0)
+	return Settled()
 }
 
 // Two objects that depend on each other reconcile forever: each pass wakes the
@@ -3568,17 +3569,17 @@ func TestADependencyCycleIsBoundedByTheFloor(t *testing.T) {
 
 // The worker reads each kind for scheduling alone.
 func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
-	t.Run("Unsettled(0) re-dispatches", func(t *testing.T) {
+	t.Run("RequeueAfter(0) re-dispatches", func(t *testing.T) {
 		calls := 0
 		doneCh := make(chan struct{})
 		adapter := &fakeAdapter{
 			reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
 				calls++
 				if calls == 1 {
-					return Unsettled(0)
+					return Unsettled().RequeueAfter(0)
 				}
 				close(doneCh)
-				return Settled(0)
+				return Settled()
 			},
 		}
 		r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
@@ -3586,12 +3587,12 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 		done := runInBackground(r, ctx)
 
 		r.enqueue(1)
-		waitClosed(t, doneCh, "the second reconcile Unsettled(0) asked for")
+		waitClosed(t, doneCh, "the second reconcile Unsettled().RequeueAfter(0) asked for")
 		cancel()
 		waitClosed(t, done, "run to exit")
 	})
 
-	t.Run("Unsettled(0) waits out the work queue's floor", func(t *testing.T) {
+	t.Run("RequeueAfter(0) waits out the work queue's floor", func(t *testing.T) {
 		second := make(chan struct{})
 		var once sync.Once
 		calls := 0
@@ -3600,9 +3601,9 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 				calls++
 				if calls > 1 {
 					once.Do(func() { close(second) })
-					return Settled(0)
+					return Settled()
 				}
-				return Unsettled(0)
+				return Unsettled().RequeueAfter(0)
 			},
 		}
 		q := newWorkQueue()
@@ -3619,12 +3620,35 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 		assert.GreaterOrEqual(t, time.Since(start), 60*time.Millisecond)
 	})
 
-	t.Run("Settled(0) schedules nothing", func(t *testing.T) {
+	t.Run("a settled RequeueAfter(0) re-dispatches too", func(t *testing.T) {
+		calls := 0
+		doneCh := make(chan struct{})
+		adapter := &fakeAdapter{
+			reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+				calls++
+				if calls == 1 {
+					return Settled().RequeueAfter(0)
+				}
+				close(doneCh)
+				return Settled()
+			},
+		}
+		r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := runInBackground(r, ctx)
+
+		r.enqueue(1)
+		waitClosed(t, doneCh, "the second reconcile Settled().RequeueAfter(0) asked for")
+		cancel()
+		waitClosed(t, done, "run to exit")
+	})
+
+	t.Run("a bare Settled schedules nothing", func(t *testing.T) {
 		reconciled := make(chan struct{}, 4)
 		adapter := &fakeAdapter{
 			reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
 				reconciled <- struct{}{}
-				return Settled(0)
+				return Settled()
 			},
 		}
 		r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
@@ -3636,10 +3660,117 @@ func TestReconcilerSchedulesFromTheResultKind(t *testing.T) {
 		<-reconciled
 		select {
 		case <-reconciled:
-			t.Fatal("Settled(0) scheduled a second reconcile")
+			t.Fatal("a bare Settled scheduled a second reconcile")
 		case <-time.After(50 * time.Millisecond):
 		}
 	})
+}
+
+// waitScheduleBeyond blocks until id's schedule sits further out than d, which
+// is how a test tells an alarm apart from a floored re-dispatch — scheduleAt
+// races the worker, so the hub is the signal.
+func waitScheduleBeyond(t *testing.T, ctx context.Context, rx *watch.Receiver[ObjectID, gaugeValue], d time.Duration, what string) {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, testTimeout)
+	defer cancel()
+	for {
+		ev, err := rx.RecvContext(waitCtx)
+		require.NoError(t, err, what)
+		if ev.Value.Schedule.NextRequeueAt.After(time.Now().Add(d)) {
+			return
+		}
+	}
+}
+
+// A bare Unsettled must schedule its own return: the unsettled listing gates on
+// the generation, so an object that declines to settle without having moved its
+// generation is in no listing and no other driver would come back for it.
+func TestReconcilerBareUnsettledSchedulesItself(t *testing.T) {
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			return Unsettled()
+		},
+	}
+	q := newWorkQueue()
+	r := &reconciler{adapter: adapter, work: q, backoffFor: make(map[ObjectID]time.Duration)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+	defer func() { cancel(); waitClosed(t, done, "run to exit") }()
+
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+	r.enqueue(1)
+
+	// The pass publishes a due-now and a dispatched-zero on the way; what proves
+	// the alarm is a schedule further out than the floor could ever be.
+	waitScheduleBeyond(t, ctx, rx, 5*time.Second,
+		"a bare Unsettled scheduled nothing further out than the floor")
+}
+
+// The bare Unsettled alarm is the owed pass extended to the objects its listing
+// misses, so it follows that pass's configured cadence: an embedder who asked for
+// a quiet store does not get a 30s ping per unsettled object anyway.
+func TestReconcilerBareUnsettledFollowsTheOwedPassCadence(t *testing.T) {
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			return Unsettled()
+		},
+	}
+	q := newWorkQueue()
+	r := &reconciler{
+		adapter:          adapter,
+		work:             q,
+		backoffFor:       make(map[ObjectID]time.Duration),
+		owedPassInterval: time.Hour,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+	defer func() { cancel(); waitClosed(t, done, "run to exit") }()
+
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+	r.enqueue(1)
+
+	waitScheduleBeyond(t, ctx, rx, 30*time.Minute,
+		"the alarm must follow the owed pass, not the default")
+}
+
+// The 30s default is an upper bound, not a period: alarmRequeueAfter does not
+// absorb an arriving add, so a wake landing inside the window dispatches on the
+// floor's schedule instead of waiting the alarm out.
+func TestReconcilerBareUnsettledYieldsToAPush(t *testing.T) {
+	first, second := make(chan struct{}), make(chan struct{})
+	var onceFirst, onceSecond sync.Once
+	calls := 0
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			calls++
+			if calls == 1 {
+				onceFirst.Do(func() { close(first) })
+				return Unsettled()
+			}
+			onceSecond.Do(func() { close(second) })
+			return Settled()
+		},
+	}
+	q := newWorkQueue()
+	q.setFloor(60 * time.Millisecond)
+	r := &reconciler{adapter: adapter, work: q, backoffFor: make(map[ObjectID]time.Duration)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+	defer func() { cancel(); waitClosed(t, done, "run to exit") }()
+
+	rx, _ := q.watchSchedule(1)
+	defer rx.Close()
+	r.enqueue(1)
+	waitClosed(t, first, "the first reconcile")
+
+	// Push only once the alarm is really pending, or a fast dispatch would prove
+	// nothing about outranking it.
+	waitScheduleBeyond(t, ctx, rx, 5*time.Second, "the bare Unsettled alarm")
+
+	r.enqueue(1)
+	waitClosed(t, second, "the pushed reconcile, which must not wait out the 30s alarm")
 }
 
 // An unusable result takes the backoff ladder, never the success path — a
@@ -3656,7 +3787,7 @@ func TestReconcilerTreatsAnUnusableResultAsAFailure(t *testing.T) {
 				return ReconcileResult{}.normalize()
 			}
 			close(doneCh)
-			return Settled(0)
+			return Settled()
 		},
 	}
 	r := &reconciler{
@@ -3722,7 +3853,7 @@ func TestReconcileStampsTheGenerationItHandedOut(t *testing.T) {
 		require.NoError(t, err)
 		_, _, err = s.Objects().UpdateSpec(ctx, clientTestGK, obj.ID, next, 0)
 		require.NoError(t, err)
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err = reconcilePass(tc, ctx, obj.ID)
 	require.NoError(t, err)
@@ -3755,7 +3886,7 @@ func TestReconcileConvergedPassMakesNoStampCall(t *testing.T) {
 
 	tc, inner := newSyncController(probe)
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 
 	_, _, err = reconcilePass(tc, ctx, obj.ID)
@@ -3780,7 +3911,7 @@ func TestReconcileUnsettledDoesNotStamp(t *testing.T) {
 
 	tc, inner := newSyncController(s)
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Unsettled(0)
+		return Unsettled().RequeueAfter(0)
 	}
 	_, _, err = reconcilePass(tc, ctx, obj.ID)
 	require.NoError(t, err)
@@ -3808,7 +3939,7 @@ func TestReconcileFailedStampDoesNotFailThePass(t *testing.T) {
 	}
 	tc, inner := newSyncController(probe)
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 
 	result, _, err := reconcilePass(tc, ctx, obj.ID)
@@ -3827,7 +3958,7 @@ func TestReconcileWritesTheWatermarkBeforeTheStamp(t *testing.T) {
 		return &orderProbeStore{Store: s, record: func(s string) { order = append(order, s) }}
 	})
 	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
-		return Settled(0)
+		return Settled()
 	}
 	_, _, err := reconcilePass(h.tc, ctx, h.dep)
 	require.NoError(t, err)

@@ -46,19 +46,19 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
   if obj.DeletionRequestedAt != nil {
     // TODO: clean up external resources for obj.Spec
     // TODO: remove the finalizer: client.DeleteFinalizer(ctx, obj.ID, "kstack.sh/cluster")
-    return beehive.Settled(0)
+    return beehive.Settled()
   }
 
   // TODO: reconcile obj.Spec against actual state (e.g. create/update external resources)
   // If the resource is not ready yet, say so and come back later:
-  // return beehive.Unsettled(5 * time.Second)
+  // return beehive.Unsettled().RequeueAfter(5 * time.Second)
 
   // TODO: update observed state
   // if err := client.UpdateStatus(ctx, obj.ID, ClusterStatus{}); err != nil {
   //   return beehive.Fail(err)
   // }
 
-  return beehive.Settled(0)
+  return beehive.Settled()
 }
 
 func main() {
@@ -326,23 +326,32 @@ Once loaded, an empty slice — or `ok == false` from `Owner` — means there re
 
 ### ReconcileResult
 
-What `Reconcile` returns. No exported fields; three constructors build every value.
+What `Reconcile` returns. No exported fields; three constructors build every value, and `RequeueAfter` schedules the next pass.
 
 ```go
-func Settled(requeueAfter time.Duration) ReconcileResult   // observed this generation; beehive records it
-func Unsettled(requeueAfter time.Duration) ReconcileResult // real work done, not caught up yet
-func Fail(err error) ReconcileResult                       // the pass failed; backoff ladder
+func Settled() ReconcileResult                                    // observed this generation; beehive records it
+func Unsettled() ReconcileResult                                  // real work done, not caught up yet
+func Fail(err error) ReconcileResult                              // the pass failed; backoff ladder
+
+func (ReconcileResult) RequeueAfter(d time.Duration) ReconcileResult // schedule the next pass
+func (ReconcileResult) Err() error                                  // the failure, or nil
 ```
 
 | Return | Records `ObservedGeneration` | Requeue |
 | --- | --- | --- |
-| `Settled(d)` | yes | after `d`; nothing scheduled when `d == 0` |
-| `Unsettled(d)` | no | after `d`; as soon as the queue's per-object floor allows when `d == 0` |
+| `Settled()` | yes | nothing scheduled |
+| `Unsettled()` | no | after the owed-pass interval (30s by default) |
+| `Settled().RequeueAfter(d)`, `Unsettled().RequeueAfter(d)` | as above | after `d` |
+| `Settled().RequeueAfter(0)`, `Unsettled().RequeueAfter(0)` | as above | as soon as the queue's per-object floor allows |
 | `Fail(err)` | no | the backoff ladder |
 
-`Settled` claims only that the pass observed the object's current generation — not that it is healthy, nor that any status was written. `Unsettled(0)` polls at the queue's floor (1s by default), so a controller waiting on something external should pass a matching delay instead.
+`Settled` claims only that the pass observed the object's current generation — not that it is healthy, nor that any status was written.
 
-`ReconcileResult{}` and `Fail(nil)` fail the pass with `ErrInvalidResult`. Neither can settle anything.
+A bare `Unsettled()` schedules its own return because nothing else would: the owed pass lists an object whose generation has moved, so one that declines to settle without having moved its generation is in no listing. It comes back on that pass's own cadence — `WithOwedPassInterval`, 30s by default — since the alarm is that pass extended to what its listing cannot see. The interval is an upper bound, not a period: a dependency wake or a spec write landing inside the window dispatches on its own schedule, paced only by the queue's floor. `RequeueAfter(0)` polls at that floor (1s by default), which is the right answer only for a pass that can make progress the moment it is called again.
+
+`RequeueAfter` is ignored on a `Fail`, which takes the backoff ladder.
+
+`ReconcileResult{}` and `Fail(nil)` fail the pass with `ErrInvalidResult`. Neither can settle anything, and `Err()` reports the sentinel for both.
 
 ### Schedule
 
@@ -555,7 +564,7 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
     if cluster.DeletionRequestedAt != nil {
         // The name is still held by a tombstone; it is released only once GC clears
         // the row's finalizers. Wait and retry — a replacement cannot be created yet.
-        return beehive.Unsettled(5 * time.Second)
+        return beehive.Unsettled().RequeueAfter(5 * time.Second)
     }
     if created {
         // AddEvent is about obj (this controller's object), not the child.
@@ -565,7 +574,7 @@ func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.Controller
             return beehive.Fail(err)
         }
     }
-    return beehive.Settled(0)
+    return beehive.Settled()
 }
 ```
 

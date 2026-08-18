@@ -78,22 +78,22 @@ func (c *ClusterController) Reconcile(ctx context.Context, client beehive.Contro
 		}
 		if referenced {
 			fmt.Printf("Cluster %d: caches still attached; holding connection open\n", obj.ID)
-			return beehive.Settled(0)
+			return beehive.Settled()
 		}
 		fmt.Printf("Cluster %d: closed connection; releasing finalizer\n", obj.ID)
 		if err := client.DeleteFinalizer(ctx, obj.ID, connectionFinalizer); err != nil {
 			return beehive.Fail(err)
 		}
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
 	if obj.Status == nil || !obj.Status.Connected {
 		if err := client.UpdateStatus(ctx, obj.ID, ClusterStatus{Connected: true}); err != nil {
 			return beehive.Fail(err)
 		}
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
-	return beehive.Settled(0)
+	return beehive.Settled()
 }
 
 // ClusterCacheController warms a cache on create and, on deletion, flushes it and
@@ -106,16 +106,16 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 		if err := client.DeleteFinalizer(ctx, obj.ID, cacheFlushFinalizer); err != nil {
 			return beehive.Fail(err)
 		}
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
 
 	if obj.Status == nil {
 		if err := client.UpdateStatus(ctx, obj.ID, ClusterCacheStatus{Entries: 42}); err != nil {
 			return beehive.Fail(err)
 		}
-		return beehive.Settled(0)
+		return beehive.Settled()
 	}
-	return beehive.Settled(0)
+	return beehive.Settled()
 }
 
 func exitOnErr(err error) {

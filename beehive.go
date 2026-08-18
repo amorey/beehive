@@ -66,6 +66,11 @@ const (
 	// object. It is the whole of what bounds a dependency cycle now that the
 	// waker has no cadence of its own; lowering it changes that bound.
 	defaultMinRequeueInterval = 1 * time.Second
+	// defaultUnsettledRequeue is when a bare Unsettled() comes back with the owed
+	// pass disabled. A bare result must schedule something: the unsettled listing
+	// gates on the generation, so an object that declines to settle without having
+	// moved its generation is in no listing.
+	defaultUnsettledRequeue = defaultOwedPassInterval
 	// The stale-dependents pass is the waker's backstop; its cadence is set by
 	// acceptable staleness after a crash, not by cost.
 	defaultStaleDependentsInterval = 60 * time.Second

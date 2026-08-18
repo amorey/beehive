@@ -88,7 +88,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	if errors.Is(err, ErrNotFound) {
 		// Already collected between enqueue and now: a no-op success.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
-		return Settled(0), true
+		return Settled(), true
 	}
 	if err != nil {
 		return Fail(err), false
@@ -111,9 +111,9 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
 				return Fail(gcErr), false
 			}
-			return Settled(0), gone
+			return Settled(), gone
 		}
-		return Settled(0), false
+		return Settled(), false
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
@@ -175,7 +175,7 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		// rescheduling a dead id straight into ErrNotFound.
 		if gone {
 			log.DebugContext(ctx, "object collected")
-			return Settled(0), true
+			return Settled(), true
 		}
 	}
 	return result, false
@@ -300,6 +300,16 @@ func (r *reconciler) backoffClear(id ObjectID) {
 	r.backoffMu.Lock()
 	defer r.backoffMu.Unlock()
 	delete(r.backoffFor, id)
+}
+
+// unsettledRequeue is when a bare Unsettled comes back: the owed pass's cadence,
+// since this alarm is that pass extended to the objects whose generation its
+// listing cannot see. The default stands in when the pass is disabled.
+func (r *reconciler) unsettledRequeue() time.Duration {
+	if r.owedPassInterval > 0 {
+		return r.owedPassInterval
+	}
+	return defaultUnsettledRequeue
 }
 
 // requeue makes id immediately dispatchable, optionally resetting its backoff
@@ -440,16 +450,20 @@ func (r *reconciler) runWorker(ctx context.Context) {
 					delay := r.backoffNext(id)
 					r.work.addAfter(id, delay, alarmBackoff)
 					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
-				case result.requeueAfter > 0:
+				case result.requeueSet && result.requeueAfter > 0:
 					r.backoffClear(id)
 					r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
 					r.logger.Debug("requeued", "id", id, "after", result.requeueAfter)
-				case result.unsettled():
-					// No delay, so nothing else would schedule it; the queue's
-					// per-object floor paces the re-dispatch.
+				case result.requeueSet:
+					// RequeueAfter(0): the queue's per-object floor paces it.
 					r.backoffClear(id)
 					r.work.add(id)
-					r.logger.Debug("requeued unsettled", "id", id)
+					r.logger.Debug("requeued", "id", id, "after", 0)
+				case result.unsettled():
+					r.backoffClear(id)
+					after := r.unsettledRequeue()
+					r.work.addAfter(id, after, alarmRequeueAfter)
+					r.logger.Debug("requeued unsettled", "id", id, "after", after)
 				default:
 					r.backoffClear(id)
 				}

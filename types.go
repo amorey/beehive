@@ -240,22 +240,25 @@ const (
 // ReconcileResult is what Reconcile returns. Build it with Settled, Unsettled
 // or Fail; the zero value fails the pass with ErrInvalidResult.
 type ReconcileResult struct {
-	kind         resultKind
+	kind resultKind
+	// requeueSet separates a result with no opinion about scheduling from
+	// RequeueAfter(0), which are different schedules.
+	requeueSet   bool
 	requeueAfter time.Duration
 	err          error
 }
 
 // Settled reports that the pass observed the object's current generation, which
-// beehive records. It claims nothing about health. Zero schedules nothing.
-func Settled(requeueAfter time.Duration) ReconcileResult {
-	return ReconcileResult{kind: kindSettled, requeueAfter: requeueAfter}
+// beehive records. It claims nothing about health. Schedules nothing of its own.
+func Settled() ReconcileResult {
+	return ReconcileResult{kind: kindSettled}
 }
 
 // Unsettled reports a successful pass over an object not caught up to its spec,
-// so no generation is recorded. Zero requeues at the work queue's per-object
-// floor.
-func Unsettled(requeueAfter time.Duration) ReconcileResult {
-	return ReconcileResult{kind: kindUnsettled, requeueAfter: requeueAfter}
+// so no generation is recorded. Requeues at the work queue's per-object floor
+// unless RequeueAfter says otherwise.
+func Unsettled() ReconcileResult {
+	return ReconcileResult{kind: kindUnsettled}
 }
 
 // Fail reports a failed pass: settles nothing, takes the backoff ladder. A nil
@@ -263,6 +266,21 @@ func Unsettled(requeueAfter time.Duration) ReconcileResult {
 func Fail(err error) ReconcileResult {
 	return ReconcileResult{kind: kindFail, err: err}
 }
+
+// RequeueAfter schedules the object's next pass, overriding what the result
+// kind schedules on its own. Zero or less requeues as soon as the work queue's
+// per-object floor allows. Ignored on a failed result, which takes the backoff
+// ladder.
+func (r ReconcileResult) RequeueAfter(d time.Duration) ReconcileResult {
+	r.requeueSet = true
+	r.requeueAfter = d
+	return r
+}
+
+// Err returns the error a failed pass carries, or nil for a successful one. The
+// zero value and Fail(nil) report ErrInvalidResult, the failure beehive records
+// for them.
+func (r ReconcileResult) Err() error { return r.normalize().err }
 
 // Must run before any gate reads the result: an un-normalized zero satisfies no
 // positive gate and is not a failure either.

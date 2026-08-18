@@ -131,9 +131,9 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 	// watch poll so each step lands in its own poll and the progression is
 	// visible; a shorter one would still converge, just invisibly.
 	if !ready {
-		return beehive.Unsettled(1500 * time.Millisecond)
+		return beehive.Unsettled().RequeueAfter(1500 * time.Millisecond)
 	}
-	return beehive.Settled(0)
+	return beehive.Settled()
 }
 
 func exitOnErr(err error) {
