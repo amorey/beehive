@@ -139,3 +139,49 @@ func TestUpdateStatusWakesTheWatch(t *testing.T) {
 		}
 	}
 }
+
+func TestSetConditions(t *testing.T) {
+	ctx := context.Background()
+	bh := newBeehive(t)
+	objects := beehive.NewClient[clusterSpec, clusterStatus](bh, clusterGK)
+	c := beehivetest.NewClient[clusterStatus](bh, clusterGK)
+
+	obj, err := objects.Create(ctx, "prod", clusterSpec{Region: "us-east-1"})
+	require.NoError(t, err)
+
+	t.Run("a condition round-trips with the store's stamps", func(t *testing.T) {
+		require.NoError(t, c.SetCondition(ctx, obj.ID, beehive.Condition{
+			Type:    "Ready",
+			Status:  beehive.ConditionTrue,
+			Reason:  "Probed",
+			Message: "the probe answered",
+		}))
+
+		got, err := objects.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		require.Len(t, got.Conditions, 1)
+		cond := got.Conditions[0]
+		assert.Equal(t, "Ready", cond.Type)
+		assert.Equal(t, beehive.ConditionTrue, cond.Status)
+		assert.Equal(t, "Probed", cond.Reason)
+		assert.False(t, cond.Unconfirmed)
+		assert.False(t, cond.UpdatedAt.IsZero(), "the store stamps on write")
+	})
+
+	t.Run("a type named twice is refused", func(t *testing.T) {
+		err := c.SetConditions(ctx, obj.ID, []beehive.Condition{
+			{Type: "Dup", Status: beehive.ConditionTrue},
+			{Type: "Dup", Status: beehive.ConditionFalse},
+		})
+		assert.ErrorIs(t, err, beehive.ErrDuplicateConditionType)
+	})
+
+	t.Run("no conditions writes nothing", func(t *testing.T) {
+		before, err := objects.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		require.NoError(t, c.SetConditions(ctx, obj.ID, nil))
+		after, err := objects.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, before.ResourceVersion, after.ResourceVersion)
+	})
+}

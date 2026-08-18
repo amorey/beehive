@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 
 	"github.com/amorey/beehive"
+	"github.com/amorey/beehive/internal/storeapi"
 	"github.com/amorey/beehive/internal/testseam"
 )
 
@@ -42,4 +43,32 @@ func (c *Client[Status]) UpdateStatus(ctx context.Context, id beehive.ObjectID, 
 		return err
 	}
 	return c.writer.UpdateStatus(ctx, c.gk, id, b)
+}
+
+// SetCondition writes id's condition of that type, as
+// ControllerClient.SetCondition does. The store stamps the times.
+func (c *Client[Status]) SetCondition(ctx context.Context, id beehive.ObjectID, cond beehive.Condition) error {
+	return c.SetConditions(ctx, id, []beehive.Condition{cond})
+}
+
+// SetConditions writes every named condition together, as
+// ControllerClient.SetConditions does: one version bump, a type named twice is
+// ErrDuplicateConditionType, and an empty slice writes nothing.
+func (c *Client[Status]) SetConditions(ctx context.Context, id beehive.ObjectID, conds []beehive.Condition) error {
+	if len(conds) == 0 {
+		return nil
+	}
+	// Unconfirmed and the stamps are set by the store on read and ignored on
+	// write, so they are not copied.
+	out := make([]storeapi.Condition, len(conds))
+	for i, cond := range conds {
+		out[i] = storeapi.Condition{
+			Type:     cond.Type,
+			Status:   string(cond.Status),
+			Reason:   cond.Reason,
+			Message:  cond.Message,
+			Liveness: cond.Liveness,
+		}
+	}
+	return c.writer.SetConditions(ctx, c.gk, id, out...)
 }

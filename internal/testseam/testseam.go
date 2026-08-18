@@ -12,6 +12,7 @@ import (
 // arrives marshalled: keeping this interface non-generic leaves the type
 // parameter in beehivetest.
 type Writer interface {
+	SetConditions(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, conds ...storeapi.Condition) error
 	UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, status []byte) error
 }
 
