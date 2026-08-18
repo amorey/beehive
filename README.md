@@ -40,23 +40,25 @@ type ClusterStatus struct {
 
 type ClusterController struct{}
 
-func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
+func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
   // Handle deletion: object is finalizing when DeletionRequestedAt is set.
   // Remove any external resources, then clear the finalizer to allow the row to be deleted.
   if obj.DeletionRequestedAt != nil {
     // TODO: clean up external resources for obj.Spec
-    // TODO: remove finalizer: return beehive.Result{}, client.DeleteFinalizer(ctx, obj.ID, "kstack.sh/cluster")
-    return beehive.Result{}, nil
+    // TODO: remove the finalizer: client.DeleteFinalizer(ctx, obj.ID, "kstack.sh/cluster")
+    return beehive.Settled(0)
   }
 
   // TODO: reconcile obj.Spec against actual state (e.g. create/update external resources)
-  // If the resource is not yet ready, requeue to check again later:
-  // return beehive.Result{RequeueAfter: 5 * time.Second}, nil
+  // If the resource is not ready yet, say so and come back later:
+  // return beehive.Unsettled(5 * time.Second)
 
   // TODO: update observed state
-  // return beehive.Result{}, client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterStatus{})
+  // if err := client.UpdateStatus(ctx, obj.ID, ClusterStatus{}); err != nil {
+  //   return beehive.Fail(err)
+  // }
 
-  return beehive.Result{}, nil
+  return beehive.Settled(0)
 }
 
 func main() {
@@ -65,8 +67,9 @@ func main() {
 
   bh, _ := beehive.New(store)
   // Register returns the kind's ControllerClient for status writes from outside
-  // a reconcile (background work belongs to the app, not beehive);
-  // ignore it if Reconcile is your only writer.
+  // a reconcile (background work belongs to the app, not beehive). It is the
+  // one to keep: the client Reconcile is passed stops working when that call
+  // returns. Ignore it if Reconcile is your only writer.
   _, _ = beehive.Register(bh, ClusterGroupKind, &ClusterController{})
 
   stop, err := bh.Start(context.Background())
@@ -325,13 +328,25 @@ func (o *Object[Spec, Status]) Events() ([]Event, error)
 
 Once loaded, an empty slice — or `ok == false` from `Owner` — means there really are none. `ErrNotLoaded` means you forgot to ask: fetch the relation eagerly with a `Load*()` option, or lazily through the `Client`/`ControllerClient` methods below.
 
-### Result
+### ReconcileResult
+
+What `Reconcile` returns. No exported fields; three constructors build every value.
 
 ```go
-type Result struct {
-    RequeueAfter time.Duration // zero means no requeue
-}
+func Settled(requeueAfter time.Duration) ReconcileResult   // observed this generation; beehive records it
+func Unsettled(requeueAfter time.Duration) ReconcileResult // real work done, not caught up yet
+func Fail(err error) ReconcileResult                       // the pass failed; backoff ladder
 ```
+
+| Return | Records `ObservedGeneration` | Requeue |
+| --- | --- | --- |
+| `Settled(d)` | yes | after `d`; nothing scheduled when `d == 0` |
+| `Unsettled(d)` | no | after `d`; as soon as the queue's per-object floor allows when `d == 0` |
+| `Fail(err)` | no | the backoff ladder |
+
+`Settled` claims only that the pass observed the object's current generation — not that it is healthy, nor that any status was written. `Unsettled(0)` polls at the queue's floor (1s by default), so a controller waiting on something external should pass a matching delay instead.
+
+`ReconcileResult{}` and `Fail(nil)` fail the pass with `ErrInvalidResult`. Neither can settle anything.
 
 ### Schedule
 
@@ -342,7 +357,7 @@ type Schedule struct {
 }
 ```
 
-`Schedule` is what the [scheduling API](#scheduling) reports: an object's **next reconcile time**, as a gauge. It is a struct rather than a bare `time.Time` so fields can be added later without breaking anything — a reschedule trigger, for instance (backoff, success cadence, or manual poke), which is reserved but not yet filled in. `NextRequeueAt` covers per-id timers only: a pending backoff retry, a `RequeueAfter` delay, or a re-enqueue floor holding a wake until the object may run again — or now if the object is already queued, or the zero time if nothing is scheduled.
+`Schedule` is what the [scheduling API](#scheduling) reports: an object's **next reconcile time**, as a gauge. It is a struct rather than a bare `time.Time` so fields can be added later without breaking anything — a reschedule trigger, for instance (backoff, success cadence, or manual poke), which is reserved but not yet filled in. `NextRequeueAt` covers per-id timers only: a pending backoff retry, a result's requeue delay, or a re-enqueue floor holding a wake until the object may run again — or now if the object is already queued, or the zero time if nothing is scheduled.
 
 ### Client
 
@@ -535,26 +550,26 @@ type ProjectController struct {
 // Ensure the Cluster this Project owns exists, without ever mutating it. The
 // options apply only if this call creates the row — a pre-existing row is
 // returned exactly as it is (see the caveat below).
-func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.ControllerClient[ProjectStatus], obj *beehive.Object[ProjectSpec, ProjectStatus]) (beehive.Result, error) {
+func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.ControllerClient[ProjectStatus], obj *beehive.Object[ProjectSpec, ProjectStatus]) beehive.ReconcileResult {
     cluster, created, err := p.clusters.GetOrCreate(ctx, "prod-cluster", ClusterSpec{...},
         beehive.WithOwner(obj.ID), beehive.WithFinalizers("kstack.sh/cluster"))
     if err != nil {
-        return beehive.Result{}, err
+        return beehive.Fail(err)
     }
     if cluster.DeletionRequestedAt != nil {
         // The name is still held by a tombstone; it is released only once GC clears
         // the row's finalizers. Wait and retry — a replacement cannot be created yet.
-        return beehive.Result{RequeueAfter: 5 * time.Second}, nil
+        return beehive.Unsettled(5 * time.Second)
     }
     if created {
         // AddEvent is about obj (this controller's object), not the child.
         if err := cc.AddEvent(ctx, obj.ID, beehive.EventSpec{
             Category: "lifecycle", Reason: "ClusterCreated",
         }); err != nil {
-            return beehive.Result{}, err
+            return beehive.Fail(err)
         }
     }
-    return beehive.Result{}, nil
+    return beehive.Settled(0)
 }
 ```
 
@@ -653,15 +668,15 @@ Eager and lazy run the same query — edges are always a separate indexed lookup
 
 By default `Requeue` **keeps the object's retry backoff**. A requeue is an ordinary nudge — a config change, a dependency update, a manual poke — and almost never proves the failure is over. The one thing that does prove it is a successful reconcile, which clears backoff already. So: **backoff is cleared by a successful reconcile or by an explicit `WithResetBackoff()`, never by a plain requeue.** Pass `beehive.WithResetBackoff()` only when you know the failure is resolved and the next retry should start from the base interval. (controller-runtime draws the same line between `Add`/`AddAfter` and `Forget`.)
 
-`Requeue` checks the id against the client's kind first, returning `ErrNotFound` for a missing or foreign id, then requires a registered controller, returning `ErrNoController` for a client-only kind that has no reconcile loop. It is on `Client` only: a controller schedules itself with `Result.RequeueAfter` and reaches other objects through the store, never by poking another reconcile loop.
+`Requeue` checks the id against the client's kind first, returning `ErrNotFound` for a missing or foreign id, then requires a registered controller, returning `ErrNoController` for a client-only kind that has no reconcile loop. It is on `Client` only: a controller schedules itself with the delay it returns from `Reconcile` and reaches other objects through the store, never by poking another reconcile loop.
 
 #### Scheduling
 
-The scheduling API reports when an object is **next due to reconcile**, as a [`Schedule`](#schedule) whose `NextRequeueAt` is a pending backoff retry, a `RequeueAfter` delay, or a re-enqueue floor holding a wake — or now, if the object is already queued, or the zero time if nothing is scheduled.
+The scheduling API reports when an object is **next due to reconcile**, as a [`Schedule`](#schedule) whose `NextRequeueAt` is a pending backoff retry, a result's requeue delay, or a re-enqueue floor holding a wake — or now, if the object is already queued, or the zero time if nothing is scheduled.
 
 `GetSchedule` is the point read: a non-blocking read of in-memory state, with no store lookup and no kind check, so it returns no error today (the error is reserved for symmetry with the rest of the surface). A missing id, another kind's id and a client-only kind all read as the zero `Schedule`, which looks the same as a real object with nothing scheduled.
 
-`WatchSchedule` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a `RequeueAfter`, a wake held by the re-enqueue floor, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `Watch`/`WatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It is pushed rather than polled, and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `GetSchedule` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
+`WatchSchedule` streams the same value as a **gauge**: the current one on subscribe, then a new `Schedule` whenever it changes — a backoff step, a requeue delay, a wake held by the re-enqueue floor, a pass or dependency wake, a dispatch, a `Requeue`. None of those fire `Watch`/`WatchList`, since rescheduling bumps no generation or resource version, and no other signal covers them all. So this is the way to watch reschedules — for example to drive a "next attempt" countdown that stays accurate while an object's spec and status sit still. It is pushed rather than polled, and emits only on change, which means it converges on the current value and may skip values in between. The channel closes when `ctx` is cancelled. Unlike `GetSchedule` it returns `ErrNoController` for a client-only kind, since a stream that can never emit should say so rather than hang, but the id need not exist: an unscheduled id streams the zero `Schedule` until something schedules it.
 
 Both are on `Client` only, and both read **per-id timers only**. Neither predicts the next reconcile: the real one can come **earlier**, because the owed pass, the full pass and the dependency wake are not per-id timers, and **a zero `NextRequeueAt` means "nothing scheduled", not "will not reconcile"**. Treat it as observability, not a guarantee.
 
@@ -693,8 +708,7 @@ All three reads — `ListEvents`, `GetLatestEvent`, `WatchEvents` — take an id
 
 ```go
 type ControllerClient[Status any] interface {
-    UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
-    SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error
+    UpdateStatus(ctx context.Context, id ObjectID, status Status) error
     SetCondition(ctx context.Context, id ObjectID, condition Condition) error
     SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
     DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error
@@ -714,15 +728,15 @@ type ControllerClient[Status any] interface {
 
 `UpdateStatus` **does nothing when the status marshals to the bytes already stored**. There is no `resource_version` bump, so a watch and the dependency waker both find nothing — the same way re-applying an unchanged spec does nothing on the `Client` side. So report observed state unconditionally; you don't need your own equality check, and a dependent riding on this kind's status won't be woken by a pass that found nothing new.
 
-The generation handshake is the exception. `observedGeneration` and `ObservedAt` are recorded even when the content is unchanged, so a reconcile that legitimately changed no status still settles the object instead of being re-queued by every owed-pass tick. That write does bump `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees the object converge. It happens at most once per generation: the next unchanged pass finds the generation already recorded and writes nothing.
+**The generation handshake is beehive's, not yours.** `UpdateStatus` writes status and nothing else; returning `Settled` records `ObservedGeneration`, written after `Reconcile` returns. A pass reporting only conditions — or nothing at all — settles like any other, with no argument to get wrong.
 
-**If your pass reports only conditions — or nothing at all — call `SetObservedGeneration(ctx, id, obj.Generation)`.** `SetCondition` bumps `resource_version` but deliberately leaves the handshake alone, so a controller whose real output is conditions would otherwise never settle and would sit in the owed listing forever, re-queued every interval. This verb records the handshake and writes no status; compose it inside `Within` to land with a `SetConditions`. Unlike `UpdateStatus` it always clamps — a generation at or below the recorded one writes nothing, so it is idempotent per generation and can never roll a converged object back to unsettled. Neither verb accepts a generation below 1 (`ErrInvalidObservedGeneration`); no object holds one.
+Beehive records **the generation it handed you**, never a fresh read, so a spec change landing mid-pass stays unobserved and the object reconciles again to pick it up. The write is skipped when the generation is already recorded, so a converged object re-reporting the same status costs no store call at all; when the generation moves, the write bumps `resource_version`, so a watcher waiting for `ObservedGeneration == Generation` sees it converge.
 
-Do **not** settle by re-passing the status you were handed to `UpdateStatus`. It usually works and is unsound — the no-op gate is the schema version as well as the bytes; the ADR below has the detail.
+A pass that settles a *new* generation therefore costs two write-log entries where it once cost one, waking the tailers and the dependency waker twice.
 
-`ObservedAt` therefore records **when the object settled at `ObservedGeneration`**, not when the controller last ran — don't use it as a liveness check, since a reconcile that never calls `UpdateStatus` never moves it either. For "when did we last look", record an event instead: `AddEvent` extends the current run and bumps its `LastAt` every time, which is that signal, retained and aggregated.
+`ObservedAt` records **when the object settled at `ObservedGeneration`**, not when the controller last ran — a pass returning `Unsettled` never moves it, so don't use it as a liveness check. For "when did we last look", record an event: `AddEvent` bumps the current run's `LastAt` every time.
 
-→ [ADR: the generation handshake and content no-ops](docs/adr/2026-07-27-generation-handshake-and-noop-writes.md), for how the no-op splits the two halves of the write and why it is gated on the schema version.
+→ [ADR: beehive owns the generation handshake](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md), for why the stamp is the generation you were handed and why the in-memory gate is sound. → [ADR: the pass client dies with the pass](docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md)
 
 `SetConditions` writes several conditions of one object as **one** write: they land in a single transaction under a single `resource_version` bump, so a watcher never sees a fresh `Connected` beside a stale `Healthy`, and a dependent is woken once for the pass rather than once per condition. Suppression stays per condition — the ones matching what is stored are not rewritten, so their `UpdatedAt` holds — and a batch where every condition matches writes nothing at all, exactly like a single `SetCondition` no-op. Naming a type twice in one call is refused with `ErrDuplicateConditionType` rather than resolved by slice order, and nothing in that batch is written. An empty slice writes nothing.
 
@@ -738,13 +752,17 @@ Do **not** settle by re-passing the status you were handed to `UpdateStatus`. It
 
 ```go
 type Controller[Spec, Status any] interface {
-    Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) (Result, error)
+    Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) ReconcileResult
 }
 ```
 
 A controller has **no lifecycle** in beehive. It implements `Reconcile` and nothing else, and receives the kind's `ControllerClient` as a parameter. Background work — timers, subscriptions, engines — belongs to your application, which already has its own lifecycle and can get a `ControllerClient` from `Register`. Beehive owns only the reconcile lifecycle: the work queue, backoff, the periodic drivers and shutdown ordering.
 
-`Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed. The next pass works from the stored state, so write `Reconcile` to be idempotent. Each write is still atomic on its own, and the generation handshake covers a concurrent spec change racing the `obj` you were handed: `UpdateStatus` rejects a generation from the future, and an older one leaves the object unsettled so it reconciles again.
+**The client you are passed is scoped to that one call.** Once `Reconcile` returns, every method on it fails with `ErrReconcileReturned`: a write arriving after the pass moves status with no pass behind it, which nothing re-derives. A goroutine outliving the pass should use the `ControllerClient` from `Register` — the application's, and unrestricted — or keep its result in memory and call `Client.Requeue`. It is a fail-fast, not a barrier: calls already in flight are not waited for.
+
+`Reconcile` is **not** wrapped in a transaction. Each `ControllerClient` write commits on its own, so a write that lands before `Reconcile` returns an error stays committed. The next pass works from the stored state, so write `Reconcile` to be idempotent. Each write is still atomic on its own, and the handshake covers a concurrent spec change racing the `obj` you were handed: beehive records the generation it gave you, so a newer one is left unobserved and the object reconciles again.
+
+The handshake is written after `Reconcile` returns, so it cannot join a `Within` of yours: a conditions-only pass commits its conditions and then its stamp, and a crash between them costs one extra reconcile.
 
 When several writes must land together or not at all, wrap them in `ControllerClient.Within(ctx, func(ctx) error { … })`. Writes made with the inner `ctx` join one transaction, which commits when the function returns `nil` and rolls back on error — `Client` writes included. That transaction holds the store's single write lock for as long as the function runs, so keep external I/O out of it. Nothing waits on it, because nothing is scheduled: a rolled-back transaction leaves no rows, so no driver can list them. That makes it safe to create or delete children inside `Within`. The one thing deferred past the commit is `WithOnCreate`, which is skipped on rollback. → [ADR](docs/adr/2026-07-27-name-keyed-writes.md)
 

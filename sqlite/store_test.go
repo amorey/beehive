@@ -1419,7 +1419,7 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 
 	// Settle the object so observed_generation == generation; an idempotent
 	// update must leave it settled.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0))
+	settle(t, ctx, store, created.ID, created.Generation)
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
@@ -1436,20 +1436,20 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	probe.expectNone()
 }
 
-func TestUpdateStatusRecordsObservedGeneration(t *testing.T) {
+// A status write moves the row's version and no part of the handshake.
+func TestUpdateStatusRecordsStatusAlone(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0))
 	updated, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
-	require.NotNil(t, updated.ObservedGeneration)
-	assert.EqualValues(t, created.Generation, *updated.ObservedGeneration)
+	assert.Nil(t, updated.ObservedGeneration, "a status write settles nothing")
+	assert.Nil(t, updated.ObservedAt, "observed_at moves with the handshake, not with status")
 	assert.EqualValues(t, created.Generation, updated.Generation, "status write must not bump generation")
-	require.NotNil(t, updated.ObservedAt)
 	assert.Greater(t, updated.ResourceVersion, created.ResourceVersion)
 	assert.JSONEq(t, `{"msg":"hi"}`, string(updated.Status))
 }
@@ -1543,8 +1543,8 @@ func TestSetObservedGenerationGuards(t *testing.T) {
 		gen  int64
 		want error
 	}{
-		{"a generation the object has not reached", created.ID, created.Generation + 4, beehive.ErrObservedGenerationFuture},
-		{"a generation no object holds", created.ID, 0, beehive.ErrInvalidObservedGeneration},
+		{"a generation the object has not reached", created.ID, created.Generation + 4, storeapi.ErrObservedGenerationFuture},
+		{"a generation no object holds", created.ID, 0, storeapi.ErrInvalidObservedGeneration},
 		{"another kind's id", other.ID, 1, beehive.ErrWrongKind},
 		{"no such id", created.ID + 9999, 1, beehive.ErrNotFound},
 	} {
@@ -1633,18 +1633,17 @@ func TestSetObservedGenerationWakesDependentsOncePerGeneration(t *testing.T) {
 	assert.Empty(t, probe.writes(), "a repeat settle wakes nobody")
 }
 
-// Re-passing the status you were handed looks like a way to settle without
-// SetObservedGeneration, and it is unsound: the no-op gate is the schema version
-// too, so on a build where the status version rose the same call takes the
-// content path — rewriting status, moving updated_at, and landing a stale
-// generation unclamped. Asserts the cliff exists, not that it is good.
-func TestUpdateStatusReUseIsUnsoundAcrossAStatusVersionBump(t *testing.T) {
+// Re-passing the status you were handed used to unsettle a converged object: the
+// no-op gate is the schema version too, so a raised status version took the
+// content path and landed a stale generation unclamped. UpdateStatus no longer
+// writes the handshake, so the row is rewritten and the generation left alone.
+func TestUpdateStatusReUseAcrossAStatusVersionBumpLeavesTheHandshake(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
 	status := []byte(`{"msg":"hi"}`)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, status, 1))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, status, 1))
 
 	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
@@ -1652,16 +1651,15 @@ func TestUpdateStatusReUseIsUnsoundAcrossAStatusVersionBump(t *testing.T) {
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
-	// The same bytes, re-passed at a stale generation under a raised status
-	// version. SetObservedGeneration would drop this; UpdateStatus does not.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, status, 2))
+	// The same bytes, re-passed under a raised status version.
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, status, 2))
 
 	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reread.ObservedGeneration)
-	assert.EqualValues(t, created.Generation, *reread.ObservedGeneration,
-		"the content path unsettles a converged object")
-	assert.Greater(t, reread.ResourceVersion, settled.ResourceVersion, "and rewrites the row")
+	assert.EqualValues(t, bumped.Generation, *reread.ObservedGeneration,
+		"a status write cannot unsettle a converged object")
+	assert.Greater(t, reread.ResourceVersion, settled.ResourceVersion, "the content path still rewrites the row")
 	assert.EqualValues(t, 2, reread.StatusVersion)
 }
 
@@ -1694,7 +1692,7 @@ func TestSchemaVersionColumnsRoundTrip(t *testing.T) {
 	assert.Zero(t, reread.StatusVersion)
 
 	// UpdateStatus stamps only the status version, leaving spec untouched.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 7))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{}`), 7))
 	withStatus, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 3, withStatus.SpecVersion, "status write must not touch spec version")
@@ -1707,81 +1705,19 @@ func TestSchemaVersionColumnsRoundTrip(t *testing.T) {
 	assert.EqualValues(t, 7, withSpec.StatusVersion, "spec write must not touch status version")
 }
 
-func TestUpdateStatusRejectsFutureGeneration(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created := newRefObject(t, store)
-
-	// created.Generation is 1; reporting generation 5 is impossible to have seen.
-	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation+4, []byte(`{"msg":"hi"}`), 0)
-	require.ErrorIs(t, err, beehive.ErrObservedGenerationFuture)
-
-	// The rejected write must not have landed.
-	reread, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	assert.Nil(t, reread.ObservedGeneration, "rejected status write must not record observed generation")
-	assert.Empty(t, reread.Status, "rejected status write must not store status")
-}
-
-// A zero observedGeneration is an uninitialised caller, not a stale report: no
-// row ever holds a generation below 1, so settling at one would bump
-// resource_version and wake dependents to record nothing.
-func TestUpdateStatusRejectsNonGeneration(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created := newRefObject(t, store)
-
-	for _, gen := range []int64{0, -1} {
-		err := store.Objects().UpdateStatus(ctx, testGK, created.ID, gen, []byte(`{"msg":"hi"}`), 0)
-		require.ErrorIs(t, err, beehive.ErrInvalidObservedGeneration)
-	}
-
-	reread, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	assert.Nil(t, reread.ObservedGeneration)
-	assert.Empty(t, reread.Status, "rejected status write must not store status")
-	assert.Equal(t, created.ResourceVersion, reread.ResourceVersion)
-}
-
-func TestUpdateStatusAcceptsStaleGeneration(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created := newRefObject(t, store)
-
-	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
-	require.NoError(t, err)
-	require.EqualValues(t, 2, bumped.Generation)
-
-	// Controller reports it reconciled the now-stale generation 1.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{}`), 0))
-	updated, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	require.NotNil(t, updated.ObservedGeneration)
-	assert.EqualValues(t, created.Generation, *updated.ObservedGeneration)
-	assert.Less(t, *updated.ObservedGeneration, updated.Generation,
-		"stale observed generation must leave the object unsettled")
-}
-
-// TestUpdateStatusIdenticalStatusIsNoOp verifies the content no-op: re-writing
-// the same status bytes must not bump resource_version or updated_at, and must
-// not emit — downstream controllers wake dependents off a status Modified, so a
-// spurious one is a wake storm on every unchanged poll.
 func TestUpdateStatusIdenticalStatusIsNoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0))
 	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0))
 	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
@@ -1797,34 +1733,19 @@ func TestUpdateStatusChangedStatusWrites(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0))
 	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"bye"}`), 0))
 	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	assert.Greater(t, again.ResourceVersion, first.ResourceVersion, "a real status change bumps resource_version")
 	assert.JSONEq(t, `{"msg":"bye"}`, string(again.Status))
 	probe.expectWrite()
-}
-
-// The future-generation guard is a caller-bug check, not a write guard: it must
-// fire on the no-op path too, where there are no new bytes to reject.
-func TestUpdateStatusNoOpStillRejectsFutureGeneration(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created := newRefObject(t, store)
-
-	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
-
-	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation+4, []byte(`{"msg":"hi"}`), 0)
-	require.ErrorIs(t, err, beehive.ErrObservedGenerationFuture)
 }
 
 // Scoping is unchanged on both branches: a foreign id is ErrWrongKind and a
@@ -1834,168 +1755,17 @@ func TestUpdateStatusScopedOnBothBranches(t *testing.T) {
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
-	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0)
 	require.NoError(t, err)
 
 	for _, status := range [][]byte{[]byte(`{"msg":"hi"}`), []byte(`{"msg":"bye"}`)} {
-		err = store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, created.Generation, status, 0)
+		err = store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, status, 0)
 		assert.ErrorIs(t, err, beehive.ErrWrongKind)
 
-		err = store.Objects().UpdateStatus(ctx, testGK, 999999, 1, status, 0)
+		err = store.Objects().UpdateStatus(ctx, testGK, created.ID+9999, status, 0)
 		assert.ErrorIs(t, err, beehive.ErrNotFound)
 	}
 }
-
-// TestUpdateStatusNoOpAdvancesObservedGeneration pins the design decision: a
-// content no-op still advances observed_generation/observed_at. The handshake
-// records that the controller ran, not what it wrote — stranding it would leave
-// the object unsettled and re-enqueued by every full pass. The advance is a real
-// transition (the object just settled at a new generation), so it bumps
-// resource_version and emits, or a watcher gating on convergence would sit
-// blind until the next full pass. The repeat call, already settled, is silent.
-func TestUpdateStatusNoOpAdvancesObservedGeneration(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created := newRefObject(t, store)
-
-	err := store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
-
-	// New spec, same status: the reconcile observed generation 2 but wrote no
-	// new content.
-	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
-	require.NoError(t, err)
-	require.EqualValues(t, 2, bumped.Generation)
-
-	probe := newWriteProbe(t, store)
-
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	again, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-
-	require.NotNil(t, again.ObservedGeneration)
-	assert.EqualValues(t, bumped.Generation, *again.ObservedGeneration,
-		"a content no-op still records the generation the controller observed")
-	assert.Greater(t, again.ResourceVersion, bumped.ResourceVersion,
-		"settling at a new generation is a real transition, so it bumps resource_version")
-	assert.Equal(t, bumped.UpdatedAt, again.UpdatedAt, "the handshake write doesn't touch updated_at")
-	// The convergence is observable: a consumer scanning the write log finds the
-	// row and re-reads it at the generation the controller settled.
-	assert.Equal(t, again.ResourceVersion, probe.expectWrite().ResourceVersion)
-	reread, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	require.NotNil(t, reread.ObservedGeneration)
-	assert.EqualValues(t, bumped.Generation, *reread.ObservedGeneration)
-
-	// It really settled: the owed-pass backstop no longer sees it.
-	unsettled, err := store.Objects().ListUnsettledIDs(ctx, testGK)
-	require.NoError(t, err)
-	assert.NotContains(t, unsettled, created.ID)
-
-	// And a second identical call, now with the generation already recorded,
-	// writes nothing at all.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	third, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	assert.Equal(t, again.ObservedAt, third.ObservedAt, "no observed_at churn once the generation is recorded")
-	assert.Equal(t, again.ResourceVersion, third.ResourceVersion)
-	probe.expectNone()
-}
-
-// TestUpdateStatusNoOpKeepsNewerObservedGeneration pins the handshake as
-// forward-only. Two reconciles can be in flight for one object and the older can
-// commit last; a content no-op reporting a generation already covered by a newer
-// recorded one must stay silent, not write observed_generation backwards —
-// regressing it would re-unsettle a converged object for the owed-pass backstop and
-// emit a Modified that wakes every dependent.
-func TestUpdateStatusNoOpKeepsNewerObservedGeneration(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created := newRefObject(t, store)
-
-	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
-	require.NoError(t, err)
-	require.EqualValues(t, 2, bumped.Generation)
-
-	// The newer reconcile lands first and settles the object at generation 2.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	settled, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	require.NotNil(t, settled.ObservedGeneration)
-	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
-
-	probe := newWriteProbe(t, store)
-
-	// The straggler, still holding generation 1, reports identical status.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
-	late, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-
-	require.NotNil(t, late.ObservedGeneration)
-	assert.EqualValues(t, bumped.Generation, *late.ObservedGeneration,
-		"a stale report must not roll the handshake back")
-	assert.Equal(t, settled.ResourceVersion, late.ResourceVersion, "nothing moved, so no version bump")
-	assert.Equal(t, settled.ObservedAt, late.ObservedAt)
-	probe.expectNone()
-
-	// The object is still converged as far as the owed-pass backstop is concerned.
-	unsettled, err := store.Objects().ListUnsettledIDs(ctx, testGK)
-	require.NoError(t, err)
-	assert.NotContains(t, unsettled, created.ID)
-}
-
-// TestUpdateStatusChangedStaleGenerationUnsettles is the content-changed
-// counterpart, and pins the opposite behavior on purpose. Here the stale reporter
-// overwrote the status with content derived from an older spec, so its generation
-// is written back verbatim: the object goes unsettled and the owed-pass backstop
-// re-derives the content. Clamping it forward — correct on the no-op path, where
-// identical bytes mean there is nothing to heal — would pin stale status as
-// converged with nothing left to revisit it.
-func TestUpdateStatusChangedStaleGenerationUnsettles(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created := newRefObject(t, store)
-
-	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
-	require.NoError(t, err)
-	require.EqualValues(t, 2, bumped.Generation)
-
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	settled, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	require.NotNil(t, settled.ObservedGeneration)
-	require.EqualValues(t, bumped.Generation, *settled.ObservedGeneration)
-
-	// The straggler, still holding generation 1, writes different status.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"stale"}`), 0))
-	late, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-
-	assert.JSONEq(t, `{"msg":"stale"}`, string(late.Status), "the status content lands")
-	require.NotNil(t, late.ObservedGeneration)
-	assert.EqualValues(t, created.Generation, *late.ObservedGeneration,
-		"the stale generation is recorded verbatim, unlike on the no-op path")
-	assert.Greater(t, late.ResourceVersion, settled.ResourceVersion, "a content write is a real transition")
-
-	// The point of not clamping: the object is unsettled again, so the full pass
-	// backstop re-reconciles it and the stale content gets re-derived.
-	unsettled, err := store.Objects().ListUnsettledIDs(ctx, testGK)
-	require.NoError(t, err)
-	assert.Contains(t, unsettled, created.ID)
-}
-
-// TestCrossVersionWriteIsNotANoOp pins the version gate on the content no-op.
-// Convert-on-read leaves a row tagged at the version it was written in, so bytes
-// arriving from a caller at a *newer* version are in a different shape: equal
-// bytes there can carry different values, and the byte compare that decides the
-// no-op is meaningless across that gap. Suppressing such a write would change
-// what every later read decodes while reporting changed=false, bumping no
-// resource_version and emitting nothing — so no watcher learns and the client
-// skips the controller wake. A version mismatch therefore takes the content path:
-// it stamps, bumps, and emits, exactly like any other real write.
 func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2006,14 +1776,14 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 		SpecVersion: 1,
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 1))
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
 	// Same status bytes, newer status schema version: a real write, announced.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 2))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 2))
 	statusStamped, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, statusStamped.StatusVersion, "the newer status version lands")
@@ -2052,13 +1822,13 @@ func TestSameVersionNoOpWritesNothing(t *testing.T) {
 		SpecVersion: 1,
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 1))
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 1))
 	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, settled.ResourceVersion, again.ResourceVersion, "no resource_version bump")
@@ -2088,7 +1858,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 3))
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.Equal(t, 3, settled.StatusVersion)
@@ -2097,7 +1867,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 
 	// A build that lost the kind's migrator (reporting 0) has no version opinion:
 	// the write goes through and leaves the tag alone.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0))
 	stale, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, stale.StatusVersion, "a no-op status write never stamps backwards")
@@ -2114,42 +1884,6 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 	assert.Equal(t, settled.ResourceVersion, reread.ResourceVersion)
 	probe.expectNone()
 }
-
-// TestNoOpWriteStampsUpwardWhileConverging covers the crossing case: the
-// convergence branch (identical bytes, new observed generation) emits, and its
-// stamp obeys the same upward-only rule.
-func TestNoOpWriteStampsUpwardWhileConverging(t *testing.T) {
-	store := newTestStore(t)
-	ctx := context.Background()
-
-	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
-		Name:        uniqueName(),
-		Spec:        []byte(`{}`),
-		SpecVersion: 3,
-	})
-	require.NoError(t, err)
-	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
-	require.NoError(t, err)
-
-	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 3)
-	require.NoError(t, err)
-
-	// Converging at the new generation with identical status and no version opinion.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, bumped.Generation, []byte(`{"msg":"hi"}`), 0))
-	got, err := store.Objects().Get(ctx, created.ID)
-	require.NoError(t, err)
-	assert.Equal(t, 3, got.StatusVersion, "the convergence write doesn't stamp backwards either")
-	require.NotNil(t, got.ObservedGeneration)
-	assert.EqualValues(t, bumped.Generation, *got.ObservedGeneration)
-}
-
-// TestWriteRejectsSchemaVersionDowngrade pins the other half of the stamp rule,
-// on *both* branches. A non-zero version below the row's is a real, wrong opinion
-// — not the "no migrator" 0 — and the read path already refuses to decode such a
-// row (from > current), so the caller could not have obtained the object it is
-// writing back. Clamping it silently, or letting the content path stamp it down,
-// would leave newer bytes labelled older and make every later read convert
-// already-converted data.
 func TestWriteRejectsSchemaVersionDowngrade(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -2160,7 +1894,7 @@ func TestWriteRejectsSchemaVersionDowngrade(t *testing.T) {
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 3)
 	require.NoError(t, err)
 
 	// Content no-op and real content change, spec and status alike.
@@ -2168,9 +1902,9 @@ func TestWriteRejectsSchemaVersionDowngrade(t *testing.T) {
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
 	_, _, err = store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":9}`), 1)
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
-	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 1)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 1)
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
-	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"bye"}`), 1)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"bye"}`), 1)
 	require.ErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
 
 	// Nothing landed: the row still holds its v3 bytes at v3.
@@ -2197,7 +1931,7 @@ func TestContentWriteWithNoMigratorKeepsSchemaVersion(t *testing.T) {
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, created.Generation, []byte(`{"msg":"hi"}`), 3)
+	err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 3)
 	require.NoError(t, err)
 
 	updated, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":4}`), 0)
@@ -2205,7 +1939,7 @@ func TestContentWriteWithNoMigratorKeepsSchemaVersion(t *testing.T) {
 	require.Greater(t, updated.Generation, created.Generation, "precondition: a real content write")
 	assert.Equal(t, 3, updated.SpecVersion, "a content write with no migrator keeps the stored version")
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, updated.Generation, []byte(`{"msg":"bye"}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"bye"}`), 0))
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, settled.StatusVersion, "same on the status half")
@@ -2861,7 +2595,7 @@ func TestMutatorsReturnNotFoundForMissingTarget(t *testing.T) {
 			return err
 		},
 		"UpdateStatus": func() error {
-			err := store.Objects().UpdateStatus(ctx, testGK, missing, 1, []byte(`{}`), 0)
+			err := store.Objects().UpdateStatus(ctx, testGK, missing, []byte(`{}`), 0)
 			return err
 		},
 		"DeletionRequestsCreate": func() error {
@@ -3687,17 +3421,15 @@ func TestObjectsListUnsettledIDs(t *testing.T) {
 
 	// settled: ObservedGeneration == Generation — must NOT appear
 	settled := newRefObject(t, store)
-	err := store.Objects().UpdateStatus(ctx, testGK, settled.ID, settled.Generation, []byte(`{}`), 0)
-	require.NoError(t, err)
+	settle(t, ctx, store, settled.ID, settled.Generation)
 
 	// unsettled: ObservedGeneration is nil — must appear
 	nilObs := newRefObject(t, store)
 
 	// unsettled: ObservedGeneration < Generation (spec changed after reconcile) — must appear
 	stale := newRefObject(t, store)
-	err = store.Objects().UpdateStatus(ctx, testGK, stale.ID, stale.Generation, []byte(`{}`), 0)
-	require.NoError(t, err)
-	_, _, err = store.Objects().UpdateSpec(ctx, testGK, stale.ID, []byte(`{"updated":true}`), 0)
+	settle(t, ctx, store, stale.ID, stale.Generation)
+	_, _, err := store.Objects().UpdateSpec(ctx, testGK, stale.ID, []byte(`{"updated":true}`), 0)
 	require.NoError(t, err)
 
 	// different kind — must NOT appear
@@ -4209,7 +3941,7 @@ func TestUpdateStatusDBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	err := store.Objects().UpdateStatus(context.Background(), testGK, 1, 1, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(context.Background(), testGK, 1, []byte(`{}`), 0)
 	require.Error(t, err)
 }
 
@@ -4259,39 +3991,31 @@ func TestGatedWritesReadNoBlobToGateOnKind(t *testing.T) {
 		storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}), beehive.ErrWrongKind)
 }
 
-// A status write reads six columns of the row it writes, and neither the spec nor
-// the finalizer list is one of them. Both probes at once: a finalizers blob that
-// fails to decode and a spec column no statement can name.
+// A status write reads two columns, and neither the spec nor the finalizer list
+// is one. Both probes at once: a finalizers blob that fails to decode and a spec
+// column no statement can name.
 func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 	ctx := context.Background()
 	store := newRawStore(t)
 	id := insertBadFinalizersRow(t, store, testGK) // no status, unsettled
-	// Two generations, so the content write can land at the older one and leave
-	// the handshake to advance on the next call.
-	_, err := store.db.ExecContext(ctx, `UPDATE objects SET generation = 2 WHERE id = ?`, id)
-	require.NoError(t, err)
 	hideObjectColumn(t, store, "spec")
 
 	status := []byte(`{"msg":"hi"}`)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 1, status, 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, status, 0),
 		"the content branch")
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 2, status, 0),
-		"identical bytes, handshake advancing")
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, 2, status, 0),
-		"identical bytes at a recorded generation: nothing written")
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, id, status, 0),
+		"identical bytes: nothing written")
 
-	var obs int64
+	var obs sql.NullInt64
 	var stored string
 	require.NoError(t, store.db.QueryRowContext(ctx,
 		`SELECT observed_generation, status FROM objects WHERE id = ?`, id).Scan(&obs, &stored))
-	assert.Equal(t, int64(2), obs)
+	assert.False(t, obs.Valid, "a status write settles nothing")
 	assert.JSONEq(t, `{"msg":"hi"}`, stored)
 
-	// The gates still answer from the columns it does read.
-	assert.ErrorIs(t, store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, 1, status, 0),
+	// The kind gate still answers from the columns it does read.
+	assert.ErrorIs(t, store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, status, 0),
 		beehive.ErrWrongKind)
-	assert.ErrorIs(t, store.Objects().UpdateStatus(ctx, testGK, id, 99, status, 0),
-		beehive.ErrObservedGenerationFuture)
 }
 
 // Clearing a finalizer needs the list and whether the object is deletion-pending,
@@ -5538,7 +5262,7 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 
 	// UpdateStatus returns no row, so there is nothing here to assemble; it must
 	// still leave the condition alone, and still emit.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"v":1}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"v":1}`), 0))
 	updated, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(updated.Conditions, "Ready"), "a status write must not disturb conditions")
@@ -5572,7 +5296,7 @@ func TestOnlyUpdateSpecCanFailAssemblingConditions(t *testing.T) {
 	_, err := store.db.ExecContext(ctx, `DROP TABLE conditions`)
 	require.NoError(t, err)
 
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0),
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{}`), 0),
 		"a status write does not read conditions, so a missing table cannot fail it")
 	_, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err, "nor does a deletion mark")
@@ -5933,7 +5657,7 @@ func TestUpdateStatusResourceVersionError(t *testing.T) {
 	obj := newRefObject(t, store)
 	dropSeq(t, store)
 
-	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{}`), 0)
 	require.Error(t, err)
 }
 
@@ -6001,31 +5725,12 @@ func TestUpdateStatusCrossVersionUpdateError(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 	status := []byte(`{"ok":true}`)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 1))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, status, 1))
 	blockObjectUpdates(t, store)
 
 	// obj.Generation is the generation the call above settled at, so re-reading the
 	// row to recover it would only echo the argument.
-	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 2)
-	require.Error(t, err)
-}
-
-// TestUpdateStatusHandshakeResourceVersionError covers the nextResourceVersion
-// branch on the content-no-op path: the bytes match but the handshake advances to
-// a generation the object hadn't settled at, so the version bump still runs.
-func TestUpdateStatusHandshakeResourceVersionError(t *testing.T) {
-	store := newRawStore(t)
-	ctx := context.Background()
-	obj := newRefObject(t, store)
-	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
-	require.NoError(t, err)
-	status := []byte(`{"ok":true}`)
-	// Settle at the older generation first, so the repeat call at the current one
-	// is an unsettled no-op rather than the already-settled path.
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, status, 0))
-	dropSeq(t, store)
-
-	err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, bumped.Generation, status, 0)
+	err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, status, 2)
 	require.Error(t, err)
 }
 
@@ -6234,7 +5939,7 @@ func TestScopedMutatorWrongKind(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store) // kind = testGK
 	other := beehive.GroupKind{Kind: "Other"}
-	err := store.Objects().UpdateStatus(ctx, other, obj.ID, obj.Generation, []byte(`{}`), 0)
+	err := store.Objects().UpdateStatus(ctx, other, obj.ID, []byte(`{}`), 0)
 	require.ErrorIs(t, err, beehive.ErrWrongKind)
 }
 
@@ -7969,7 +7674,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "status update",
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+				require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"b":2}`), 0))
 			},
 			logs: true,
 		},
@@ -8073,7 +7778,7 @@ func TestObjectsDeleteAppendsARowImage(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, obj.Generation, []byte(`{"b":2}`), 0))
+	require.NoError(t, store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"b":2}`), 0))
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"}))
 	before, err := store.Objects().Get(ctx, obj.ID)
@@ -8764,4 +8469,39 @@ func TestObjectWritesSweepCapsEachKindWithItsOwnHorizon(t *testing.T) {
 	require.Len(t, page, 1)
 	assert.Equal(t, quiet.ResourceVersion, page[0].ResourceVersion)
 	assert.Zero(t, trimmed, "the quiet kind was never trimmed, so its horizon never moved")
+}
+
+// observed_generation is monotonic: its only writer clamps, so nothing rolls a
+// converged object back to unsettled. The reconcile loop's stamp gate depends
+// on it.
+func TestObservedGenerationIsMonotonic(t *testing.T) {
+	ctx := context.Background()
+	s := newTestStore(t)
+
+	obj, err := s.Objects().Create(ctx, testGK, storeapi.ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	// Three spec writes, so the row is at generation 4 with room to move down.
+	for i := 0; i < 3; i++ {
+		_, _, err = s.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(fmt.Sprintf(`{"v":%d}`, i)), 0)
+		require.NoError(t, err)
+	}
+	settled, err := s.Objects().SetObservedGeneration(ctx, testGK, obj.ID, 4)
+	require.NoError(t, err)
+	require.True(t, settled)
+
+	// A status write cannot move it.
+	require.NoError(t, s.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"s":1}`), 0))
+	got, err := s.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got.ObservedGeneration)
+	assert.Equal(t, int64(4), *got.ObservedGeneration, "a status write is not a handshake write")
+
+	// Nor can a stale handshake report.
+	settled, err = s.Objects().SetObservedGeneration(ctx, testGK, obj.ID, 2)
+	require.NoError(t, err)
+	assert.False(t, settled)
+	got, err = s.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), *got.ObservedGeneration, "clamped, never rolled back")
 }

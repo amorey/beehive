@@ -709,22 +709,52 @@ failed while servicing a wake keeps its `reconcile_owed` count, because
 `ReconcileOwed().Decrement` runs only on success, which is case 5. A retry for a
 *settled* object with neither record has nothing to recover it.
 
-### 13. `Result.RequeueAfter`
+### 13. A result's requeue delay
 
-`runWorker` calls `workQueue.addAfter`.
+`runWorker` calls `workQueue.addAfter` for `Settled(d)`/`Unsettled(d)` with `d > 0`.
 
 A chain of these on a settled object is the one case with no durable record at all.
 It does not survive a restart, and no driver brings it back. **This is accepted, not
-planned work: beehive will not add a durable form of `RequeueAfter`.** A
-`RequeueAfter` chain is a controller's private timer, not a fact about the object,
-and persisting it would mean a row per poll on the single connection —
-exactly the cost `reconcile_owed` exists to avoid. See [`TODO.md`](TODO.md) for the
+planned work: beehive will not add a durable form of it.** Such a chain is a
+controller's private timer, not a fact about the object, and persisting it would mean
+a row per poll on the single connection — the cost `reconcile_owed` exists to avoid. See [`TODO.md`](TODO.md) for the
 full reasoning. The open question left there is narrower: whether a self-polling
 controller should be written this way at all, or should own its own ticker and call
 `Client.Requeue`, or should enable `WithFullPassInterval` instead.
 
 Tests: `TestReconcilerRequeueAfter`, `TestWorkQueueAddAfterNewestWins`,
 `TestTypedControllerReconcileDropsRequeueWhenCollected`.
+
+### 13b. `Unsettled(0)`
+
+`runWorker` calls `workQueue.add`, so the per-object floor
+(`defaultMinRequeueInterval`, 1s) paces it. The return for a pass that can make
+progress as soon as it is called again; one waiting on something external should
+return a delay, or it polls at the floor forever.
+
+No durable record either, and **not** recovered by the unsettled listing in the
+general case: that listing gates on `observed_generation IS NULL OR
+observed_generation < generation`, so declining to stamp does not un-settle a row.
+An object already converged — woken by a dependency, say — that returns
+`Unsettled(0)` is absent from the listing, and a restart drops the chain exactly
+as section 13's does. Only an object whose generation really has moved past what
+was observed is recovered.
+
+Tests: `TestReconcilerSchedulesFromTheResultKind`.
+
+### 13c. Beehive's generation stamp
+
+A write rather than a trigger, on this map because it is new traffic:
+`typedController.reconcile` calls `Objects().SetObservedGeneration` after a
+`Settled` pass, appending a write-log entry that wakes the kind's tailers and the
+dependency waker. A settling status write therefore costs **two** entries where it
+cost one.
+
+Bounded by the in-memory gate: only a pass settling a *new* generation writes at
+all, so a converged object re-reporting the same status costs nothing.
+
+Tests: `TestReconcileStampsTheGenerationItHandedOut`,
+`TestReconcileConvergedPassMakesNoStampCall`.
 
 ### 14. Failure backoff
 

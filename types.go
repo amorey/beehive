@@ -114,14 +114,6 @@ var ErrStaleTxContext = storeapi.ErrStaleTxContext
 // is still open at commit, which can only mean another goroutine holds one.
 var ErrConcurrentNestedTx = storeapi.ErrConcurrentNestedTx
 
-// ErrObservedGenerationFuture is returned by a handshake write when the caller
-// reports a generation greater than the object's current one.
-var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
-
-// ErrInvalidObservedGeneration is returned by a handshake write given a
-// generation below 1, which no object ever holds.
-var ErrInvalidObservedGeneration = storeapi.ErrInvalidObservedGeneration
-
 // ErrSchemaVersionDowngrade is returned by Objects().UpdateSpec/UpdateStatus when the
 // caller's schema version is lower than the one stamped on the row.
 var ErrSchemaVersionDowngrade = storeapi.ErrSchemaVersionDowngrade
@@ -226,20 +218,82 @@ func (o *Object[Spec, Status]) Events() ([]Event, error) {
 	return o.events, nil
 }
 
-// Result is returned by a controller's Reconcile to influence requeueing.
-type Result struct {
-	// RequeueAfter requeues the object after the given delay. Zero means no
-	// explicit requeue (the object is still picked up by the periodic passes).
-	RequeueAfter time.Duration
+// ErrInvalidResult is what an unusable ReconcileResult — the zero value, or
+// Fail(nil) — fails the pass with. It settles nothing and takes the backoff
+// ladder.
+var ErrInvalidResult = errors.New("beehive: unusable ReconcileResult")
+
+// ErrReconcileReturned is returned by every method of the ControllerClient
+// Reconcile was passed, once it has returned. The client Register hands back is
+// never scoped this way.
+var ErrReconcileReturned = errors.New("beehive: the ControllerClient passed to Reconcile is no longer usable")
+
+// Zero names no kind, which is what makes the zero ReconcileResult detectable.
+type resultKind uint8
+
+const (
+	kindInvalid resultKind = iota
+	kindSettled
+	kindUnsettled
+	kindFail
+)
+
+// ReconcileResult is what Reconcile returns. Build it with Settled, Unsettled
+// or Fail; the zero value fails the pass with ErrInvalidResult.
+type ReconcileResult struct {
+	kind         resultKind
+	requeueAfter time.Duration
+	err          error
 }
+
+// Settled reports that the pass observed the object's current generation, which
+// beehive records. It claims nothing about health. Zero schedules nothing.
+func Settled(requeueAfter time.Duration) ReconcileResult {
+	return ReconcileResult{kind: kindSettled, requeueAfter: requeueAfter}
+}
+
+// Unsettled reports a successful pass over an object not caught up to its spec,
+// so no generation is recorded. Zero requeues at the work queue's per-object
+// floor.
+func Unsettled(requeueAfter time.Duration) ReconcileResult {
+	return ReconcileResult{kind: kindUnsettled, requeueAfter: requeueAfter}
+}
+
+// Fail reports a failed pass: settles nothing, takes the backoff ladder. A nil
+// err is itself a failure, reported as ErrInvalidResult.
+func Fail(err error) ReconcileResult {
+	return ReconcileResult{kind: kindFail, err: err}
+}
+
+// Must run before any gate reads the result: an un-normalized zero satisfies no
+// positive gate and is not a failure either.
+func (r ReconcileResult) normalize() ReconcileResult {
+	if r.kind == kindInvalid {
+		return Fail(fmt.Errorf("%w: the zero value", ErrInvalidResult))
+	}
+	if r.kind == kindFail && r.err == nil {
+		return Fail(fmt.Errorf("%w: Fail(nil)", ErrInvalidResult))
+	}
+	return r
+}
+
+func (r ReconcileResult) settles() bool { return r.kind == kindSettled }
+
+// Names the kinds it admits, so a new kind must be added here deliberately.
+func (r ReconcileResult) succeeded() bool {
+	return r.kind == kindSettled || r.kind == kindUnsettled
+}
+
+// Successful, but recorded no generation.
+func (r ReconcileResult) unsettled() bool { return r.kind == kindUnsettled }
 
 // Schedule reports when an object is next due to reconcile. A struct so fields
 // can be added without a breaking change.
 type Schedule struct {
 	// NextRequeueAt is when the reconcile loop has scheduled the object to be
 	// requeued, or the zero time when nothing is scheduled. It reflects only
-	// per-id timers (backoff, RequeueAfter, an immediate enqueue), not the
-	// periodic drivers.
+	// per-id timers (backoff, a result's requeue delay, an immediate enqueue),
+	// not the periodic drivers.
 	NextRequeueAt time.Time
 }
 

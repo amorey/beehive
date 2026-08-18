@@ -67,43 +67,55 @@ type ClusterCacheStatus struct{ Entries int }
 // caches that use it — then closes it and clears the finalizer.
 type ClusterController struct{}
 
-func (c *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
+func (c *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
 	if obj.DeletionRequestedAt != nil {
 		// Hold the connection open while any cache still has a live claim on us.
 		// HasIncomingEdges ignores caches that are themselves finalizing, so this clears
 		// once the owned caches are gone — not merely marked for deletion.
 		referenced, err := client.HasIncomingEdges(ctx, obj.ID)
 		if err != nil {
-			return beehive.Result{}, err
+			return beehive.Fail(err)
 		}
 		if referenced {
 			fmt.Printf("Cluster %d: caches still attached; holding connection open\n", obj.ID)
-			return beehive.Result{}, nil
+			return beehive.Settled(0)
 		}
 		fmt.Printf("Cluster %d: closed connection; releasing finalizer\n", obj.ID)
-		return beehive.Result{}, client.DeleteFinalizer(ctx, obj.ID, connectionFinalizer)
+		if err := client.DeleteFinalizer(ctx, obj.ID, connectionFinalizer); err != nil {
+			return beehive.Fail(err)
+		}
+		return beehive.Settled(0)
 	}
 
 	if obj.Status == nil || !obj.Status.Connected {
-		return beehive.Result{}, client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterStatus{Connected: true})
+		if err := client.UpdateStatus(ctx, obj.ID, ClusterStatus{Connected: true}); err != nil {
+			return beehive.Fail(err)
+		}
+		return beehive.Settled(0)
 	}
-	return beehive.Result{}, nil
+	return beehive.Settled(0)
 }
 
 // ClusterCacheController warms a cache on create and, on deletion, flushes it and
 // clears its finalizer so GC can remove the row.
 type ClusterCacheController struct{}
 
-func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) (beehive.Result, error) {
+func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) beehive.ReconcileResult {
 	if obj.DeletionRequestedAt != nil {
 		fmt.Printf("ClusterCache %d: flushed local cache; releasing finalizer\n", obj.ID)
-		return beehive.Result{}, client.DeleteFinalizer(ctx, obj.ID, cacheFlushFinalizer)
+		if err := client.DeleteFinalizer(ctx, obj.ID, cacheFlushFinalizer); err != nil {
+			return beehive.Fail(err)
+		}
+		return beehive.Settled(0)
 	}
 
 	if obj.Status == nil {
-		return beehive.Result{}, client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterCacheStatus{Entries: 42})
+		if err := client.UpdateStatus(ctx, obj.ID, ClusterCacheStatus{Entries: 42}); err != nil {
+			return beehive.Fail(err)
+		}
+		return beehive.Settled(0)
 	}
-	return beehive.Result{}, nil
+	return beehive.Settled(0)
 }
 
 func exitOnErr(err error) {

@@ -20,9 +20,9 @@
 // It defines a "Server" resource whose controller scales replicas online one
 // per reconcile pass. While replicas are still coming up it reports a
 // "Progressing" condition; a "Ready" liveness condition tracks whether the
-// live pool has reached the desired size. The controller requeues itself
-// (Result.RequeueAfter) until the pool is full, then clears "Progressing" and
-// flips "Ready" to True:
+// live pool has reached the desired size. The controller returns Unsettled with
+// a delay until the pool is full — so ObservedGeneration only catches up once
+// the object really has — then clears "Progressing" and flips "Ready" to True:
 //
 //	Create(spec) -> Reconcile (1/3, Progressing) -> ... -> Reconcile (3/3, Ready) -> converged
 //
@@ -69,7 +69,7 @@ type ServerController struct {
 	online map[beehive.ObjectID]int // replicas this process has brought online
 }
 
-func (c *ServerController) Reconcile(ctx context.Context, client beehive.ControllerClient[ServerStatus], obj *beehive.Object[ServerSpec, ServerStatus]) (beehive.Result, error) {
+func (c *ServerController) Reconcile(ctx context.Context, client beehive.ControllerClient[ServerStatus], obj *beehive.Object[ServerSpec, ServerStatus]) beehive.ReconcileResult {
 	want := obj.Spec.Replicas
 
 	// Bring one more replica online this pass, modeling a pool that warms up
@@ -88,7 +88,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 	if ready {
 		// Pool is full: clear the transient progress condition and mark Ready.
 		if err := client.DeleteCondition(ctx, obj.ID, condProgressing); err != nil {
-			return beehive.Result{}, err
+			return beehive.Fail(err)
 		}
 		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:     condReady,
@@ -97,7 +97,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 			Message:  msg,
 			Liveness: true,
 		}); err != nil {
-			return beehive.Result{}, err
+			return beehive.Fail(err)
 		}
 	} else {
 		// One pass observed both, so they go in one write: a watcher never sees
@@ -117,21 +117,23 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 				Liveness: true,
 			},
 		}); err != nil {
-			return beehive.Result{}, err
+			return beehive.Fail(err)
 		}
 	}
 
-	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, ServerStatus{OnlineReplicas: have}); err != nil {
-		return beehive.Result{}, err
+	if err := client.UpdateStatus(ctx, obj.ID, ServerStatus{OnlineReplicas: have}); err != nil {
+		return beehive.Fail(err)
 	}
 
-	// Requeue ourselves until the pool is full; once ready, settle. The delay is
-	// longer than the watch poll so each step lands in its own poll and the
-	// progression is visible; a shorter one would still converge, just invisibly.
+	// Unsettled until the pool is full: the spec asks for `want` replicas and
+	// only `have` are online, so this pass has not observed the generation it
+	// was handed and beehive must not record it. The delay is longer than the
+	// watch poll so each step lands in its own poll and the progression is
+	// visible; a shorter one would still converge, just invisibly.
 	if !ready {
-		return beehive.Result{RequeueAfter: 1500 * time.Millisecond}, nil
+		return beehive.Unsettled(1500 * time.Millisecond)
 	}
-	return beehive.Result{}, nil
+	return beehive.Settled(0)
 }
 
 func exitOnErr(err error) {
@@ -147,7 +149,7 @@ func main() {
 
 	// Production defaults. Nothing is pushed, so the create below is nudged with
 	// Requeue rather than left to the 30s owed-pass tick; every pass after that is
-	// paced by the RequeueAfter the controller returns. Note what is *not* set here:
+	// paced by the delay the controller returns. Note what is *not* set here:
 	// a short WithFullPassInterval would re-dispatch the object on its own cadence
 	// and drive the loop faster than the controller asked for.
 	bh, err := beehive.New(store)
@@ -175,7 +177,7 @@ func main() {
 	fmt.Printf("created Server id=%d replicas=%d\n", obj.ID, obj.Spec.Replicas)
 
 	// A write schedules nothing; this is what starts the sequence now rather than in
-	// 30s. The RequeueAfter the controller returns paces every step after it.
+	// 30s. The delay the controller returns paces every step after it.
 	exitOnErr(client.Requeue(ctx, obj.ID))
 
 	waitForReady(obj.ID, stream)

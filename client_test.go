@@ -675,8 +675,7 @@ func TestClientGetOrCreateOwesAPassOnlyOnCreate(t *testing.T) {
 	assert.Equal(t, []ObjectID{obj.ID}, unsettledIDs(t, store), "a new object is owed its first pass")
 
 	// Settle it, so the found branch below starts from "nothing owed".
-	err = store.Objects().UpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
-	require.NoError(t, err)
+	settleRow(t, ctx, store, clientTestGK, obj.ID)
 	require.Empty(t, unsettledIDs(t, store), "precondition: settled")
 
 	_, created, err = client.GetOrCreate(ctx, "w1", cSpec{Val: "b"})
@@ -906,8 +905,7 @@ func TestClientWritesAreOwedOnlyAfterOuterCommit(t *testing.T) {
 				client := NewClient[cSpec, cStatus](bh, clientTestGK)
 				seeded := mustCreate(t, ctx, client, "seed", cSpec{Val: "a"})
 				// Settle the seed so its own unconverged spec doesn't mask the write's.
-				err = store.Objects().UpdateStatus(ctx, clientTestGK, seeded.ID, 1, []byte(`{}`), 0)
-				require.NoError(t, err)
+				settleRow(t, ctx, store, clientTestGK, seeded.ID)
 				require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
 				cc := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
@@ -946,8 +944,7 @@ func TestClientNoOpUpdateOwesNothing(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, "w1", cSpec{Val: "a"})
 	// Settle it, so anything the write below owes is its own.
-	err = store.Objects().UpdateStatus(ctx, clientTestGK, obj.ID, 1, []byte(`{}`), 0)
-	require.NoError(t, err)
+	settleRow(t, ctx, store, clientTestGK, obj.ID)
 	require.Empty(t, unsettledIDs(t, store), "precondition: nothing owed")
 
 	_, err = client.Update(ctx, obj.ID, cSpec{Val: "a"})
@@ -1709,7 +1706,7 @@ func TestWatchReceivesModifiedOnStatusUpdate(t *testing.T) {
 	require.Len(t, stream.Objects, 1)
 	assert.Equal(t, obj.ID, stream.Objects[0].ID)
 
-	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
 
 	evt := recv(t, stream.Changes)
 	assert.Equal(t, Modified, evt.Type)
@@ -3238,11 +3235,15 @@ func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], Controlle
 	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc, mustReconciler(t, bh, clientTestGK)
 }
 
-// settle drives the generation handshake to "converged" and empties the queue, so
-// a following test step starts from a row that owes nothing.
+// settle records the object's generation as observed and empties the queue, so a
+// following step starts from a row that owes nothing. These tests need a settled
+// row without running a reconcile loop to get one.
 func settle(t *testing.T, ctx context.Context, cc ControllerClient[cStatus], r *reconciler, obj *Object[cSpec, cStatus]) {
 	t.Helper()
-	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
+	bh := cc.(*controllerClientImpl[cStatus]).bh
+	_, err := bh.store.Objects().SetObservedGeneration(ctx, clientTestGK, obj.ID, obj.Generation)
+	require.NoError(t, err)
 	drainQueue(r.work)
 	require.Empty(t, queuedIDs(r.work), "settle must leave the queue empty")
 }
@@ -3517,7 +3518,13 @@ func TestSpecThenStatusInOneTransactionStillEnqueues(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return cc.UpdateStatus(ctx, obj.ID, updated.Generation, cStatus{Val: "done"})
+		if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
+			return err
+		}
+		// Settling is beehive's write, so reach the store directly.
+		bh := cc.(*controllerClientImpl[cStatus]).bh
+		_, err = bh.store.Objects().SetObservedGeneration(ctx, clientTestGK, obj.ID, updated.Generation)
+		return err
 	}))
 
 	// The committed row is settled, so the owed pass would not list it...
@@ -3541,13 +3548,13 @@ type respecController struct {
 	first, hot *signal
 }
 
-func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 	if c.calls.Add(1) >= hotLoopCalls {
 		c.hot.fire()
 	}
 	c.first.fire()
 	_, _ = c.client.Update(ctx, obj.ID, obj.Spec) // identical bytes: the store skips it
-	return Result{}, errBoom
+	return Fail(errBoom)
 }
 
 // A failing controller that re-writes its own spec must stay on its backoff ladder.

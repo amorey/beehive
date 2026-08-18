@@ -692,8 +692,8 @@ type blockingController[Spec, Status any] struct {
 	release chan struct{}
 }
 
-func (c *blockingController[Spec, Status]) Reconcile(context.Context, ControllerClient[Status], *Object[Spec, Status]) (Result, error) {
+func (c *blockingController[Spec, Status]) Reconcile(context.Context, ControllerClient[Status], *Object[Spec, Status]) ReconcileResult {
 	c.once.Do(func() { close(c.entered) })
 	<-c.release
-	return Result{}, nil
+	return Settled(0)
 }

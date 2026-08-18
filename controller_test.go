@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -164,7 +165,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		assert.Equal(t, 0, raw.StatusVersion, "no status written yet")
 
 		// Controller status write stamps the status version, spec unchanged.
-		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
 		raw, err = store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Equal(t, 4, raw.SpecVersion, "status write must not touch spec version")
@@ -181,7 +182,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
-		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+		require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
 
 		raw, err := store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
@@ -205,7 +206,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	err = cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"})
+	err = cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"})
 	require.NoError(t, err)
 
 	// Status must now be visible through the client.
@@ -213,8 +214,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "done", got.Status.Val)
-	require.NotNil(t, got.ObservedGeneration)
-	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
+	assert.Nil(t, got.ObservedGeneration, "a status write is not a handshake write")
 }
 
 // TestControllerClientUpdateStatusNoOpIsSilent pins the property downstream
@@ -232,7 +232,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
-	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
 
 	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
@@ -245,14 +245,14 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	// frame for this write would have to arrive before the real change's.
 	before, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
-	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}))
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}))
 	after, err := client.Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, before.ResourceVersion, after.ResourceVersion,
 		"an unchanged status bumped resource_version, which is what the watch emits on")
 
 	// A real change still flows.
-	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "changed"}))
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "changed"}))
 	select {
 	case ev := <-stream.Changes:
 		assert.Equal(t, Modified, ev.Type)
@@ -277,7 +277,7 @@ func TestControllerClientWithin(t *testing.T) {
 	// Rollback: an error from fn discards every write it made.
 	sentinel := errors.New("boom")
 	err := cc.Within(ctx, func(ctx context.Context) error {
-		if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "rolled-back"}); err != nil {
+		if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "rolled-back"}); err != nil {
 			return err
 		}
 		return sentinel
@@ -289,7 +289,7 @@ func TestControllerClientWithin(t *testing.T) {
 
 	// Commit: a nil return persists every write atomically.
 	require.NoError(t, cc.Within(ctx, func(ctx context.Context) error {
-		if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "committed"}); err != nil {
+		if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "committed"}); err != nil {
 			return err
 		}
 		return cc.SetCondition(ctx, obj.ID, Condition{Type: "Ready", Status: ConditionTrue})
@@ -449,16 +449,25 @@ func TestControllerClientSetConditions(t *testing.T) {
 	assert.Nil(t, findCondition(after.Conditions, "Ready"))
 }
 
-// A controller whose whole report is conditions has no status write to carry
-// the handshake, so without SetObservedGeneration it sits in the owed listing
-// forever. Both halves are asserted: the gap is deliberate, so nobody closes it
-// by stamping in the reconciler.
-func TestControllerClientSetObservedGeneration(t *testing.T) {
+// A controller whose whole report is conditions has no status write to carry the
+// handshake and needs none: returning Settled is what records the generation.
+func TestConditionsOnlyControllerSettlesByReturningSettled(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	reconciled := make(chan struct{}, 4)
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+		if err := cc.SetCondition(ctx, obj.ID, Condition{Type: "Synced", Status: ConditionFalse, Reason: "Paused"}); err != nil {
+			return Fail(err)
+		}
+		select {
+		case reconciled <- struct{}{}:
+		default:
+		}
+		return Settled(0)
+	}}
+	_, err := Register(bh, clientTestGK, inner)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -467,25 +476,18 @@ func TestControllerClientSetObservedGeneration(t *testing.T) {
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 
-	require.NoError(t, cc.SetCondition(ctx, obj.ID, Condition{Type: "Synced", Status: ConditionFalse, Reason: "Paused"}))
+	select {
+	case <-reconciled:
+	case <-time.After(testTimeout):
+		t.Fatal("the create's own enqueue never reconciled")
+	}
+	got := waitSettled(t, ctx, client, obj.ID)
+	assert.Nil(t, got.Status, "the handshake writes no status")
+	require.NotNil(t, findCondition(got.Conditions, "Synced"), "the pass's real report")
+
 	unsettled, err := store.Objects().ListUnsettledIDs(ctx, clientTestGK)
 	require.NoError(t, err)
-	require.Contains(t, unsettled, obj.ID, "a condition write settles nothing")
-
-	require.NoError(t, cc.SetObservedGeneration(ctx, obj.ID, obj.Generation))
-
-	unsettled, err = store.Objects().ListUnsettledIDs(ctx, clientTestGK)
-	require.NoError(t, err)
 	assert.NotContains(t, unsettled, obj.ID)
-
-	got, err := client.Get(ctx, obj.ID)
-	require.NoError(t, err)
-	require.NotNil(t, got.ObservedGeneration)
-	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
-	assert.Nil(t, got.Status, "the handshake writes no status")
-
-	assert.ErrorIs(t, cc.SetObservedGeneration(ctx, obj.ID, obj.Generation+4), ErrObservedGenerationFuture)
-	assert.ErrorIs(t, cc.SetObservedGeneration(ctx, obj.ID, 0), ErrInvalidObservedGeneration)
 }
 
 func TestControllerClientAddAndDeleteDependency(t *testing.T) {
@@ -895,16 +897,16 @@ type redeclareController struct {
 	first, hot *signal
 }
 
-func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	if obj.ID == c.target {
-		return Result{}, nil
+		return Settled(0)
 	}
 	if c.calls.Add(1) >= hotLoopCalls {
 		c.hot.fire()
 	}
 	c.first.fire()
 	_ = cc.AddDependency(ctx, obj.ID, c.target)
-	return Result{}, errBoom
+	return Fail(errBoom)
 }
 
 // TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges pins the bound the
@@ -1048,7 +1050,7 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	gadgets := NewClient[cSpec, cStatus](bh, gadgetGK)
 	gadget := mustCreate(t, ctx, gadgets, uniqueName(), cSpec{Val: "v1"}, WithFinalizers("f"))
 
-	require.ErrorIs(t, cc.UpdateStatus(ctx, gadget.ID, 1, cStatus{Val: "hijacked"}), ErrWrongKind)
+	require.ErrorIs(t, cc.UpdateStatus(ctx, gadget.ID, cStatus{Val: "hijacked"}), ErrWrongKind)
 	require.ErrorIs(t, cc.SetCondition(ctx, gadget.ID, Condition{Type: "Ready", Status: ConditionTrue}), ErrWrongKind)
 	require.ErrorIs(t, cc.DeleteCondition(ctx, gadget.ID, "Ready"), ErrWrongKind)
 	require.ErrorIs(t, cc.DeleteFinalizer(ctx, gadget.ID, "f"), ErrWrongKind)
@@ -1128,7 +1130,7 @@ func (s *failUpdateStatusStore) Objects() storeapi.Objects {
 	return objectsOverride{Objects: s.kindTStore.Objects(), updateStatus: s.updateStatus}
 }
 
-func (s *failUpdateStatusStore) updateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ int64, _ []byte, _ int) error {
+func (s *failUpdateStatusStore) updateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) error {
 	return errBoom
 }
 
@@ -1140,14 +1142,14 @@ func (errStatusMarshaler) MarshalJSON() ([]byte, error) { return nil, errBoom }
 func TestControllerClientUpdateStatusMarshalError(t *testing.T) {
 	bh := newTestBeehive(t, &kindTStore{})
 	cc := &controllerClientImpl[errStatusMarshaler]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err := cc.UpdateStatus(context.Background(), 1, 1, errStatusMarshaler{})
+	err := cc.UpdateStatus(context.Background(), 1, errStatusMarshaler{})
 	require.Error(t, err)
 }
 
 func TestControllerClientUpdateStatusStoreError(t *testing.T) {
 	bh := newTestBeehive(t, &failUpdateStatusStore{})
 	cc := &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	err := cc.UpdateStatus(context.Background(), 1, 1, tStatus{})
+	err := cc.UpdateStatus(context.Background(), 1, tStatus{})
 	require.Error(t, err)
 }
 
@@ -1311,4 +1313,203 @@ func TestControllerClientReadEdges(t *testing.T) {
 	owned, err := cc.ListOwned(ctx, owner.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{child.ID}, objectRefIDs(owned))
+}
+
+// UpdateStatus writes status and nothing else, so no status write can roll a
+// converged object back to unsettled.
+func TestUpdateStatusDoesNotTouchTheHandshake(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+
+	require.NoError(t, cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "reported"}))
+
+	got, err := client.Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "reported", got.Status.Val)
+	assert.Nil(t, got.ObservedGeneration, "a status write settles nothing")
+	assert.Contains(t, unsettledIDs(t, store), obj.ID)
+}
+
+// The client passed into Reconcile stops working when that call returns: a write
+// arriving later moves status with no pass behind it.
+func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	var captured ControllerClient[cStatus]
+	ran := make(chan struct{}, 4)
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+		captured = cc
+		// Live for the whole of Reconcile, Within included.
+		if err := cc.Within(ctx, func(ctx context.Context) error {
+			return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "inside"})
+		}); err != nil {
+			return Fail(err)
+		}
+		select {
+		case ran <- struct{}{}:
+		default:
+		}
+		return Settled(0)
+	}}
+	registerClient, err := Register(bh, clientTestGK, inner)
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+	select {
+	case <-ran:
+	case <-time.After(testTimeout):
+		t.Fatal("the create's own enqueue never reconciled")
+	}
+	require.NotNil(t, captured)
+
+	t.Run("a write fails", func(t *testing.T) {
+		assert.ErrorIs(t, captured.UpdateStatus(ctx, obj.ID, cStatus{Val: "late"}), ErrReconcileReturned)
+	})
+
+	t.Run("a read fails too", func(t *testing.T) {
+		_, _, err := captured.GetOwner(ctx, obj.ID)
+		assert.ErrorIs(t, err, ErrReconcileReturned, "the whole surface stops, not just the writes")
+	})
+
+	t.Run("the write really did not land", func(t *testing.T) {
+		got, err := client.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		require.NotNil(t, got.Status)
+		assert.Equal(t, "inside", got.Status.Val)
+	})
+
+	// The Register client is the application's and outlives every pass by design.
+	t.Run("the Register client is unaffected", func(t *testing.T) {
+		require.NoError(t, registerClient.UpdateStatus(ctx, obj.ID, cStatus{Val: "from outside"}))
+		got, err := client.Get(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "from outside", got.Status.Val)
+	})
+}
+
+// end() and every method gate go through the same atomic. Needs -race to mean
+// much; without it, it still pins that the calls end in ErrReconcileReturned.
+func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	var (
+		wg      sync.WaitGroup
+		lateErr atomic.Value
+	)
+	ran := make(chan struct{}, 4)
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Runs across the return: some calls land before end(), some after.
+			for i := 0; i < 50; i++ {
+				if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "late"}); err != nil {
+					lateErr.Store(err)
+					return
+				}
+			}
+		}()
+		select {
+		case ran <- struct{}{}:
+		default:
+		}
+		return Settled(0)
+	}}
+	_, err := Register(bh, clientTestGK, inner)
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+	select {
+	case <-ran:
+	case <-time.After(testTimeout):
+		t.Fatal("the create's own enqueue never reconciled")
+	}
+	wg.Wait()
+
+	if err, ok := lateErr.Load().(error); ok {
+		assert.ErrorIs(t, err, ErrReconcileReturned, "the only failure a late call may take")
+	}
+}
+
+// Every method, in both states. Table-driven over the whole surface because the
+// rule is the surface: a method added without a gate is what this pins.
+func TestPassClientGatesEveryMethod(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	require.NoError(t, err)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dep"})
+
+	calls := []struct {
+		name string
+		call func(cc ControllerClient[cStatus]) error
+	}{
+		{"AddDependency", func(cc ControllerClient[cStatus]) error { return cc.AddDependency(ctx, dep.ID, obj.ID) }},
+		{"AddEvent", func(cc ControllerClient[cStatus]) error {
+			return cc.AddEvent(ctx, obj.ID, EventSpec{Category: "lifecycle", Reason: "Probed"})
+		}},
+		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, obj.ID, "Synced") }},
+		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, dep.ID, obj.ID) }},
+		{"DeleteFinalizer", func(cc ControllerClient[cStatus]) error {
+			return cc.DeleteFinalizer(ctx, obj.ID, "kstack.sh/none")
+		}},
+		{"GetOwner", func(cc ControllerClient[cStatus]) error { _, _, err := cc.GetOwner(ctx, obj.ID); return err }},
+		{"HasIncomingEdges", func(cc ControllerClient[cStatus]) error { _, err := cc.HasIncomingEdges(ctx, owner.ID); return err }},
+		{"ListDependencies", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependencies(ctx, dep.ID); return err }},
+		{"ListDependents", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependents(ctx, obj.ID); return err }},
+		{"ListOwned", func(cc ControllerClient[cStatus]) error { _, err := cc.ListOwned(ctx, owner.ID); return err }},
+		{"SetCondition", func(cc ControllerClient[cStatus]) error {
+			return cc.SetCondition(ctx, obj.ID, Condition{Type: "Synced", Status: ConditionTrue})
+		}},
+		{"SetConditions", func(cc ControllerClient[cStatus]) error {
+			return cc.SetConditions(ctx, obj.ID, []Condition{{Type: "Ready", Status: ConditionTrue}})
+		}},
+		{"UpdateStatus", func(cc ControllerClient[cStatus]) error { return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "v"}) }},
+		{"Within", func(cc ControllerClient[cStatus]) error {
+			return cc.Within(ctx, func(context.Context) error { return nil })
+		}},
+	}
+
+	inner := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
+	live := &scopedControllerClient[cStatus]{inner: inner}
+	for _, c := range calls {
+		t.Run(c.name+" delegates while the pass runs", func(t *testing.T) {
+			// Reaching inner is the assertion; whether inner likes the arguments is not.
+			assert.NotErrorIs(t, c.call(live), ErrReconcileReturned)
+		})
+	}
+
+	ended := &scopedControllerClient[cStatus]{inner: inner}
+	ended.end()
+	for _, c := range calls {
+		t.Run(c.name+" refuses once the pass has ended", func(t *testing.T) {
+			assert.ErrorIs(t, c.call(ended), ErrReconcileReturned)
+		})
+	}
 }

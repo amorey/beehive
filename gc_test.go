@@ -34,16 +34,19 @@ type finalizerClearingController struct {
 	finalizer string // empty => never clears anything
 }
 
-func (c *finalizerClearingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *finalizerClearingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 	if obj.DeletionRequestedAt == nil || c.finalizer == "" {
-		return Result{}, nil
+		return Settled(0)
 	}
 	for _, f := range obj.Finalizers {
 		if f == c.finalizer {
-			return Result{}, client.DeleteFinalizer(ctx, obj.ID, c.finalizer)
+			if err := client.DeleteFinalizer(ctx, obj.ID, c.finalizer); err != nil {
+				return Fail(err)
+			}
+			return Settled(0)
 		}
 	}
-	return Result{}, nil
+	return Settled(0)
 }
 
 // hasIncomingEdgesGatingController models the documented finalizer workflow: an
@@ -54,9 +57,9 @@ type hasIncomingEdgesGatingController struct {
 	finalizer string
 }
 
-func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 	if obj.DeletionRequestedAt == nil {
-		return Result{}, nil
+		return Settled(0)
 	}
 	held := false
 	for _, f := range obj.Finalizers {
@@ -65,13 +68,19 @@ func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc Con
 		}
 	}
 	if !held {
-		return Result{}, nil
+		return Settled(0)
 	}
 	referenced, err := cc.HasIncomingEdges(ctx, obj.ID)
-	if err != nil || referenced {
-		return Result{}, err // a live user remains; keep the finalizer
+	if err != nil {
+		return Fail(err)
 	}
-	return Result{}, cc.DeleteFinalizer(ctx, obj.ID, c.finalizer)
+	if referenced {
+		return Settled(0) // a live user remains; keep the finalizer
+	}
+	if err := cc.DeleteFinalizer(ctx, obj.ID, c.finalizer); err != nil {
+		return Fail(err)
+	}
+	return Settled(0)
 }
 
 // waitForDeletions consumes w until it has seen a Deleted event for every id in
@@ -793,8 +802,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// which the startup resumption of owed work would pick up as unsettled — the row
 	// would then be removed for two reasons and this test would stop pinning either
 	// one. Deletion does not bump generation, so the row stays settled below.
-	err = store.Objects().UpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
-	require.NoError(t, err)
+	settleRow(t, ctx, store, clientTestGK, raw.ID)
 	_, err = store.DeletionRequests().Create(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 
@@ -1051,24 +1059,27 @@ type depReleaseController struct {
 	targetID ObjectID
 }
 
-func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 	c.mu.Lock()
 	reader, depID, targetID := c.reader, c.depID, c.targetID
 	c.mu.Unlock()
 	if obj.ID != depID {
-		return Result{}, nil
+		return Settled(0)
 	}
 	target, err := reader.Get(ctx, targetID)
 	if errors.Is(err, ErrNotFound) {
-		return Result{}, nil // already collected
+		return Settled(0) // already collected
 	}
 	if err != nil {
-		return Result{}, err
+		return Fail(err)
 	}
 	if target.DeletionRequestedAt == nil {
-		return Result{}, nil
+		return Settled(0)
 	}
-	return Result{}, cc.DeleteDependency(ctx, depID, targetID)
+	if err := cc.DeleteDependency(ctx, depID, targetID); err != nil {
+		return Fail(err)
+	}
+	return Settled(0)
 }
 
 // With the sweeper stopped, the waker off and every periodic pass parked, the
@@ -1248,24 +1259,27 @@ type siblingFinalizerClearingController struct {
 	finalizer string
 }
 
-func (c *siblingFinalizerClearingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *siblingFinalizerClearingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 	c.mu.Lock()
 	reader, targetID, finalizer := c.reader, c.targetID, c.finalizer
 	c.mu.Unlock()
 	if reader == nil || obj.ID == targetID {
-		return Result{}, nil
+		return Settled(0)
 	}
 	target, err := reader.Get(ctx, targetID)
 	if errors.Is(err, ErrNotFound) {
-		return Result{}, nil // already collected
+		return Settled(0) // already collected
 	}
 	if err != nil {
-		return Result{}, err
+		return Fail(err)
 	}
 	if target.DeletionRequestedAt == nil || len(target.Finalizers) == 0 {
-		return Result{}, nil
+		return Settled(0)
 	}
-	return Result{}, cc.DeleteFinalizer(ctx, targetID, finalizer)
+	if err := cc.DeleteFinalizer(ctx, targetID, finalizer); err != nil {
+		return Fail(err)
+	}
+	return Settled(0)
 }
 
 // With the sweeper stopped and the periodic passes off, the push is the only

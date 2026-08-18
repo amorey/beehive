@@ -17,6 +17,7 @@ package beehive
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 
 	"github.com/amorey/beehive/internal/storeapi"
 )
@@ -28,9 +29,10 @@ var ErrWrongKind = storeapi.ErrWrongKind
 
 // Controller is the user-supplied reconcile logic for a resource kind.
 // Reconcile drives an object toward its desired state; the client is the
-// status-write surface for this controller's kind.
+// status-write surface for this controller's kind. Build the return with
+// Settled, Unsettled or Fail.
 type Controller[Spec, Status any] interface {
-	Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) (Result, error)
+	Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) ReconcileResult
 }
 
 // ControllerClient is the write surface a controller uses to report observed
@@ -70,19 +72,10 @@ type ControllerClient[Status any] interface {
 	// twice is refused with ErrDuplicateConditionType; an empty slice writes
 	// nothing. Same stamping as SetCondition.
 	SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
-	// SetObservedGeneration records the generation this reconcile settled without
-	// writing status, for a controller whose report is conditions or nothing at
-	// all. Pass the generation of the object you were handed. A generation at or
-	// below the recorded one writes nothing; one above the object's current
-	// generation → ErrObservedGenerationFuture, below 1 →
-	// ErrInvalidObservedGeneration — which UpdateStatus rejects too. Compose it
-	// inside Within to land with a SetConditions.
-	SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error
-	// UpdateStatus records status and the generation this reconcile observed.
-	// Status that marshals to the stored bytes writes nothing, so a controller
-	// can report unconditionally without waking watchers on an unchanged poll —
-	// except that a newly settled generation is still recorded and does emit.
-	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
+	// UpdateStatus records status and nothing else — the handshake is beehive's,
+	// recorded by returning Settled. Status that marshals to the stored bytes
+	// writes nothing, so a controller can report on every poll.
+	UpdateStatus(ctx context.Context, id ObjectID, status Status) error
 	// Within runs fn inside a single transaction: writes made with fn's ctx all
 	// commit together or roll back on error. Pass fn's ctx to every store call
 	// it makes — the store runs on one connection, so any other context
@@ -118,19 +111,24 @@ func (c *controllerClientImpl[Status]) wakeAfter(ctx context.Context, err error)
 	return nil
 }
 
-func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error {
+func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
 	b, err := json.Marshal(status)
 	if err != nil {
 		return err
 	}
 	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
-		ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
+		ctx, c.gk, id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
-// Gated on settled: a controller calls this every pass, so the steady state is
-// the clamped no-op, which appends no log entry for a wake to read.
-func (c *controllerClientImpl[Status]) SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error {
-	settled, err := c.bh.store.Objects().SetObservedGeneration(ctx, c.gk, id, observedGeneration)
+// stampObserved records raw's generation as observed, skipping the store call
+// when the loaded row already carries it. That gate stands in for the store's
+// clamp only while observed_generation is monotonic — keep
+// SetObservedGeneration its sole writer.
+func (c *controllerClientImpl[Status]) stampObserved(ctx context.Context, raw *RawObject) error {
+	if raw.ObservedGeneration != nil && *raw.ObservedGeneration >= raw.Generation {
+		return nil
+	}
+	settled, err := c.bh.store.Objects().SetObservedGeneration(ctx, c.gk, raw.ID, raw.Generation)
 	if err != nil || !settled {
 		return err
 	}
@@ -260,4 +258,121 @@ func (c *controllerClientImpl[Status]) HasIncomingEdges(ctx context.Context, id 
 // widens what this controller can mutate.
 func (c *controllerClientImpl[Status]) Within(ctx context.Context, fn func(ctx context.Context) error) error {
 	return c.bh.store.Within(ctx, fn)
+}
+
+// scopedControllerClient is the ControllerClient one Reconcile is handed. It
+// refuses everything once the pass ends, and is a fail-fast rather than a
+// barrier: nothing waits for calls already in flight.
+// See docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md.
+type scopedControllerClient[Status any] struct {
+	inner *controllerClientImpl[Status]
+	done  atomic.Bool
+}
+
+// Called once, after Reconcile returns and before beehive's own writes.
+func (c *scopedControllerClient[Status]) end() { c.done.Store(true) }
+
+func (c *scopedControllerClient[Status]) live() error {
+	if c.done.Load() {
+		return ErrReconcileReturned
+	}
+	return nil
+}
+
+func (c *scopedControllerClient[Status]) AddDependency(ctx context.Context, fromID, toID ObjectID) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.AddDependency(ctx, fromID, toID)
+}
+
+func (c *scopedControllerClient[Status]) AddEvent(ctx context.Context, id ObjectID, event EventSpec) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.AddEvent(ctx, id, event)
+}
+
+func (c *scopedControllerClient[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.DeleteCondition(ctx, id, conditionType)
+}
+
+func (c *scopedControllerClient[Status]) DeleteDependency(ctx context.Context, fromID, toID ObjectID) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.DeleteDependency(ctx, fromID, toID)
+}
+
+func (c *scopedControllerClient[Status]) DeleteFinalizer(ctx context.Context, id ObjectID, finalizer string) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.DeleteFinalizer(ctx, id, finalizer)
+}
+
+func (c *scopedControllerClient[Status]) GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error) {
+	if err := c.live(); err != nil {
+		return ObjectRef{}, false, err
+	}
+	return c.inner.GetOwner(ctx, id)
+}
+
+func (c *scopedControllerClient[Status]) HasIncomingEdges(ctx context.Context, id ObjectID) (bool, error) {
+	if err := c.live(); err != nil {
+		return false, err
+	}
+	return c.inner.HasIncomingEdges(ctx, id)
+}
+
+func (c *scopedControllerClient[Status]) ListDependencies(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	if err := c.live(); err != nil {
+		return nil, err
+	}
+	return c.inner.ListDependencies(ctx, id)
+}
+
+func (c *scopedControllerClient[Status]) ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	if err := c.live(); err != nil {
+		return nil, err
+	}
+	return c.inner.ListDependents(ctx, id)
+}
+
+func (c *scopedControllerClient[Status]) ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+	if err := c.live(); err != nil {
+		return nil, err
+	}
+	return c.inner.ListOwned(ctx, id)
+}
+
+func (c *scopedControllerClient[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.SetCondition(ctx, id, condition)
+}
+
+func (c *scopedControllerClient[Status]) SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.SetConditions(ctx, id, conditions)
+}
+
+func (c *scopedControllerClient[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.UpdateStatus(ctx, id, status)
+}
+
+func (c *scopedControllerClient[Status]) Within(ctx context.Context, fn func(ctx context.Context) error) error {
+	if err := c.live(); err != nil {
+		return err
+	}
+	return c.inner.Within(ctx, fn)
 }

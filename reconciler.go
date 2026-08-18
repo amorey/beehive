@@ -37,18 +37,22 @@ const (
 // parameters.
 type controllerAdapter interface {
 	// gone reports that id's row no longer exists, so the worker drops what is
-	// queued for it rather than dispatching an ErrNotFound.
-	reconcile(ctx context.Context, id ObjectID) (result Result, gone bool, err error)
+	// queued for it rather than dispatching an ErrNotFound. The result is
+	// normalized, and on a branch with no controller behind it carries only a
+	// scheduling decision — the handshake is written in here, not by the worker.
+	reconcile(ctx context.Context, id ObjectID) (result ReconcileResult, gone bool)
 }
 
 // typedController adapts a generic Controller[Spec, Status] to the non-generic
 // controllerAdapter interface.
 type typedController[Spec, Status any] struct {
-	gk     GroupKind
-	bh     *Beehive
-	inner  Controller[Spec, Status]
-	client ControllerClient[Status] // built once at Register, passed into each Reconcile
-	logger *slog.Logger             // kind-tagged; set by Register
+	gk    GroupKind
+	bh    *Beehive
+	inner Controller[Spec, Status]
+	// Built once at Register and returned to the caller; each pass hands the
+	// controller a scopedControllerClient over it, never this.
+	client *controllerClientImpl[Status]
+	logger *slog.Logger // kind-tagged; set by Register
 }
 
 // log guards the rare path where a typedController is built outside Register.
@@ -63,17 +67,17 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 // transaction: each ControllerClient write commits on its own; a controller
 // that needs atomicity uses ControllerClient.Within. GC runs afterwards, in its
 // own transaction.
-func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, bool, error) {
+func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (ReconcileResult, bool) {
 	log := t.log().With("id", id)
 
 	load, err := t.bh.store.Objects().GetForReconcile(ctx, id)
 	if errors.Is(err, ErrNotFound) {
 		// Already collected between enqueue and now: a no-op success.
 		log.DebugContext(ctx, "object gone before reconcile; skipping")
-		return Result{}, true, nil
+		return Settled(0), true
 	}
 	if err != nil {
-		return Result{}, false, err
+		return Fail(err), false
 	}
 	raw := &load.Object
 	deleting := raw.DeletionRequestedAt != nil
@@ -91,25 +95,30 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 			gone, gcErr := t.bh.gcCollect(ctx, id)
 			if gcErr != nil {
 				log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
-				return Result{}, false, gcErr
+				return Fail(gcErr), false
 			}
-			return Result{}, gone, nil
+			return Settled(0), gone
 		}
-		return Result{}, false, nil
+		return Settled(0), false
 	}
 
 	log.DebugContext(ctx, "reconciling", "generation", obj.Generation, "deleting", deleting)
-	result, reconcileErr := t.inner.Reconcile(ctx, t.client, obj)
-	if reconcileErr != nil {
+	// Ended below, before beehive's own writes: nothing the controller captured
+	// may write past that point.
+	pass := &scopedControllerClient[Status]{inner: t.client}
+	// Normalized before any gate below reads it.
+	result := t.inner.Reconcile(ctx, pass, obj).normalize()
+	pass.end()
+	if !result.succeeded() {
 		// Warn, not Error: the retry loop absorbs failed reconciles. Don't return
 		// yet — committed writes still need their GC follow-up below.
-		log.WarnContext(ctx, "reconcile failed; will retry", "err", reconcileErr)
+		log.WarnContext(ctx, "reconcile failed; will retry", "err", result.err)
 	}
 	// Subtract the whole count observed at load, not 1: this pass read current
 	// state, which answers every wake outstanding then. Increments landing during
 	// the pass sit above the observed count and survive. A failed subtraction is
 	// left to the backstop rather than retried under backoff.
-	if reconcileErr == nil && raw.ReconcileOwed != 0 {
+	if result.succeeded() && raw.ReconcileOwed != 0 {
 		if err := t.bh.store.ReconcileOwed().Decrement(ctx, t.gk, id, raw.ReconcileOwed); err != nil {
 			log.WarnContext(ctx, "failed to decrement the reconcile-owed count; backstop will retry", "err", err)
 		}
@@ -124,10 +133,20 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// any target change this pass did not observe is above the stale pass's
 	// cursor, so the next sweep finds it. Costs a redundant pass, never a strand.
 	// See docs/adr/2026-08-03-stale-dependents-cursor.md.
-	if reconcileErr == nil && load.HasDependencies {
+	if result.succeeded() && load.HasDependencies {
 		// A cancelled write is shutdown, not a lost pass.
 		if err := t.bh.store.Dependencies().WatermarkSet(ctx, id, load.Cursor); err != nil && ctx.Err() == nil {
 			log.WarnContext(ctx, "failed to record the dependency watermark; the next target change re-derives it", "err", err)
+		}
+	}
+	// After the watermark and before the GC block; both orderings are
+	// load-bearing. A failure only leaves the object unsettled; a cancelled write
+	// and a row collected mid-pass are not faults.
+	// See docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md.
+	if result.settles() {
+		if err := t.client.stampObserved(ctx, raw); err != nil &&
+			ctx.Err() == nil && !errors.Is(err, ErrNotFound) {
+			log.WarnContext(ctx, "failed to record the observed generation; the object stays unsettled", "err", err)
 		}
 	}
 	// GC runs in its own transaction over the controller's committed writes, so
@@ -136,16 +155,16 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 		gone, gcErr := t.bh.gcCollect(ctx, id)
 		if gcErr != nil {
 			log.ErrorContext(ctx, "garbage collection failed; will retry", "err", gcErr)
-			return result, false, cmp.Or(reconcileErr, gcErr)
+			return Fail(cmp.Or(result.err, gcErr)), false
 		}
-		// Collected: drop any RequeueAfter and the reconcile error rather than
+		// Collected: drop the requeue delay and the failure rather than
 		// rescheduling a dead id straight into ErrNotFound.
 		if gone {
 			log.DebugContext(ctx, "object collected")
-			return Result{}, true, nil
+			return Settled(0), true
 		}
 	}
-	return result, false, reconcileErr
+	return result, false
 }
 
 // reconciler drives the reconcile loop for a single registered controller.
@@ -390,7 +409,7 @@ func (r *reconciler) runWorker(ctx context.Context) {
 			return
 		case <-workReady:
 			if id, ok := r.work.get(); ok {
-				result, gone, err := r.adapter.reconcile(ctx, id)
+				result, gone := r.adapter.reconcile(ctx, id)
 				// done releases the processing hold so a re-add that arrived
 				// mid-reconcile becomes dispatchable; a collected row has nothing
 				// left to dispatch, so drop what is queued for it instead.
@@ -399,16 +418,26 @@ func (r *reconciler) runWorker(ctx context.Context) {
 				} else {
 					r.work.done(id)
 				}
-				if err != nil {
+				switch {
+				case !result.succeeded():
+					if errors.Is(result.err, ErrInvalidResult) {
+						r.logger.Error("controller returned an unusable result", "id", id, "err", result.err)
+					}
 					delay := r.backoffNext(id)
 					r.work.addAfter(id, delay, alarmBackoff)
 					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
-				} else {
+				case result.requeueAfter > 0:
 					r.backoffClear(id)
-					if result.RequeueAfter > 0 {
-						r.work.addAfter(id, result.RequeueAfter, alarmRequeueAfter)
-						r.logger.Debug("requeued", "id", id, "after", result.RequeueAfter)
-					}
+					r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
+					r.logger.Debug("requeued", "id", id, "after", result.requeueAfter)
+				case result.unsettled():
+					// No delay, so nothing else would schedule it; the queue's
+					// per-object floor paces the re-dispatch.
+					r.backoffClear(id)
+					r.work.add(id)
+					r.logger.Debug("requeued unsettled", "id", id)
+				default:
+					r.backoffClear(id)
 				}
 			}
 		}

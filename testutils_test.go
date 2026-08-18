@@ -767,8 +767,9 @@ func (fakeObjects) ListUnsettledIDs(context.Context, GroupKind) ([]ObjectID, err
 	return nil, nil
 }
 
+// Reports no write, so a pass over the fake wakes nobody.
 func (fakeObjects) SetObservedGeneration(context.Context, GroupKind, ObjectID, int64) (bool, error) {
-	panic("not implemented: fakeStore.Objects().SetObservedGeneration")
+	return false, nil
 }
 
 func (fakeObjects) UpdateSpec(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error) {
@@ -779,7 +780,7 @@ func (fakeObjects) UpdateSpecByName(context.Context, GroupKind, string, []byte, 
 	panic("not implemented: fakeStore.Objects().UpdateSpecByName")
 }
 
-func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
+func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, []byte, int) error {
 	panic("not implemented: fakeStore.Objects().UpdateStatus")
 }
 
@@ -806,7 +807,15 @@ type objectsOverride struct {
 	delete             func(context.Context, ObjectID) error
 	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
 	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
-	updateStatus       func(context.Context, GroupKind, ObjectID, int64, []byte, int) error
+	updateStatus       func(context.Context, GroupKind, ObjectID, []byte, int) error
+	setObservedGen     func(context.Context, GroupKind, ObjectID, int64) (bool, error)
+}
+
+func (o objectsOverride) SetObservedGeneration(ctx context.Context, gk GroupKind, id ObjectID, gen int64) (bool, error) {
+	if o.setObservedGen != nil {
+		return o.setObservedGen(ctx, gk, id, gen)
+	}
+	return o.Objects.SetObservedGeneration(ctx, gk, id, gen)
 }
 
 func (o objectsOverride) Create(ctx context.Context, gk GroupKind, in storeapi.ObjectsCreateInput) (*RawObject, error) {
@@ -893,11 +902,11 @@ func (o objectsOverride) GetByName(ctx context.Context, gk GroupKind, name strin
 	return o.Objects.GetByName(ctx, gk, name)
 }
 
-func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observed int64, status []byte, version int) error {
+func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte, version int) error {
 	if o.updateStatus != nil {
-		return o.updateStatus(ctx, gk, id, observed, status, version)
+		return o.updateStatus(ctx, gk, id, status, version)
 	}
-	return o.Objects.UpdateStatus(ctx, gk, id, observed, status, version)
+	return o.Objects.UpdateStatus(ctx, gk, id, status, version)
 }
 
 func (s *fakeStore) Conditions() storeapi.Conditions { return fakeConditions{} }
@@ -1227,8 +1236,10 @@ func (s cursorStoreCursors) Set(_ context.Context, name string, cursor int64) er
 // Tests that need a ControllerClient obtain it from Register's return value.
 type noopController[Spec, Status any] struct{}
 
-func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) (Result, error) {
-	return Result{}, nil
+// Unsettled, and far enough out that nothing re-dispatches inside a test: a
+// Settled pass would stamp the generation, a real write these tests do not expect.
+func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) ReconcileResult {
+	return Unsettled(time.Hour)
 }
 
 // registerNoop registers a do-nothing controller for gk, making the kind count as
@@ -1478,9 +1489,9 @@ type reconcileCapture struct {
 	ch chan *Object[tSpec, tStatus]
 }
 
-func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	c.ch <- obj
-	return Result{}, nil
+	return Settled(0)
 }
 
 // addEdge declares an edge for test scaffolding: it drains the owed-wake stamp
@@ -1948,4 +1959,79 @@ func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	return store, bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc
+}
+
+// reconcilePass splits the failure back out of the result, the shape most
+// reconcile tests assert on.
+func reconcilePass(a controllerAdapter, ctx context.Context, id ObjectID) (ReconcileResult, bool, error) {
+	result, gone := a.reconcile(ctx, id)
+	return result, gone, result.err
+}
+
+// objectsOverrideStore swaps one kind's Objects sub-API for a hooked one, so a
+// test can count or fail a single store call without a whole fake.
+type objectsOverrideStore struct {
+	Store
+	override objectsOverride
+}
+
+func (s *objectsOverrideStore) Objects() storeapi.Objects {
+	if s.override.Objects == nil {
+		s.override.Objects = s.Store.Objects()
+	}
+	return s.override
+}
+
+// orderProbeStore records the order of the two post-reconcile writes whose
+// ordering is load-bearing: the watermark must commit before the stamp.
+type orderProbeStore struct {
+	Store
+	record func(string)
+}
+
+func (s *orderProbeStore) Objects() storeapi.Objects {
+	return objectsOverride{
+		Objects: s.Store.Objects(),
+		setObservedGen: func(ctx context.Context, gk GroupKind, id ObjectID, gen int64) (bool, error) {
+			s.record("stamp")
+			return s.Store.Objects().SetObservedGeneration(ctx, gk, id, gen)
+		},
+	}
+}
+
+func (s *orderProbeStore) Dependencies() storeapi.Dependencies {
+	return depsOverride{
+		Dependencies: s.Store.Dependencies(),
+		watermarkSet: func(ctx context.Context, id ObjectID, cursor int64) error {
+			s.record("watermark")
+			return s.Store.Dependencies().WatermarkSet(ctx, id, cursor)
+		},
+	}
+}
+
+// settleRow records id's current generation as observed, for tests needing a
+// settled row without a reconcile loop to produce one.
+func settleRow(t *testing.T, ctx context.Context, store Store, gk GroupKind, id ObjectID) {
+	t.Helper()
+	raw, err := store.Objects().GetMeta(ctx, id)
+	require.NoError(t, err)
+	_, err = store.Objects().SetObservedGeneration(ctx, gk, id, raw.Generation)
+	require.NoError(t, err)
+}
+
+// waitSettled waits for beehive's generation stamp and returns the settled
+// object. The stamp lands after Reconcile returns, so a controller's own signal
+// fires before it and cannot be waited on in its place.
+func waitSettled(t *testing.T, ctx context.Context, client Client[cSpec, cStatus], id ObjectID) *Object[cSpec, cStatus] {
+	t.Helper()
+	var got *Object[cSpec, cStatus]
+	require.Eventually(t, func() bool {
+		o, err := client.Get(ctx, id)
+		if err != nil || o.ObservedGeneration == nil {
+			return false
+		}
+		got = o
+		return *o.ObservedGeneration == o.Generation
+	}, testTimeout, time.Millisecond, "beehive to record the generation the pass settled")
+	return got
 }

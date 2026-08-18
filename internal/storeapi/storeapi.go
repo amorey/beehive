@@ -69,12 +69,12 @@ var ErrStaleTxContext = errors.New("beehive: transaction context is not the live
 // same-goroutine frames unwind before fn returns.
 var ErrConcurrentNestedTx = errors.New("beehive: nested transaction frame still open at commit")
 
-// ErrObservedGenerationFuture is returned by Objects().UpdateStatus and
-// Objects().SetObservedGeneration when observedGeneration exceeds the object's
+// ErrObservedGenerationFuture is returned by Objects().SetObservedGeneration
+// when observedGeneration exceeds the object's
 // current generation.
 var ErrObservedGenerationFuture = errors.New("beehive: observed generation exceeds current generation")
 
-// ErrInvalidObservedGeneration is returned by the same two when
+// ErrInvalidObservedGeneration is returned by the same one when
 // observedGeneration is below 1. generation is NOT NULL DEFAULT 1, so no object
 // ever holds one — a zero is an uninitialised caller, not a stale report.
 var ErrInvalidObservedGeneration = errors.New("beehive: observed generation is not a generation")
@@ -777,21 +777,15 @@ type Objects interface {
 	// concurrent collect hand the name to a replacement in between.
 	UpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
-	// UpdateStatus replaces an object's status, records observedGeneration and
-	// stamps statusVersion. Changed bytes bump ObservedAt, ResourceVersion and
-	// UpdatedAt. Bytes identical at the row's own schema version write no
-	// status — but ObservedGeneration/ObservedAt (and ResourceVersion) still
-	// advance if this reconcile settled a new generation, at most once per
-	// generation; a call identical in both respects writes nothing at all.
-	//
-	// A stale observedGeneration (at or below the recorded value) is ignored
-	// on the no-op path but written as given on the content-changed path,
-	// rolling the object back to unsettled so a later pass re-derives it.
+	// UpdateStatus replaces an object's status and stamps statusVersion. Changed
+	// bytes bump ResourceVersion and UpdatedAt; bytes identical at the row's own
+	// schema version write nothing. It touches no part of the handshake, which
+	// leaves SetObservedGeneration the sole writer of observed_generation and so
+	// that column monotonic.
 	//
 	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// observedGeneration above the row's generation → ErrObservedGenerationFuture;
-	// below 1 → ErrInvalidObservedGeneration. Returns no row.
-	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observedGeneration int64, status []byte, statusVersion int) error
+	// Returns no row.
+	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte, statusVersion int) error
 }
 
 // Dependencies is the dependency-watermark table: what each dependent was last

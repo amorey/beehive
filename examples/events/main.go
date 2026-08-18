@@ -60,8 +60,8 @@ type ProbeDetail struct {
 // acknowledging deletion.
 type ClusterController struct{}
 
-func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) (beehive.Result, error) {
-	return beehive.Result{}, nil
+func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
+	return beehive.Settled(0)
 }
 
 func exitOnErr(err error) {

@@ -12,12 +12,13 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   objects that depend on each other still wake each other forever. A's write wakes
   B, B's wakes A, and no generation ever moves, so nothing reports a problem.
 
-  Almost any write sustains it: changed status bytes, a byte-identical
-  `UpdateStatus` at a generation the object has not settled at, any real condition
-  write, or `DeleteFinalizer`. Only `AddEvent` is safe, because it bumps no
-  object `resource_version`. `SetObservedGeneration` is safe for a different
-  reason: its clamp bounds it to one write per generation, and in a cycle no
-  generation moves, so the second settle writes nothing. Pinned by
+  Almost any write sustains it: changed status bytes, any real condition write, or
+  `DeleteFinalizer`. Only `AddEvent` is safe, because it bumps no object
+  `resource_version`. Beehive's own generation stamp is safe for a different
+  reason: `Objects().SetObservedGeneration` clamps, which bounds it to one write
+  per generation, and in a cycle no generation moves — so the second settle writes
+  nothing. A byte-identical `UpdateStatus` is now safe too, since it no longer
+  carries the handshake and so writes nothing at all. Pinned by
   `TestSetObservedGenerationWakesDependentsOncePerGeneration`.
 
   **The contention is gone.** The work queue's re-enqueue floor bounds the loop to

@@ -43,7 +43,7 @@ separate status-write surface, which is easy to miss. The condition and finalize
 mutators write other tables and carry no version.
 
 The never-downward stamping rule and its interaction with the content no-op live
-in [the generation handshake ADR](2026-07-27-generation-handshake-and-noop-writes.md).
+in [the generation handshake ADR](2026-08-18-beehive-owns-the-generation-handshake.md).
 
 ### gk-keyed registry on `*Beehive`
 
