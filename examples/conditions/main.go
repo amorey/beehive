@@ -69,7 +69,7 @@ type ServerController struct {
 	online map[beehive.ObjectID]int // replicas this process has brought online
 }
 
-func (c *ServerController) Reconcile(ctx context.Context, client beehive.ControllerClient[ServerStatus], obj *beehive.Object[ServerSpec, ServerStatus]) (beehive.Result, error) {
+func (c *ServerController) Reconcile(ctx context.Context, client beehive.ControllerClient[ServerStatus], obj *beehive.Object[ServerSpec, ServerStatus]) beehive.ReconcileResult {
 	want := obj.Spec.Replicas
 
 	// Bring one more replica online this pass, modeling a pool that warms up
@@ -88,7 +88,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 	if ready {
 		// Pool is full: clear the transient progress condition and mark Ready.
 		if err := client.DeleteCondition(ctx, obj.ID, condProgressing); err != nil {
-			return beehive.Result{}, err
+			return beehive.Fail(err)
 		}
 		if err := client.SetCondition(ctx, obj.ID, beehive.Condition{
 			Type:     condReady,
@@ -97,7 +97,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 			Message:  msg,
 			Liveness: true,
 		}); err != nil {
-			return beehive.Result{}, err
+			return beehive.Fail(err)
 		}
 	} else {
 		// One pass observed both, so they go in one write: a watcher never sees
@@ -117,21 +117,21 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 				Liveness: true,
 			},
 		}); err != nil {
-			return beehive.Result{}, err
+			return beehive.Fail(err)
 		}
 	}
 
 	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, ServerStatus{OnlineReplicas: have}); err != nil {
-		return beehive.Result{}, err
+		return beehive.Fail(err)
 	}
 
 	// Requeue ourselves until the pool is full; once ready, settle. The delay is
 	// longer than the watch poll so each step lands in its own poll and the
 	// progression is visible; a shorter one would still converge, just invisibly.
 	if !ready {
-		return beehive.Result{RequeueAfter: 1500 * time.Millisecond}, nil
+		return beehive.Settled(1500 * time.Millisecond)
 	}
-	return beehive.Result{}, nil
+	return beehive.Settled(0)
 }
 
 func exitOnErr(err error) {

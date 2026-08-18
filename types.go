@@ -226,13 +226,6 @@ func (o *Object[Spec, Status]) Events() ([]Event, error) {
 	return o.events, nil
 }
 
-// Result is returned by a controller's Reconcile to influence requeueing.
-type Result struct {
-	// RequeueAfter requeues the object after the given delay. Zero means no
-	// explicit requeue (the object is still picked up by the periodic passes).
-	RequeueAfter time.Duration
-}
-
 // ErrInvalidResult is the error a Reconcile returning an unusable
 // ReconcileResult fails with: the zero value, which names no kind, or
 // Fail(nil). Both are programming errors; the reconcile takes the backoff
@@ -308,8 +301,8 @@ func (r ReconcileResult) succeeded() bool {
 type Schedule struct {
 	// NextRequeueAt is when the reconcile loop has scheduled the object to be
 	// requeued, or the zero time when nothing is scheduled. It reflects only
-	// per-id timers (backoff, RequeueAfter, an immediate enqueue), not the
-	// periodic drivers.
+	// per-id timers (backoff, a result's requeue delay, an immediate enqueue),
+	// not the periodic drivers.
 	NextRequeueAt time.Time
 }
 

@@ -28,9 +28,10 @@ var ErrWrongKind = storeapi.ErrWrongKind
 
 // Controller is the user-supplied reconcile logic for a resource kind.
 // Reconcile drives an object toward its desired state; the client is the
-// status-write surface for this controller's kind.
+// status-write surface for this controller's kind. Build the return with
+// Settled, Unsettled or Fail.
 type Controller[Spec, Status any] interface {
-	Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) (Result, error)
+	Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) ReconcileResult
 }
 
 // ControllerClient is the write surface a controller uses to report observed

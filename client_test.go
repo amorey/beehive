@@ -3541,13 +3541,13 @@ type respecController struct {
 	first, hot *signal
 }
 
-func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) (Result, error) {
+func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
 	if c.calls.Add(1) >= hotLoopCalls {
 		c.hot.fire()
 	}
 	c.first.fire()
 	_, _ = c.client.Update(ctx, obj.ID, obj.Spec) // identical bytes: the store skips it
-	return Result{}, errBoom
+	return Fail(errBoom)
 }
 
 // A failing controller that re-writes its own spec must stay on its backoff ladder.

@@ -895,16 +895,16 @@ type redeclareController struct {
 	first, hot *signal
 }
 
-func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	if obj.ID == c.target {
-		return Result{}, nil
+		return Settled(0)
 	}
 	if c.calls.Add(1) >= hotLoopCalls {
 		c.hot.fire()
 	}
 	c.first.fire()
 	_ = cc.AddDependency(ctx, obj.ID, c.target)
-	return Result{}, errBoom
+	return Fail(errBoom)
 }
 
 // TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges pins the bound the

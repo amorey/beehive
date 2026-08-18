@@ -1227,8 +1227,8 @@ func (s cursorStoreCursors) Set(_ context.Context, name string, cursor int64) er
 // Tests that need a ControllerClient obtain it from Register's return value.
 type noopController[Spec, Status any] struct{}
 
-func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) (Result, error) {
-	return Result{}, nil
+func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) ReconcileResult {
+	return Settled(0)
 }
 
 // registerNoop registers a do-nothing controller for gk, making the kind count as
@@ -1478,9 +1478,9 @@ type reconcileCapture struct {
 	ch chan *Object[tSpec, tStatus]
 }
 
-func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) (Result, error) {
+func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
 	c.ch <- obj
-	return Result{}, nil
+	return Settled(0)
 }
 
 // addEdge declares an edge for test scaffolding: it drains the owed-wake stamp
@@ -1948,4 +1948,12 @@ func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, 
 	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	return store, bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc
+}
+
+// reconcilePass runs one adapter pass and splits the failure back out of the
+// result, which is the shape most reconcile tests assert on. The error is
+// result.err — a normalized failure and nothing else.
+func reconcilePass(a controllerAdapter, ctx context.Context, id ObjectID) (ReconcileResult, bool, error) {
+	result, gone := a.reconcile(ctx, id)
+	return result, gone, result.err
 }

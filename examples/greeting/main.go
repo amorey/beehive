@@ -50,13 +50,15 @@ type GreetingStatus struct {
 // GreetingController reconciles a GreetingSpec into a GreetingStatus.
 type GreetingController struct{}
 
-func (gc *GreetingController) Reconcile(ctx context.Context, client beehive.ControllerClient[GreetingStatus], obj *beehive.Object[GreetingSpec, GreetingStatus]) (beehive.Result, error) {
+func (gc *GreetingController) Reconcile(ctx context.Context, client beehive.ControllerClient[GreetingStatus], obj *beehive.Object[GreetingSpec, GreetingStatus]) beehive.ReconcileResult {
 	want := "Hello, " + obj.Spec.Name
 	if obj.Status != nil && obj.Status.Message == want {
-		return beehive.Result{}, nil
+		return beehive.Settled(0)
 	}
-	err := client.UpdateStatus(ctx, obj.ID, obj.Generation, GreetingStatus{Message: want})
-	return beehive.Result{}, err
+	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, GreetingStatus{Message: want}); err != nil {
+		return beehive.Fail(err)
+	}
+	return beehive.Settled(0)
 }
 
 func exitOnErr(err error) {
