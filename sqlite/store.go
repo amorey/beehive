@@ -1438,7 +1438,7 @@ func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.Gr
 		// No content to re-derive, so a stale report is dropped rather than rolling
 		// a converged object back to unsettled — the opposite of what UpdateStatus's
 		// content path does.
-		settled, err = s.advanceObserved(ctx, s.conn(ctx), gk, id, observedGen, observedGeneration)
+		settled, err = s.advanceObserved(ctx, gk, id, observedGen, observedGeneration)
 		return err
 	})
 	return settled && err == nil, err
@@ -1449,10 +1449,11 @@ func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.Gr
 // content — and reports whether it wrote. A report at or below the recorded
 // generation would roll a converged object back to unsettled, so it writes
 // nothing. Callers have proved the row exists in gk.
-func (s *sqliteStore) advanceObserved(ctx context.Context, c dbtx, gk storeapi.GroupKind, id storeapi.ObjectID, recorded sql.NullInt64, observedGeneration int64) (bool, error) {
+func (s *sqliteStore) advanceObserved(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, recorded sql.NullInt64, observedGeneration int64) (bool, error) {
 	if recorded.Valid && recorded.Int64 >= observedGeneration {
 		return false, nil
 	}
+	c := s.conn(ctx)
 	rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 	if err != nil {
 		return false, err
@@ -1484,12 +1485,9 @@ func checkObservedGeneration(observedGeneration int64) error {
 	return nil
 }
 
-// Objects().UpdateStatus skips the status write when the incoming bytes equal the stored
+// Objects().UpdateStatus skips the write when the incoming bytes equal the stored
 // ones at the same schema version: no resource_version bump, so no spurious
-// watch diff or dependent wake. It is not a handshake write and bumps
-// resource_version — settling at a new generation is a real transition, and it
-// fires at most once per generation. Identical status with the generation
-// already recorded writes nothing at all.
+// watch diff or dependent wake. It touches no part of the handshake.
 func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, status []byte, statusVersion int) error {
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {

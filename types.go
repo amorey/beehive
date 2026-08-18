@@ -218,11 +218,15 @@ func (o *Object[Spec, Status]) Events() ([]Event, error) {
 	return o.events, nil
 }
 
-// ErrInvalidResult is the error a Reconcile returning an unusable
-// ReconcileResult fails with: the zero value, which names no kind, or
-// Fail(nil). Both are programming errors; the reconcile takes the backoff
-// ladder rather than settling anything.
+// ErrInvalidResult is what a Reconcile returning an unusable ReconcileResult
+// fails with: the zero value, or Fail(nil). Both take the backoff ladder and
+// settle nothing.
 var ErrInvalidResult = errors.New("beehive: unusable ReconcileResult")
+
+// ErrReconcileReturned is returned by every method of the ControllerClient a
+// Reconcile was passed, once that Reconcile has returned. The client Register
+// hands back is the application's and is never scoped this way.
+var ErrReconcileReturned = errors.New("beehive: the ControllerClient passed to Reconcile is no longer usable")
 
 // resultKind is ReconcileResult's discriminant. Its zero names no kind, which
 // is what makes the zero ReconcileResult detectable.
@@ -264,10 +268,9 @@ func Fail(err error) ReconcileResult {
 	return ReconcileResult{kind: kindFail, err: err}
 }
 
-// normalize folds every unusable value into a failure. It runs once, in the
-// reconcile path, before anything reads the result: every gate downstream tests
-// for the kinds it admits, so an un-normalized zero would read as neither a
-// failure nor a success and slip through a negative test.
+// normalize folds every unusable value into a failure. Must run before anything
+// reads the result: an un-normalized zero satisfies no positive gate and is not
+// a failure either.
 func (r ReconcileResult) normalize() ReconcileResult {
 	if r.kind == kindInvalid {
 		return Fail(fmt.Errorf("%w: the zero value", ErrInvalidResult))
@@ -281,12 +284,14 @@ func (r ReconcileResult) normalize() ReconcileResult {
 // settles reports whether the pass recorded the generation it was handed.
 func (r ReconcileResult) settles() bool { return r.kind == kindSettled }
 
-// succeeded reports whether the pass ran to completion, settled or not. Every
-// post-reconcile write gates on this, naming the kinds it admits rather than
-// testing for the absence of a failure.
+// succeeded reports whether the pass ran to completion, settled or not. Names
+// the kinds it admits: a new kind must be added here deliberately.
 func (r ReconcileResult) succeeded() bool {
 	return r.kind == kindSettled || r.kind == kindUnsettled
 }
+
+// unsettled reports a successful pass that recorded no generation.
+func (r ReconcileResult) unsettled() bool { return r.kind == kindUnsettled }
 
 // Schedule reports when an object is next due to reconcile. A struct so fields
 // can be added without a breaking change.

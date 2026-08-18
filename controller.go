@@ -17,7 +17,6 @@ package beehive
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"sync/atomic"
 
 	"github.com/amorey/beehive/internal/storeapi"
@@ -120,6 +119,22 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	}
 	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
 		ctx, c.gk, id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
+}
+
+// stampObserved records raw's generation as observed, gated on the value the
+// row already carries so a converged pass makes no store call. That gate stands
+// in for the store's clamp only while observed_generation is monotonic — keep
+// SetObservedGeneration its sole writer. Unexported, and deliberately absent
+// from ControllerClient: the handshake is beehive's write.
+func (c *controllerClientImpl[Status]) stampObserved(ctx context.Context, raw *RawObject) error {
+	if raw.ObservedGeneration != nil && *raw.ObservedGeneration >= raw.Generation {
+		return nil
+	}
+	settled, err := c.bh.store.Objects().SetObservedGeneration(ctx, c.gk, raw.ID, raw.Generation)
+	if err != nil || !settled {
+		return err
+	}
+	return c.wakeAfter(ctx, nil)
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
@@ -247,27 +262,17 @@ func (c *controllerClientImpl[Status]) Within(ctx context.Context, fn func(ctx c
 	return c.bh.store.Within(ctx, fn)
 }
 
-// ErrReconcileReturned is returned by every method of the ControllerClient a
-// Reconcile was passed, once that Reconcile has returned. The client Register
-// hands back is the application's and is never scoped this way.
-var ErrReconcileReturned = errors.New("beehive: the ControllerClient passed to Reconcile is no longer usable")
-
-// scopedControllerClient is the ControllerClient one Reconcile is handed. It
-// delegates until the pass ends, then refuses everything: beehive concludes a
-// pass by stamping the generation it handed out, and a write arriving after
-// that moves status with no pass behind it, which nothing re-derives.
-//
-// A fail-fast, not a barrier. end() does not wait for calls already in flight,
-// so a sibling goroutine that got past the check runs to completion and may
-// commit either side of the stamp. Atomic because the caller it guards against
-// is concurrent by definition.
+// scopedControllerClient is the ControllerClient one Reconcile is handed: it
+// delegates until the pass ends, then refuses everything with
+// ErrReconcileReturned. A fail-fast, not a barrier — nothing waits for calls
+// already in flight. See docs/adr/2026-08-18-the-pass-client-dies-with-the-pass.md.
 type scopedControllerClient[Status any] struct {
 	inner *controllerClientImpl[Status]
 	done  atomic.Bool
 }
 
-// end closes the pass. Called once, immediately after Reconcile returns and
-// before beehive's own post-reconcile writes.
+// end closes the pass. Called once, after Reconcile returns and before
+// beehive's own post-reconcile writes.
 func (c *scopedControllerClient[Status]) end() { c.done.Store(true) }
 
 func (c *scopedControllerClient[Status]) live() error {

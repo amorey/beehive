@@ -1357,9 +1357,10 @@ func TestTypedControllerReconcileRawToTypedError(t *testing.T) {
 		return Settled(0)
 	}}
 	tc := &typedController[cSpec, cStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    bh,
-		inner: inner,
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  inner,
 	}
 	res, _, err := reconcilePass(tc, context.Background(), 1)
 	require.NoError(t, err, "an undecodable row must not retry forever")
@@ -1406,8 +1407,9 @@ func TestTypedControllerReconcileQuarantineKeepsReconcileOwed(t *testing.T) {
 	store := &owedBadSpecStore{}
 	bh := &Beehive{store: store}
 	tc := &typedController[cSpec, cStatus]{
-		gk: GroupKind{Kind: "Widget"},
-		bh: bh,
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
 		inner: &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 			return Settled(0)
 		}},
@@ -1485,9 +1487,10 @@ func TestTypedControllerReconcileRawToTypedErrorCollectError(t *testing.T) {
 		return Settled(0)
 	}}
 	tc := &typedController[cSpec, cStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    bh,
-		inner: inner,
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  inner,
 	}
 	_, _, err := reconcilePass(tc, context.Background(), 1)
 	require.ErrorIs(t, err, errBoom, "a failed collect on a poison deleting row must surface for retry")
@@ -1527,9 +1530,10 @@ func TestTypedControllerReconcileCollectErrorAfterASuccessfulPass(t *testing.T) 
 		return Settled(time.Minute)
 	}}
 	tc := &typedController[cSpec, cStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    bh,
-		inner: inner,
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[cStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  inner,
 	}
 
 	result, _, err := reconcilePass(tc, context.Background(), 1)
@@ -1562,9 +1566,10 @@ func TestTypedControllerReconcileGetObjectError(t *testing.T) {
 	bh := &Beehive{store: &getObjectErrorStore{}}
 	inner := &noopController[tSpec, tStatus]{}
 	tc := &typedController[tSpec, tStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    bh,
-		inner: inner,
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  inner,
 	}
 	_, _, err := reconcilePass(tc, context.Background(), 1)
 	require.Error(t, err)
@@ -1592,9 +1597,10 @@ func (s *notFoundStore) getForReconcileObjects(ctx context.Context, id ObjectID)
 func TestTypedControllerReconcileMissingIDIsTerminal(t *testing.T) {
 	bh := &Beehive{store: &notFoundStore{}}
 	tc := &typedController[tSpec, tStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    bh,
-		inner: &noopController[tSpec, tStatus]{},
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  &noopController[tSpec, tStatus]{},
 	}
 	// A gone object is a no-op success, not a retryable error: returning the error
 	// would retry the missing id forever on backoff.
@@ -1624,10 +1630,12 @@ func TestTypedControllerReconcilePropagatesControllerNotFound(t *testing.T) {
 	raw, err := s.Objects().Create(ctx, GroupKind{Kind: "Widget"}, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
 	require.NoError(t, err)
 
+	bh := &Beehive{store: s}
 	tc := &typedController[tSpec, tStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    &Beehive{store: s},
-		inner: notFoundReturningController{},
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  notFoundReturningController{},
 	}
 	// The object exists; only the controller returned ErrNotFound. It must surface
 	// so the worker retries, not be swallowed as a vanished-object no-op.
@@ -1657,10 +1665,12 @@ func TestTypedControllerReconcileDropsRequeueWhenCollected(t *testing.T) {
 	_, err = s.DeletionRequests().Create(ctx, GroupKind{Kind: "Widget"}, raw.ID)
 	require.NoError(t, err)
 
+	bh := &Beehive{store: s}
 	tc := &typedController[tSpec, tStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    &Beehive{store: s},
-		inner: requeueController{},
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  requeueController{},
 	}
 	// GC removes the unfinalized, deletion-pending row; the controller's
 	// RequeueAfter must be dropped so the worker doesn't reschedule a dead id.
@@ -1688,9 +1698,10 @@ func TestTypedControllerReconcile(t *testing.T) {
 	bh := &Beehive{store: s}
 	capCh := make(chan *Object[tSpec, tStatus], 1)
 	tc := &typedController[tSpec, tStatus]{
-		gk:    GroupKind{Kind: "Widget"},
-		bh:    bh,
-		inner: &reconcileCapture{ch: capCh},
+		gk:     GroupKind{Kind: "Widget"},
+		bh:     bh,
+		client: &controllerClientImpl[tStatus]{bh: bh, gk: GroupKind{Kind: "Widget"}},
+		inner:  &reconcileCapture{ch: capCh},
 	}
 	result, _, err := reconcilePass(tc, ctx, raw.ID)
 	require.NoError(t, err)
@@ -1774,10 +1785,6 @@ func wrapStore(s Store, wrap func(Store) Store) Store {
 // funcController the caller scripts. Nothing here starts a loop: reconcile is
 // called directly, so a pass's bookkeeping writes have landed by the time it
 // returns, which is what lets these tests assert on them without waiting.
-func newSyncControllerOn(s Store) (*typedController[cSpec, cStatus], *funcController) {
-	return newSyncController(s)
-}
-
 func newSyncController(s Store) (*typedController[cSpec, cStatus], *funcController) {
 	bh := &Beehive{store: s}
 	inner := &funcController{}
@@ -1801,9 +1808,7 @@ func newSyncController(s Store) (*typedController[cSpec, cStatus], *funcControll
 func reconcileOwedHarness(t *testing.T, wrap func(Store) Store) (*typedController[cSpec, cStatus], *funcController, ObjectID, func(*testing.T) int64, func() error) {
 	t.Helper()
 	ctx := context.Background()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
+	s := newClientTestStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -3695,9 +3700,7 @@ func TestReconcilerTreatsAnUnusableResultAsAFailure(t *testing.T) {
 // it, and nothing would reconcile it again.
 func TestReconcileStampsTheGenerationItHandedOut(t *testing.T) {
 	ctx := context.Background()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
+	s := newClientTestStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -3731,9 +3734,7 @@ func TestReconcileStampsTheGenerationItHandedOut(t *testing.T) {
 // gate is what keeps the steady state off the store's single connection.
 func TestReconcileConvergedPassMakesNoStampCall(t *testing.T) {
 	ctx := context.Background()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
+	s := newClientTestStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -3742,13 +3743,12 @@ func TestReconcileConvergedPassMakesNoStampCall(t *testing.T) {
 
 	var calls int
 	probe := &objectsOverrideStore{Store: s}
-	probe.override.Objects = s.Objects()
 	probe.override.setObservedGen = func(ctx context.Context, gk GroupKind, id ObjectID, gen int64) (bool, error) {
 		calls++
 		return s.Objects().SetObservedGeneration(ctx, gk, id, gen)
 	}
 
-	tc, inner := newSyncControllerOn(probe)
+	tc, inner := newSyncController(probe)
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		return Settled(0)
 	}
@@ -3766,9 +3766,7 @@ func TestReconcileConvergedPassMakesNoStampCall(t *testing.T) {
 // generation: the object stays in the unsettled listing until it converges.
 func TestReconcileUnsettledDoesNotStamp(t *testing.T) {
 	ctx := context.Background()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
+	s := newClientTestStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -3793,9 +3791,7 @@ func TestReconcileUnsettledDoesNotStamp(t *testing.T) {
 // retry a pass that already committed its writes.
 func TestReconcileFailedStampDoesNotFailThePass(t *testing.T) {
 	ctx := context.Background()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
+	s := newClientTestStore(t)
 
 	specJSON, err := json.Marshal(cSpec{})
 	require.NoError(t, err)
@@ -3803,11 +3799,10 @@ func TestReconcileFailedStampDoesNotFailThePass(t *testing.T) {
 	require.NoError(t, err)
 
 	probe := &objectsOverrideStore{Store: s}
-	probe.override.Objects = s.Objects()
 	probe.override.setObservedGen = func(context.Context, GroupKind, ObjectID, int64) (bool, error) {
 		return false, errBoom
 	}
-	tc, inner := newSyncControllerOn(probe)
+	tc, inner := newSyncController(probe)
 	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		return Settled(0)
 	}
@@ -3823,26 +3818,14 @@ func TestReconcileFailedStampDoesNotFailThePass(t *testing.T) {
 // never a settled object whose watermark never landed.
 func TestReconcileWritesTheWatermarkBeforeTheStamp(t *testing.T) {
 	ctx := context.Background()
-	s, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
-
-	specJSON, err := json.Marshal(cSpec{})
-	require.NoError(t, err)
-	dep, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
-	require.NoError(t, err)
-	target, err := s.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{Name: uniqueName(), Spec: specJSON})
-	require.NoError(t, err)
-	_, err = s.Edges().Add(ctx, dep.ID, target.ID, RelationDependsOn)
-	require.NoError(t, err)
-
 	var order []string
-	probe := &orderProbeStore{Store: s, record: func(s string) { order = append(order, s) }}
-	tc, inner := newSyncControllerOn(probe)
-	inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+	h := newWatermarkHarness(t, func(s Store) Store {
+		return &orderProbeStore{Store: s, record: func(s string) { order = append(order, s) }}
+	})
+	h.inner.fn = func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
 		return Settled(0)
 	}
-	_, _, err = reconcilePass(tc, ctx, dep.ID)
+	_, _, err := reconcilePass(h.tc, ctx, h.dep)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"watermark", "stamp"}, order)

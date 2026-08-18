@@ -2002,26 +2002,13 @@ func (s *orderProbeStore) Objects() storeapi.Objects {
 }
 
 func (s *orderProbeStore) Dependencies() storeapi.Dependencies {
-	return dependenciesOverride{
+	return depsOverride{
 		Dependencies: s.Store.Dependencies(),
 		watermarkSet: func(ctx context.Context, id ObjectID, cursor int64) error {
 			s.record("watermark")
 			return s.Store.Dependencies().WatermarkSet(ctx, id, cursor)
 		},
 	}
-}
-
-// dependenciesOverride replaces the hooks that are set and delegates the rest.
-type dependenciesOverride struct {
-	storeapi.Dependencies
-	watermarkSet func(context.Context, ObjectID, int64) error
-}
-
-func (o dependenciesOverride) WatermarkSet(ctx context.Context, id ObjectID, cursor int64) error {
-	if o.watermarkSet != nil {
-		return o.watermarkSet(ctx, id, cursor)
-	}
-	return o.Dependencies.WatermarkSet(ctx, id, cursor)
 }
 
 // settleRow records id's current generation as observed, which is beehive's

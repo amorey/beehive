@@ -332,14 +332,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   what the controller last settled. Byte-identical writes are skipped, which is
   what stops a controller re-applying its own spec from waking itself forever.
   `Reconcile` returns `Settled`/`Unsettled`/`Fail` and beehive stamps
-  `observed_generation` from **the object it handed out**, never a fresh read —
-  a spec change landing mid-pass must stay unobserved or nothing reconciles it
-  again. The stamp is gated in memory on the loaded value, so a converged pass
-  makes no store call; that gate is equivalent to the store's clamp **only
-  because `observed_generation` is monotonic**, which holds because
-  `advanceObserved` is its sole writer. `UpdateStatus` writes status alone. The
-  stamp lands after the dependency watermark and before GC, and a failure only
-  leaves the object unsettled.
+  `observed_generation` from **the object it handed out**, never a fresh read.
+  `UpdateStatus` writes status alone, which is what leaves
+  `Objects().SetObservedGeneration` the sole writer of that column.
   → [ADR](docs/adr/2026-08-18-beehive-owns-the-generation-handshake.md)
 - **The `ControllerClient` passed to `Reconcile` dies with the pass.** Every
   method fails with `ErrReconcileReturned` once it returns, because beehive
