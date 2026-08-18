@@ -14,7 +14,9 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-No spec is in flight.
+In flight:
+
+- [RequeueAfter and Err on ReconcileResult](2026-08-18-reconcile-result-requeue-after-and-err.md)
 
 The last spec shipped as
 [a ControllerClient existing only for the pass it is handed to](../adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).
