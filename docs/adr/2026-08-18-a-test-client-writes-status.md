@@ -25,9 +25,14 @@ external package cannot name.
 `NewTestClient[Status](bh, gk)` returns a `*TestClient[Status]` with
 `UpdateStatus`, `SetCondition`, `SetConditions` and `DeleteCondition` — the pass
 client's status half, minus `AddEvent`. It needs no registered controller and no
-running beehive, and it writes through the same `kindWriter` a pass does, so the
-schema version and the commit wake are resolved in one place and it is correct on
-both sides of `Start`.
+running beehive.
+
+**It holds a `ControllerClient` nothing ever ends.** `controllerClientImpl`'s
+`live()` gate only closes when the reconcile loop calls `end()`, so a client
+built outside a pass stays open, and the four verbs are forwarded unchanged. The
+schema version, the condition conversion and the commit wake therefore have one
+implementation rather than a parallel one, and there is nothing to keep in step
+as those writes change.
 
 **It is the last resort, not the first.** A controller test that needs only the
 object it is handed should call `Reconcile` directly against a fake
@@ -60,9 +65,9 @@ fixture parking state on an object its controller is actively settling sequences
 that itself.
 
 Two names join the root package's godoc, which is the price of not having a
-package name to hide behind. In exchange the `Condition` conversion is shared
-with the pass client (`conditionsToRaw`) rather than copied across a package
-boundary, which is what a sub-package forced.
+package name to hide behind. In exchange the write path is the pass client's
+own: a sub-package forced a parallel implementation of every write, plus the
+seam to reach it.
 
 `AddEvent` is deliberately absent — appending to an event log out of band is the
 capability the pass-client change removed rather than relocated, and it stays in

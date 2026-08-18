@@ -20,14 +20,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"io/fs"
 	"log/slog"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime/pprof"
 	"slices"
 	"strings"
@@ -2047,26 +2042,4 @@ func waitSettled(t *testing.T, ctx context.Context, client Client[cSpec, cStatus
 		return *o.ObservedGeneration == o.Generation
 	}, testTimeout, time.Millisecond, "beehive to record the generation the pass settled")
 	return got
-}
-
-// forEachSourceFile parses every non-test .go file in the module and hands each
-// to fn. The structural tripwires share it so "which files count as source"
-// has one definition: a walk that quietly stopped covering sqlite/ would weaken
-// a tripwire without failing anything.
-func forEachSourceFile(t *testing.T, fn func(path string, file *ast.File)) {
-	t.Helper()
-	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
-		if err != nil {
-			return err
-		}
-		fn(path, file)
-		return nil
-	}))
 }

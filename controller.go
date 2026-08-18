@@ -96,14 +96,11 @@ type controllerClientImpl[Status any] struct {
 	done atomic.Bool
 }
 
-// newPassClient builds the client for one pass, and is the only constructor.
+// newPassClient is the only constructor. The pass ends its client; TestClient
+// holds one that is never ended, so live() always passes there.
 func newPassClient[Status any](bh *Beehive, gk GroupKind) *controllerClientImpl[Status] {
 	return &controllerClientImpl[Status]{bh: bh, gk: gk}
 }
-
-// writes is the client's kind-scoped write core. Derived rather than stored: a
-// second copy of bh and gk is a second thing to keep in step.
-func (c *controllerClientImpl[Status]) writes() kindWriter { return kindWriter{c.bh, c.gk} }
 
 // Called once, after Reconcile returns and before beehive's own writes.
 func (c *controllerClientImpl[Status]) end() { c.done.Store(true) }
@@ -122,57 +119,20 @@ func (c *controllerClientImpl[Status]) live() error {
 // Each mutator self-wraps in Within, joining the controller's own Within when
 // nested.
 
-// kindWriter is the non-generic core of a write to one kind: the store call and
-// the watch wake that must follow it. The pass client and the beehivetest seam
-// both write through it, so the wake obligation is discharged in one place.
-type kindWriter struct {
-	bh *Beehive
-	gk GroupKind
-}
-
 // wakeAfter returns a store write's error, waking the kind's watches when the
-// write succeeded. Every write that appends to the object write log ends with
-// it: forgetting the wake costs staleness rather than a failure, so nothing
+// write succeeded. Every mutator here that appends to the object write log ends
+// with it: forgetting the wake costs staleness rather than a failure, so nothing
 // else would catch it — up to the watch floor for a subscriber, and up to the
 // stale-dependents pass for a dependent, since the waker has no tick behind it.
 //
 // AddEvent is the one that does not, and must not: an event bumps no
 // resource_version, so it appends no entry for a watch to read.
-func (w kindWriter) wakeAfter(ctx context.Context, err error) error {
+func (c *controllerClientImpl[Status]) wakeAfter(ctx context.Context, err error) error {
 	if err != nil {
 		return err
 	}
-	w.bh.signalKindWritten(ctx, w.gk)
+	c.bh.signalKindWritten(ctx, c.gk)
 	return nil
-}
-
-// conditionsToRaw is the write-side conversion. Unconfirmed and the two stamps
-// are set by the store on read and ignored on write, so they are not carried.
-func conditionsToRaw(conditions []Condition) []storeapi.Condition {
-	conds := make([]storeapi.Condition, len(conditions))
-	for i, condition := range conditions {
-		conds[i] = storeapi.Condition{
-			Type:     condition.Type,
-			Status:   string(condition.Status),
-			Reason:   condition.Reason,
-			Message:  condition.Message,
-			Liveness: condition.Liveness,
-		}
-	}
-	return conds
-}
-
-func (w kindWriter) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
-	return w.wakeAfter(ctx, w.bh.store.Conditions().Delete(ctx, w.gk, id, conditionType))
-}
-
-func (w kindWriter) SetConditions(ctx context.Context, id ObjectID, conds ...storeapi.Condition) error {
-	return w.wakeAfter(ctx, w.bh.store.Conditions().Set(ctx, w.gk, id, conds...))
-}
-
-func (w kindWriter) UpdateStatus(ctx context.Context, id ObjectID, status []byte) error {
-	return w.wakeAfter(ctx, w.bh.store.Objects().UpdateStatus(
-		ctx, w.gk, id, status, migratorStatusVersion(w.bh.migratorFor(w.gk))))
 }
 
 func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
@@ -183,7 +143,8 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id Obje
 	if err != nil {
 		return err
 	}
-	return c.writes().UpdateStatus(ctx, id, b)
+	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
+		ctx, c.gk, id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {
@@ -197,14 +158,24 @@ func (c *controllerClientImpl[Status]) SetConditions(ctx context.Context, id Obj
 	if len(conditions) == 0 {
 		return nil
 	}
-	return c.writes().SetConditions(ctx, id, conditionsToRaw(conditions)...)
+	conds := make([]storeapi.Condition, len(conditions))
+	for i, condition := range conditions {
+		conds[i] = storeapi.Condition{
+			Type:     condition.Type,
+			Status:   string(condition.Status),
+			Reason:   condition.Reason,
+			Message:  condition.Message,
+			Liveness: condition.Liveness,
+		}
+	}
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Set(ctx, c.gk, id, conds...))
 }
 
 func (c *controllerClientImpl[Status]) DeleteCondition(ctx context.Context, id ObjectID, conditionType string) error {
 	if err := c.live(); err != nil {
 		return err
 	}
-	return c.writes().DeleteCondition(ctx, id, conditionType)
+	return c.wakeAfter(ctx, c.bh.store.Conditions().Delete(ctx, c.gk, id, conditionType))
 }
 
 func (c *controllerClientImpl[Status]) AddEvent(ctx context.Context, id ObjectID, event EventSpec) error {
@@ -239,7 +210,7 @@ func (c *controllerClientImpl[Status]) DeleteFinalizer(ctx context.Context, id O
 		return err
 	}
 	clearedLast, err := c.bh.store.Objects().DeleteFinalizer(ctx, c.gk, id, finalizer)
-	if err := c.writes().wakeAfter(ctx, err); err != nil {
+	if err := c.wakeAfter(ctx, err); err != nil {
 		return err
 	}
 	if clearedLast {

@@ -365,8 +365,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   rather than a `beehivetest` sub-package: a sub-package cannot reach `bh.store`
   or the write hub, so it would need a seam, and the seam buys only a package
   name to hide the warning in — the constructor is exported either way. It
-  writes through the same `kindWriter` a pass does, so the schema version and the
-  commit wake have one site, and it never stamps `observed_generation`.
+  holds a `ControllerClient` nothing ever ends — `live()` closes only when the
+  reconcile loop calls `end()` — so the writes have one implementation, and it
+  never stamps `observed_generation`.
   → [ADR](docs/adr/2026-08-18-a-test-client-writes-status.md)
 - **A downgraded liveness condition says so.** `downgradeLiveness` sets
   `Condition.Unconfirmed` beside the `Unknown` rewrite, because the predicate
