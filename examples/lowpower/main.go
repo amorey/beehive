@@ -57,7 +57,7 @@ func (c *PanelController) Reconcile(ctx context.Context, client beehive.Controll
 	if obj.DeletionRequestedAt != nil || (obj.Status != nil && obj.Status.Connected) {
 		return beehive.Settled()
 	}
-	if err := client.UpdateStatus(ctx, obj.ID, PanelStatus{Connected: true}); err != nil {
+	if err := client.UpdateStatus(ctx, PanelStatus{Connected: true}); err != nil {
 		return beehive.Fail(err)
 	}
 	return beehive.Settled()

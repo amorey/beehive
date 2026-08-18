@@ -72,7 +72,7 @@ func (c *ClusterController) Reconcile(ctx context.Context, client beehive.Contro
 		// Hold the connection open while any cache still has a live claim on us.
 		// HasIncomingEdges ignores caches that are themselves finalizing, so this clears
 		// once the owned caches are gone — not merely marked for deletion.
-		referenced, err := client.HasIncomingEdges(ctx, obj.ID)
+		referenced, err := client.HasIncomingEdges(ctx)
 		if err != nil {
 			return beehive.Fail(err)
 		}
@@ -81,14 +81,14 @@ func (c *ClusterController) Reconcile(ctx context.Context, client beehive.Contro
 			return beehive.Settled()
 		}
 		fmt.Printf("Cluster %d: closed connection; releasing finalizer\n", obj.ID)
-		if err := client.DeleteFinalizer(ctx, obj.ID, connectionFinalizer); err != nil {
+		if err := client.DeleteFinalizer(ctx, connectionFinalizer); err != nil {
 			return beehive.Fail(err)
 		}
 		return beehive.Settled()
 	}
 
 	if obj.Status == nil || !obj.Status.Connected {
-		if err := client.UpdateStatus(ctx, obj.ID, ClusterStatus{Connected: true}); err != nil {
+		if err := client.UpdateStatus(ctx, ClusterStatus{Connected: true}); err != nil {
 			return beehive.Fail(err)
 		}
 		return beehive.Settled()
@@ -103,14 +103,14 @@ type ClusterCacheController struct{}
 func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) beehive.ReconcileResult {
 	if obj.DeletionRequestedAt != nil {
 		fmt.Printf("ClusterCache %d: flushed local cache; releasing finalizer\n", obj.ID)
-		if err := client.DeleteFinalizer(ctx, obj.ID, cacheFlushFinalizer); err != nil {
+		if err := client.DeleteFinalizer(ctx, cacheFlushFinalizer); err != nil {
 			return beehive.Fail(err)
 		}
 		return beehive.Settled()
 	}
 
 	if obj.Status == nil {
-		if err := client.UpdateStatus(ctx, obj.ID, ClusterCacheStatus{Entries: 42}); err != nil {
+		if err := client.UpdateStatus(ctx, ClusterCacheStatus{Entries: 42}); err != nil {
 			return beehive.Fail(err)
 		}
 		return beehive.Settled()

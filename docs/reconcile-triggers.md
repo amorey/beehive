@@ -52,7 +52,7 @@ can be read.
 | Push path | Made by | Starts | Gate |
 |---|---|---|---|
 | A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
-| A new edge enqueues the edge's source | `ControllerClient.AddDependency` | the source of the new `depends_on` edge | `EdgesAddResult.ReconcileOwedStamped` |
+| A new edge enqueues the edge's source | `ControllerClient.AddDependency` | the declaring pass's own object | `EdgesAddResult.ReconcileOwedStamped` |
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
 | A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |
 | A cleared finalizer enqueues its own object | `ControllerClient.DeleteFinalizer` | the object whose block it lifted | the store reports `clearedLast` |
@@ -324,7 +324,7 @@ is what the stamp is for.
 **Tests:** `TestDependencyRequeueLostAcrossRestart` (run under
 `WithStartupFullPass(false)`, so the full pass cannot hide the result),
 `TestEdgesAddStampsReconcileOwed`, `TestRefsAddStampsOnlyNewEdge`,
-`TestAddDependencyEnqueueRoutesByTheSourcesKind`,
+`TestDependencyVerbsBindTheSource`,
 `TestANewEdgeOnAnInFlightSourceRespectsTheBackoff`,
 `TestReconcileMidPassDeclareLeavesTheDependentOwed`.
 
@@ -647,7 +647,7 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 `TestIntegrationDroppedDependencyCollectsWithoutThePush`,
 `TestObjects().DeleteFinalizerPushesTheCollect`,
 `TestObjects().DeleteFinalizerPushesNothingOtherwise`,
-`TestIntegrationClearedFinalizerCollectsWithoutASweep`,
+`TestDeleteFinalizerTargetsThePassObject`,
 `TestIntegrationClearedFinalizerCollectsWithoutThePush`,
 `TestPhysicalDeletePushesItsOwner`, `TestPhysicalDeletePushBeatsAPendingAlarm`,
 `TestPhysicalDeletePushesNoLiveOwner`, `TestPhysicalDeletePushesNothingWhenBlocked`,

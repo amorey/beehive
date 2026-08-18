@@ -97,14 +97,14 @@ func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.Contr
 				detail = p.Detail
 			}
 			for range p.Count {
-				if err := client.AddEvent(ctx, obj.ID, beehive.EventSpec{
+				if err := client.AddEvent(ctx, beehive.EventSpec{
 					Category: "connection", Type: p.Type, Reason: p.Reason, Message: p.Message, Detail: detail,
 				}); err != nil {
 					return err
 				}
 			}
 		}
-		return client.UpdateStatus(ctx, obj.ID, ClusterStatus{
+		return client.UpdateStatus(ctx, ClusterStatus{
 			Reachable:        reachable,
 			ProbedGeneration: obj.Generation,
 		})

@@ -145,11 +145,10 @@ level-triggered controller re-asserts its whole dependency set on every pass, so
 an ungated enqueue would schedule a pass per pass. The hook is `Store.AfterCommit`,
 so a rollback or a savepoint unwind discards it.
 
-**The routing is what differs.** A spec write is always to the client's own kind. An
-edge is deliberately cross-kind, so the enqueue routes by `EdgesAddResult.From` —
-`fromID`'s own kind, which the store also uses for the durable stamp. Routing by the
-caller's kind would reach the wrong reconciler, or none.
-`TestAddDependencyEnqueueRoutesByTheSourcesKind` is the only test that catches it.
+**Both enqueue their own kind.** A spec write is always to the client's own kind, and
+a declare is always from the pass's own object, so an edge — cross-kind at its far
+end — still enqueues the source through the client's own reconciler.
+`TestDependencyVerbsBindTheSource` pins the source.
 
 ### The backoff ladder now survives a non-converging edge set
 

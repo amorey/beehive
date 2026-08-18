@@ -145,8 +145,8 @@ type Client[Spec, Status any] interface {
 	//
 	// This, ListEvents and WatchEvents all read by id and are not kind-scoped: an
 	// event carries no kind of its own, so any id's log reads through any client.
-	// The write is the asymmetry — ControllerClient.AddEvent is scoped to its own
-	// kind and returns ErrWrongKind.
+	// The write is the asymmetry — ControllerClient.AddEvent appends to the
+	// object its pass was handed and takes no id at all.
 	GetLatestEvent(ctx context.Context, id ObjectID, category string) (Event, bool, error)
 	// GetOrCreate returns the object with the given name, creating it from spec
 	// if absent. It NEVER mutates an existing row: a name held by a live or

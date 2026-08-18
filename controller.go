@@ -22,9 +22,11 @@ import (
 	"github.com/amorey/beehive/internal/storeapi"
 )
 
-// ErrWrongKind is returned by a ControllerClient write whose target id belongs
-// to another kind. The store folds the controller's kind into every write, so a
-// wrong id fails loudly instead of corrupting another kind's row.
+// ErrWrongKind is returned by an id-keyed write whose target belongs to another
+// kind. The store folds the caller's kind into every write, so a wrong id fails
+// loudly instead of corrupting another kind's row. A ControllerClient cannot
+// raise it — it is bound to its own object — and Client reports it as
+// ErrNotFound, which leaves TestClient the only surface that returns it.
 var ErrWrongKind = storeapi.ErrWrongKind
 
 // Controller is the user-supplied reconcile logic for a resource kind.
@@ -120,10 +122,9 @@ func (c *controllerClientImpl[Status]) live() error {
 	return nil
 }
 
-// The store folds the controller's kind into each write below, so another
-// kind's id is rejected with ErrWrongKind and a missing id with ErrNotFound.
-// Each mutator self-wraps in Within, joining the controller's own Within when
-// nested.
+// The store folds the controller's kind into each write below; a missing id is
+// ErrNotFound, which is what a row collected mid-pass reads as. Each mutator
+// self-wraps in Within, joining the controller's own Within when nested.
 
 // wakeAfter returns a store write's error, waking the kind's watches when the
 // write succeeded. Every mutator here that appends to the object write log ends

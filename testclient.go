@@ -22,8 +22,8 @@ import "context"
 // other way to write.
 //
 // It writes through a ControllerClient nothing ever ends, so every verb below
-// means exactly what it means during a pass. A ControllerClient is bound to one
-// object, so the id each verb takes builds one.
+// means exactly what it means during a pass. A pass client is bound to one
+// object, so the id each verb takes is what builds one.
 // See docs/adr/2026-08-18-a-test-client-writes-status.md.
 type TestClient[Status any] struct {
 	bh *Beehive

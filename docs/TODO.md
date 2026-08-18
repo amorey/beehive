@@ -417,14 +417,16 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   registering the kind is a one-line workaround and the requirement documents
   itself.
 
-- **An application cannot append to an event log outside a reconcile pass** —
-  removed deliberately, with
-  [Register handing back nothing](adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).
-  `AddEvent` lives on the `ControllerClient`, which now exists only for the pass
-  it is handed to, so a background prober — an ordinary app goroutine watching a
+- **Nothing can append to an event log except the object's own pass** — removed
+  deliberately, in two steps, both under
+  [the pass-scoped client](adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).
+  `AddEvent` lives on the `ControllerClient`, which exists only for the pass it is
+  handed to, so a background prober — an ordinary app goroutine watching a
   connection — has no way to record what it saw. It has to hold the outcome in
   memory and call `Client.Requeue`, which is a round trip through the work queue
-  for a write that settles nothing.
+  for a write that settles nothing. Binding the client then took the second half:
+  a pass can no longer append to a *related* object's log either, so a controller
+  that observes a child reports it on its own timeline or not at all.
 
   The argument that took the client away does not reach `AddEvent`: an event
   bumps no `resource_version` and is invisible to the handshake, so an out-of-band
@@ -432,13 +434,34 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   client, and carving one method out would restore the which-half-works table that
   scoping the client exists to avoid.
 
-  The fix is `Client.AddEvent`, kind-scoped like the `ControllerClient` verb and
-  sitting beside the three event reads already there. What it needs first is a
+  The fix is `Client.AddEvent`, id-keyed and kind-scoped, sitting beside the three
+  event reads already there. It closes both halves at once. What it needs first is a
   decision, not code: `Client` writing something only a controller may write
   crosses a line this package has held, and "only controllers write events"
   (`README.md`) would have to become a sentence about passes instead. What would
   make it worth doing: an application whose observations genuinely arrive between
   passes — a prober, a subscription — rather than during one.
+
+- **Only a dependent's own pass can declare or drop its `depends_on` edges** —
+  the other half of binding the client to its pass object. `Edges().Add` with
+  `RelationDependsOn` has one non-test caller, and `Client` has no
+  `AddDependency`, so a kind with no controller can never be the *source* of an
+  edge (it is still fine as a target: the waker scans the whole write log). The
+  drop binds the same way, so an edge left in a store by an earlier build, whose
+  source is a client-only kind, cannot be removed through the package at all — it
+  pins its target against collection through the RESTRICT for good. What would
+  make this worth closing: a store that actually carries such an edge, or an
+  application that declares dependencies for objects it does not reconcile. The
+  fix is the same shape as the `AddEvent` one — id-keyed edge verbs on `Client` —
+  and runs into the same question about what `Client` may write.
+
+- **`HasIncomingEdges` has no `Client` counterpart.** The other four edge reads
+  moved to the pass's own object with an id-keyed twin already on `Client`; this
+  one did not, so "does anything with a live claim still point at this object?"
+  is answerable only from inside that object's pass. It folds owned children in
+  with dependents, so it cannot be rebuilt from `ListDependents`. What would make
+  it worth adding: a caller outside a pass that has to make the GC-blocking
+  question itself, rather than gating a finalizer on it.
 
 - **The store-side tests still spell pre-accessor method names in prose and test
   names** — `sqlite/store_test.go` and `internal/storeapi/storeapi_test.go` carry
