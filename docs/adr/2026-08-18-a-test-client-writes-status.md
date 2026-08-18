@@ -27,12 +27,19 @@ external package cannot name.
 client's status half, minus `AddEvent`. It needs no registered controller and no
 running beehive.
 
-**It holds a `ControllerClient` nothing ever ends.** `controllerClientImpl`'s
+**It builds a `ControllerClient` nothing ever ends.** `controllerClientImpl`'s
 `live()` gate only closes when the reconcile loop calls `end()`, so a client
-built outside a pass stays open, and the four verbs are forwarded unchanged. The
+built outside a pass stays open, and the four verbs are forwarded to one. The
 schema version, the condition conversion and the commit wake therefore have one
 implementation rather than a parallel one, and there is nothing to keep in step
 as those writes change.
+
+**It keeps its `ObjectID` arguments**, which is why it builds a client per call
+rather than holding one: a pass client is
+[bound to its object](2026-08-18-a-controller-client-exists-only-for-a-pass.md)
+and cannot take an id. A fixture writes for whatever object it is seeding, so the
+id belongs in the signature here. It also leaves `TestClient` the only surface
+that can return `ErrWrongKind`.
 
 **It is the last resort, not the first.** A controller test that needs only the
 object it is handed should call `Reconcile` directly against a fake
