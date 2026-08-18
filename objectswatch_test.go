@@ -155,7 +155,7 @@ func TestWatchSeesASettleWithNoStatus(t *testing.T) {
 
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store, fast()...)
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -164,7 +164,11 @@ func TestWatchSeesASettleWithNoStatus(t *testing.T) {
 	stream, err := client.WatchList(ctx)
 	require.NoError(t, err)
 
-	require.NoError(t, cc.SetObservedGeneration(ctx, obj.ID, obj.Generation))
+	// The handshake write is beehive's, so drive it through the store: what this
+	// test watches for is the emit it produces.
+	_, err = bh.store.Objects().SetObservedGeneration(ctx, clientTestGK, obj.ID, obj.Generation)
+	require.NoError(t, err)
+	bh.signalKindWritten(ctx, clientTestGK)
 
 	ev := recv(t, stream.Changes)
 	assert.Equal(t, Modified, ev.Type)
@@ -1436,7 +1440,7 @@ func TestKindWriteHubPublishesOnEveryWrite(t *testing.T) {
 			name:  "update status",
 			setup: create("status"),
 			write: func(t *testing.T, ctx context.Context, w *writeWorld, id ObjectID) {
-				require.NoError(t, w.ctrl.UpdateStatus(ctx, id, 1, cStatus{Val: "ok"}))
+				require.NoError(t, w.ctrl.UpdateStatus(ctx, id, cStatus{Val: "ok"}))
 			},
 		},
 		{

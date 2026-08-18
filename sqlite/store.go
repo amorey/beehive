@@ -1486,35 +1486,24 @@ func checkObservedGeneration(observedGeneration int64) error {
 
 // Objects().UpdateStatus skips the status write when the incoming bytes equal the stored
 // ones at the same schema version: no resource_version bump, so no spurious
-// watch diff or dependent wake. A content no-op that advances the generation
-// handshake still writes observed_generation/observed_at and bumps
+// watch diff or dependent wake. It is not a handshake write and bumps
 // resource_version — settling at a new generation is a real transition, and it
 // fires at most once per generation. Identical status with the generation
 // already recorded writes nothing at all.
-func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, observedGeneration int64, status []byte, statusVersion int) error {
-	if err := checkObservedGeneration(observedGeneration); err != nil {
-		return err
-	}
+func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, status []byte, statusVersion int) error {
 	// Within keeps the read-compare-write atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary while doubling as the compare's load
-		// — four columns, not the row: the spec blob and the finalizer list are no
-		// part of a status write.
+		// — two columns, not the row: the spec blob and the finalizer list are no
+		// part of a status write, and the handshake is no part of it either.
 		var (
-			generation    int64
-			observedGen   sql.NullInt64
 			storedVersion int
 			storedStatus  []byte
 		)
 		if err := s.selectScoped(ctx, gk, id,
-			`generation, observed_generation, schema_version_status, status`,
-			&generation, &observedGen, &storedVersion, &storedStatus); err != nil {
-			return err
-		}
-		// A future generation would falsely settle the object once its spec caught
-		// up. An older one is fine (spec changed mid-reconcile).
-		if err := checkObservedNotFuture(observedGeneration, generation, id); err != nil {
+			`schema_version_status, status`,
+			&storedVersion, &storedStatus); err != nil {
 			return err
 		}
 		// Never downward — see stampVersion.
@@ -1523,27 +1512,20 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 			return err
 		}
 		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
-			// Content no-op: write only the bookkeeping, and only if it would move.
-			// The handshake advancing is watch-visible even with identical bytes.
-			_, err := s.advanceObserved(ctx, c, gk, id, observedGen, observedGeneration)
-			return err
+			// Content no-op: nothing to write, so no version bump and no wake.
+			return nil
 		}
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
 			return err
 		}
-		// observedGeneration lands verbatim, unclamped: a stale reporter just
-		// overwrote the status, and its generation marking the object unsettled is
-		// what gets that content re-derived. Not advanceObserved, deliberately —
-		// that clamps, and routing through it would delete this behavior. Keyed on id
-		// alone: the kind boundary came from the scoped read in this transaction —
-		// keep the read if you move this statement.
+		// Keyed on id alone: the kind boundary came from the scoped read in this
+		// transaction — keep the read if you move this statement.
 		_, err = c.ExecContext(ctx, `
 			UPDATE objects
-			SET status = ?, schema_version_status = ?, observed_generation = ?, observed_at = ?,
-			    resource_version = ?, updated_at = ?
+			SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
 			WHERE id = ?`,
-			jsonText(status), stamp, observedGeneration, now, rv, now, id)
+			jsonText(status), stamp, rv, now, id)
 		return err
 	})
 }

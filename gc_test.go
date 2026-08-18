@@ -799,8 +799,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// which the startup resumption of owed work would pick up as unsettled — the row
 	// would then be removed for two reasons and this test would stop pinning either
 	// one. Deletion does not bump generation, so the row stays settled below.
-	err = store.Objects().UpdateStatus(ctx, clientTestGK, raw.ID, raw.Generation, []byte(`{}`), 0)
-	require.NoError(t, err)
+	settleRow(t, ctx, store, clientTestGK, raw.ID)
 	_, err = store.DeletionRequests().Create(ctx, clientTestGK, raw.ID)
 	require.NoError(t, err)
 

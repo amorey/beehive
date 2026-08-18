@@ -780,7 +780,7 @@ func (fakeObjects) UpdateSpecByName(context.Context, GroupKind, string, []byte, 
 	panic("not implemented: fakeStore.Objects().UpdateSpecByName")
 }
 
-func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, int64, []byte, int) error {
+func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, []byte, int) error {
 	panic("not implemented: fakeStore.Objects().UpdateStatus")
 }
 
@@ -807,7 +807,7 @@ type objectsOverride struct {
 	delete             func(context.Context, ObjectID) error
 	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
 	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
-	updateStatus       func(context.Context, GroupKind, ObjectID, int64, []byte, int) error
+	updateStatus       func(context.Context, GroupKind, ObjectID, []byte, int) error
 	setObservedGen     func(context.Context, GroupKind, ObjectID, int64) (bool, error)
 }
 
@@ -902,11 +902,11 @@ func (o objectsOverride) GetByName(ctx context.Context, gk GroupKind, name strin
 	return o.Objects.GetByName(ctx, gk, name)
 }
 
-func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, observed int64, status []byte, version int) error {
+func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte, version int) error {
 	if o.updateStatus != nil {
-		return o.updateStatus(ctx, gk, id, observed, status, version)
+		return o.updateStatus(ctx, gk, id, status, version)
 	}
-	return o.Objects.UpdateStatus(ctx, gk, id, observed, status, version)
+	return o.Objects.UpdateStatus(ctx, gk, id, status, version)
 }
 
 func (s *fakeStore) Conditions() storeapi.Conditions { return fakeConditions{} }
@@ -2022,4 +2022,15 @@ func (o dependenciesOverride) WatermarkSet(ctx context.Context, id ObjectID, cur
 		return o.watermarkSet(ctx, id, cursor)
 	}
 	return o.Dependencies.WatermarkSet(ctx, id, cursor)
+}
+
+// settleRow records id's current generation as observed, which is beehive's
+// write rather than a client's. Tests that need a settled row as a
+// precondition — without standing up a reconcile loop to produce one — use it.
+func settleRow(t *testing.T, ctx context.Context, store Store, gk GroupKind, id ObjectID) {
+	t.Helper()
+	raw, err := store.Objects().GetMeta(ctx, id)
+	require.NoError(t, err)
+	_, err = store.Objects().SetObservedGeneration(ctx, gk, id, raw.Generation)
+	require.NoError(t, err)
 }

@@ -1604,7 +1604,7 @@ func TestTheWakerSeedReachesTheDatabase(t *testing.T) {
 type settlingCapture struct{ ch chan ObjectID }
 
 func (c *settlingCapture) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{}); err != nil {
+	if err := cc.UpdateStatus(ctx, obj.ID, cStatus{}); err != nil {
 		return Fail(err)
 	}
 	c.ch <- obj.ID

@@ -71,19 +71,11 @@ type ControllerClient[Status any] interface {
 	// twice is refused with ErrDuplicateConditionType; an empty slice writes
 	// nothing. Same stamping as SetCondition.
 	SetConditions(ctx context.Context, id ObjectID, conditions []Condition) error
-	// SetObservedGeneration records the generation this reconcile settled without
-	// writing status, for a controller whose report is conditions or nothing at
-	// all. Pass the generation of the object you were handed. A generation at or
-	// below the recorded one writes nothing; one above the object's current
-	// generation → ErrObservedGenerationFuture, below 1 →
-	// ErrInvalidObservedGeneration — which UpdateStatus rejects too. Compose it
-	// inside Within to land with a SetConditions.
-	SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error
-	// UpdateStatus records status and the generation this reconcile observed.
-	// Status that marshals to the stored bytes writes nothing, so a controller
-	// can report unconditionally without waking watchers on an unchanged poll —
-	// except that a newly settled generation is still recorded and does emit.
-	UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error
+	// UpdateStatus records status and nothing else. Status that marshals to the
+	// stored bytes writes nothing, so a controller can report unconditionally
+	// without waking watchers on an unchanged poll. The generation handshake is
+	// beehive's: return Settled from Reconcile to record one.
+	UpdateStatus(ctx context.Context, id ObjectID, status Status) error
 	// Within runs fn inside a single transaction: writes made with fn's ctx all
 	// commit together or roll back on error. Pass fn's ctx to every store call
 	// it makes — the store runs on one connection, so any other context
@@ -119,23 +111,13 @@ func (c *controllerClientImpl[Status]) wakeAfter(ctx context.Context, err error)
 	return nil
 }
 
-func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, observedGeneration int64, status Status) error {
+func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
 	b, err := json.Marshal(status)
 	if err != nil {
 		return err
 	}
 	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
-		ctx, c.gk, id, observedGeneration, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
-}
-
-// Gated on settled: a controller calls this every pass, so the steady state is
-// the clamped no-op, which appends no log entry for a wake to read.
-func (c *controllerClientImpl[Status]) SetObservedGeneration(ctx context.Context, id ObjectID, observedGeneration int64) error {
-	settled, err := c.bh.store.Objects().SetObservedGeneration(ctx, c.gk, id, observedGeneration)
-	if err != nil || !settled {
-		return err
-	}
-	return c.wakeAfter(ctx, nil)
+		ctx, c.gk, id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, id ObjectID, condition Condition) error {

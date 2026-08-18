@@ -114,14 +114,6 @@ var ErrStaleTxContext = storeapi.ErrStaleTxContext
 // is still open at commit, which can only mean another goroutine holds one.
 var ErrConcurrentNestedTx = storeapi.ErrConcurrentNestedTx
 
-// ErrObservedGenerationFuture is returned by a handshake write when the caller
-// reports a generation greater than the object's current one.
-var ErrObservedGenerationFuture = storeapi.ErrObservedGenerationFuture
-
-// ErrInvalidObservedGeneration is returned by a handshake write given a
-// generation below 1, which no object ever holds.
-var ErrInvalidObservedGeneration = storeapi.ErrInvalidObservedGeneration
-
 // ErrSchemaVersionDowngrade is returned by Objects().UpdateSpec/UpdateStatus when the
 // caller's schema version is lower than the one stamped on the row.
 var ErrSchemaVersionDowngrade = storeapi.ErrSchemaVersionDowngrade

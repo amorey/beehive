@@ -121,7 +121,7 @@ func (c *ServerController) Reconcile(ctx context.Context, client beehive.Control
 		}
 	}
 
-	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, ServerStatus{OnlineReplicas: have}); err != nil {
+	if err := client.UpdateStatus(ctx, obj.ID, ServerStatus{OnlineReplicas: have}); err != nil {
 		return beehive.Fail(err)
 	}
 

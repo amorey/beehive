@@ -388,7 +388,7 @@ func (c *dependentController) Reconcile(ctx context.Context, cc ControllerClient
 	}
 	// Settling at obj.Generation is what hides a missed wake from the full pass
 	// backstop: ObjectsListUnsettledIDs sees a converged object.
-	if err := cc.UpdateStatus(ctx, c.depID, obj.Generation, tStatus{}); err != nil {
+	if err := cc.UpdateStatus(ctx, c.depID, tStatus{}); err != nil {
 		return Fail(err)
 	}
 	c.observed <- ready
@@ -1744,7 +1744,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 		bh:     bh,
 		client: &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK},
 		inner: &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "written"}); err != nil {
+			if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "written"}); err != nil {
 				return Fail(err)
 			}
 			return Fail(errBoom)
@@ -1757,7 +1757,7 @@ func TestReconcilePersistsWritesOnError(t *testing.T) {
 	got, err := s.Objects().Get(ctx, raw.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got.Status, "the status write committed despite the reconcile error")
-	assert.NotNil(t, got.ObservedGeneration)
+	assert.Nil(t, got.ObservedGeneration, "a failed pass settles nothing")
 }
 
 // wrapStore applies a harness's optional store decoration, so the harnesses read
@@ -1980,7 +1980,7 @@ type statusSettingController struct {
 }
 
 func (c *statusSettingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
+	if err := client.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
 		return Fail(err)
 	}
 	c.reconciled.fire()
@@ -1997,7 +1997,7 @@ type specEchoController struct {
 }
 
 func (c *specEchoController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: obj.Spec.Val}); err != nil {
+	if err := client.UpdateStatus(ctx, obj.ID, cStatus{Val: obj.Spec.Val}); err != nil {
 		return Fail(err)
 	}
 	c.firstDone.fire()
@@ -2036,7 +2036,7 @@ func (c *deletionTrackingController) Reconcile(ctx context.Context, client Contr
 		}
 		return Settled(0)
 	}
-	if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "done"}); err != nil {
+	if err := client.UpdateStatus(ctx, obj.ID, cStatus{Val: "done"}); err != nil {
 		return Fail(err)
 	}
 	c.reconciled.fire()
@@ -2064,7 +2064,7 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "done", got.Status.Val)
-	require.NotNil(t, got.ObservedGeneration)
+	require.NotNil(t, got.ObservedGeneration, "the Settled pass recorded the generation")
 	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
 }
 
@@ -2170,7 +2170,7 @@ func TestIntegrationWritePersistsAcrossReconcileError(t *testing.T) {
 	ctrl := &funcController{
 		signal: newSignal(),
 		fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-			_ = cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: "persisted"})
+			_ = cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "persisted"})
 			return Fail(errBoom)
 		},
 	}
@@ -2453,7 +2453,7 @@ func TestOwedPassTickDispatchesOwedWake(t *testing.T) {
 	real, reconciled := newOwedPassHarness(t, gk, func(s wakeStampingStore) {
 		raw, err := s.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		err = s.Objects().UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
+		err = s.Objects().UpdateStatus(ctx, gk, raw.ID, []byte(`{}`), 0)
 		require.NoError(t, err)
 		id = raw.ID
 	})
@@ -2496,8 +2496,7 @@ func newSettledHarness(t *testing.T, opts ...Option) (id ObjectID, reconciled <-
 		t.Helper()
 		raw, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		err = store.Objects().UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
-		require.NoError(t, err)
+		settleRow(t, ctx, store, gk, raw.ID)
 		return raw.ID
 	}
 	probeID, sentinelID := settle(), settle()
@@ -2580,8 +2579,7 @@ func newStartupHarness(t *testing.T, seed func(Store, GroupKind), opts ...Option
 	require.NoError(t, err)
 	// Settled, so no startup pass of its own can reach it: the only thing that ever
 	// dispatches it is the explicit requeue below.
-	err = store.Objects().UpdateStatus(ctx, gk, sentinel.ID, sentinel.Generation, []byte(`{}`), 0)
-	require.NoError(t, err)
+	settleRow(t, ctx, store, gk, sentinel.ID)
 
 	reconciled := make(chan ObjectID, 8)
 	logger, started := loggerSignallingOn(reconcilerStartedMsg)
@@ -2638,8 +2636,7 @@ func TestStartupFullPassReconcilesSettled(t *testing.T) {
 	seed := func(s Store, gk GroupKind) {
 		raw, err := s.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		err = s.Objects().UpdateStatus(ctx, gk, raw.ID, raw.Generation, []byte(`{}`), 0)
-		require.NoError(t, err)
+		settleRow(t, ctx, s, gk, raw.ID)
 		settled = raw.ID
 	}
 
@@ -3546,7 +3543,7 @@ func (c *cycleController) Reconcile(ctx context.Context, cc ControllerClient[cSt
 		c.hot.fire()
 	}
 	c.first.fire()
-	if err := cc.UpdateStatus(ctx, obj.ID, obj.Generation, cStatus{Val: fmt.Sprint(n)}); err != nil {
+	if err := cc.UpdateStatus(ctx, obj.ID, cStatus{Val: fmt.Sprint(n)}); err != nil {
 		return Fail(err)
 	}
 	return Settled(0)

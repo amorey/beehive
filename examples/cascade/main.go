@@ -88,7 +88,7 @@ func (c *ClusterController) Reconcile(ctx context.Context, client beehive.Contro
 	}
 
 	if obj.Status == nil || !obj.Status.Connected {
-		if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterStatus{Connected: true}); err != nil {
+		if err := client.UpdateStatus(ctx, obj.ID, ClusterStatus{Connected: true}); err != nil {
 			return beehive.Fail(err)
 		}
 		return beehive.Settled(0)
@@ -110,7 +110,7 @@ func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.C
 	}
 
 	if obj.Status == nil {
-		if err := client.UpdateStatus(ctx, obj.ID, obj.Generation, ClusterCacheStatus{Entries: 42}); err != nil {
+		if err := client.UpdateStatus(ctx, obj.ID, ClusterCacheStatus{Entries: 42}); err != nil {
 			return beehive.Fail(err)
 		}
 		return beehive.Settled(0)
