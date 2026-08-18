@@ -95,7 +95,7 @@ func main() {
 	)
 	exitOnErr(err)
 
-	_, err = beehive.Register(bh, PanelGroupKind, &PanelController{})
+	err = beehive.Register(bh, PanelGroupKind, &PanelController{})
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())

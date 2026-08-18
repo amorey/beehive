@@ -436,17 +436,17 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 	return bh, nil
 }
 
-// Register installs controller c for the resource kind gk and returns the
-// kind's ControllerClient. It must be called before Start, and only once per
-// kind.
-func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) (ControllerClient[Status], error) {
+// Register installs controller c for the resource kind gk. It must be called
+// before Start, and only once per kind. The kind's ControllerClient reaches the
+// controller as a parameter of Reconcile.
+func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, Status], opts ...Option) error {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
 	if bh.state != beehiveNew {
-		return nil, fmt.Errorf("beehive: cannot register %s/%s after Start", gk.Group, gk.Kind)
+		return fmt.Errorf("beehive: cannot register %s/%s after Start", gk.Group, gk.Kind)
 	}
 	if _, exists := bh.reconcilers[gk]; exists {
-		return nil, fmt.Errorf("beehive: controller already registered for %s/%s", gk.Group, gk.Kind)
+		return fmt.Errorf("beehive: controller already registered for %s/%s", gk.Group, gk.Kind)
 	}
 
 	r := &reconciler{
@@ -464,14 +464,12 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	}
 	r.work.setFloor(bh.minRequeueInterval) // withMinRequeueInterval may override below
 
-	// One client per kind, shared by the adapter and the caller.
-	client := &controllerClientImpl[Status]{bh: bh, gk: gk}
-	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c, client: client}
+	adapter := &typedController[Spec, Status]{gk: gk, bh: bh, inner: c}
 	r.adapter = adapter
 
 	for _, o := range opts {
 		if err := o(r); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
@@ -487,7 +485,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 
 	bh.reconcilers[gk] = r
 	bh.order = append(bh.order, r)
-	return client, nil
+	return nil
 }
 
 // isRegistered reports whether a controller is registered for gk.

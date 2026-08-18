@@ -155,7 +155,7 @@ func main() {
 	bh, err := beehive.New(store)
 	exitOnErr(err)
 
-	_, err = beehive.Register(bh, ServerGroupKind, &ServerController{online: map[beehive.ObjectID]int{}})
+	err = beehive.Register(bh, ServerGroupKind, &ServerController{online: map[beehive.ObjectID]int{}})
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())

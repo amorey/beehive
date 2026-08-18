@@ -448,8 +448,7 @@ func TestWatchEventsDeliversWithoutTicking(t *testing.T) {
 	defer cancel()
 
 	bh := newTestBeehive(t, newClientTestStore(t), WithWatchFloorInterval(time.Hour))
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 

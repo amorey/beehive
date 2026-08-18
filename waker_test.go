@@ -161,7 +161,7 @@ func TestWakerScanReportsWhatHappened(t *testing.T) {
 func TestWakerPrimeSubscribesBeforeItSeeds(t *testing.T) {
 	store := &seedProbe{Store: &fakeStore{}, mark: 500}
 	bh := newTestBeehive(t, store)
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 
 	var subscribed bool
@@ -186,7 +186,7 @@ func TestWakerScansWhenAWriteCommits(t *testing.T) {
 	seeded := make(chan struct{}, 8)
 	store := &seedProbe{Store: inner, onRead: func() { probeSignal(seeded) }}
 	bh := newTestBeehive(t, store)
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 
 	// Priming is what Start does, and it subscribes before it seeds — so once it
@@ -269,7 +269,7 @@ func TestIdleWakerIssuesNoQueries(t *testing.T) {
 	// No throttle, so every wake drives a scan of its own rather than folding
 	// into the one before it.
 	bh := newTestBeehive(t, store, withWakeScanMinInterval(0))
-	_, err := Register(bh, widget, &reconcileCapture{})
+	err := Register(bh, widget, &reconcileCapture{})
 	require.NoError(t, err)
 	bh.waker.prime(ctx)
 
@@ -304,7 +304,7 @@ func TestWakerRecoversFromAFailedScanWithoutATick(t *testing.T) {
 	// The ladder is capped at the stale-dependents cadence, which is what makes
 	// the retry here fast enough to wait on.
 	bh := newTestBeehive(t, store, WithStaleDependentsInterval(fastTick))
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 	bh.waker.prime(ctx)
 
@@ -327,7 +327,7 @@ func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
 	store := &replayStore{rows: replayRows(3), err: errBoom, lists: make(chan struct{}, 8)}
 	bh := newTestBeehive(t, store)
 	widget := GroupKind{Kind: "Widget"}
-	_, err := Register(bh, widget, &reconcileCapture{})
+	err := Register(bh, widget, &reconcileCapture{})
 	require.NoError(t, err)
 	// Primed, so the eager first pass is a scan — and it fails, which is what
 	// starts the backoff the wake below must not break into.
@@ -351,7 +351,7 @@ func TestWakerDropsWakesWhileBackingOff(t *testing.T) {
 func TestWakerClosedHubArmReturns(t *testing.T) {
 	store := &replayStore{rows: replayRows(1)}
 	bh := newTestBeehive(t, store)
-	_, err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
+	err := Register(bh, GroupKind{Kind: "Widget"}, &reconcileCapture{})
 	require.NoError(t, err)
 	bh.waker.prime(context.Background())
 
@@ -1625,7 +1625,7 @@ func TestStaleDependentsPassEnqueuesStaleDependents(t *testing.T) {
 	bh := newTestBeehive(t, probe, fast(withDependencyWakerOff())...)
 
 	reconciled := make(chan ObjectID, 8)
-	_, err := Register(bh, clientTestGK, &settlingCapture{ch: reconciled}, WithFullPassInterval(0))
+	err := Register(bh, clientTestGK, &settlingCapture{ch: reconciled}, WithFullPassInterval(0))
 	require.NoError(t, err)
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
@@ -1662,7 +1662,7 @@ func TestStaleDependentsPassIgnoresUnregisteredKinds(t *testing.T) {
 		staleListed: make(chan struct{}, 1),
 	}
 	bh := newTestBeehive(t, probe, fast()...)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 
 	// One object, so a version has been issued: the sweep skips a store where

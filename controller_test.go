@@ -17,6 +17,8 @@ package beehive
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,8 +35,7 @@ func TestControllerClientDeleteFinalizer(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -123,8 +124,7 @@ func TestDeleteFinalizerPushesNothingWhenRolledBack(t *testing.T) {
 func TestDeleteFinalizerPushesNothingOnWrongKind(t *testing.T) {
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	gadgetGK := GroupKind{Kind: "Gadget"}
 	registerNoop[cSpec, cStatus](t, bh, gadgetGK)
 	gadgetR := mustReconciler(t, bh, gadgetGK)
@@ -151,9 +151,8 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		bh, err := New(store)
 		require.NoError(t, err)
 
-		cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{},
+		cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{},
 			WithMigrator(&fakeMigrator{specVersion: 4, statusVersion: 9}))
-		require.NoError(t, err)
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
@@ -177,8 +176,7 @@ func TestWriteStampsSchemaVersions(t *testing.T) {
 		bh, err := New(store)
 		require.NoError(t, err)
 
-		cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-		require.NoError(t, err)
+		cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 
 		client := NewClient[cSpec, cStatus](bh, clientTestGK)
 		obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
@@ -196,8 +194,7 @@ func TestControllerClientUpdateStatus(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -227,8 +224,7 @@ func TestControllerClientUpdateStatusNoOpIsSilent(t *testing.T) {
 	defer cancel()
 	bh := newTestBeehive(t, newClientTestStore(t), fast()...)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
@@ -382,8 +378,7 @@ func TestControllerClientSetAndDeleteCondition(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -410,8 +405,7 @@ func TestControllerClientSetConditions(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -467,7 +461,7 @@ func TestConditionsOnlyControllerSettlesByReturningSettled(t *testing.T) {
 		}
 		return Settled(0)
 	}}
-	_, err := Register(bh, clientTestGK, inner)
+	err := Register(bh, clientTestGK, inner)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -495,8 +489,7 @@ func TestControllerClientAddAndDeleteDependency(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -530,8 +523,7 @@ func TestAddDependencyAcceptsCycle(t *testing.T) {
 	bh := newTestBeehive(t, store)
 
 	gk := GroupKind{Kind: "Widget"}
-	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, gk, &noopController[tSpec, tStatus]{})
 	client := NewClient[tSpec, tStatus](bh, gk)
 	a := mustCreate(t, ctx, client, uniqueName(), tSpec{})
 	b := mustCreate(t, ctx, client, uniqueName(), tSpec{})
@@ -583,10 +575,9 @@ func newDeclareFixture(t *testing.T) *declareFixture {
 		targetGK: GroupKind{Kind: "Target"},
 		depGK:    GroupKind{Kind: "Dependent"},
 	}
-	_, err := Register(bh, f.depGK, &noopController[tSpec, tStatus]{})
+	err := Register(bh, f.depGK, &noopController[tSpec, tStatus]{})
 	require.NoError(t, err)
-	f.cc, err = Register(bh, f.targetGK, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
+	f.cc = registerWithClient(t, bh, f.targetGK, &noopController[tSpec, tStatus]{})
 
 	depClient := NewClient[tSpec, tStatus](bh, f.depGK)
 	f.dep = mustCreate(t, ctx, depClient, "dep", tSpec{})
@@ -672,8 +663,7 @@ func newSameKindFixture(t *testing.T) *sameKindFixture {
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))
 	gk := GroupKind{Kind: "Widget"}
-	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, gk, &noopController[tSpec, tStatus]{})
 
 	client := NewClient[tSpec, tStatus](bh, gk)
 	f := &sameKindFixture{
@@ -740,8 +730,7 @@ func TestAddDependencyStampRidesRefsAdd(t *testing.T) {
 
 	bh := newTestBeehive(t, real)
 	gk := GroupKind{Kind: "Widget"}
-	cc, err := Register(bh, gk, &noopController[tSpec, tStatus]{}, WithFullPassInterval(0))
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, gk, &noopController[tSpec, tStatus]{}, WithFullPassInterval(0))
 
 	client := NewClient[tSpec, tStatus](bh, gk)
 	dep := mustCreate(t, ctx, client, uniqueName(), tSpec{})
@@ -869,8 +858,7 @@ func TestAddDependencyOnAClientOnlyKindEnqueuesNothing(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 	targetGK := GroupKind{Kind: "Target"}
-	cc, err := Register(bh, targetGK, &noopController[tSpec, tStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, targetGK, &noopController[tSpec, tStatus]{})
 
 	clientOnly := GroupKind{Kind: "NoController"}
 	dep := mustCreate(t, ctx, NewClient[tSpec, tStatus](bh, clientOnly), uniqueName(), tSpec{})
@@ -923,7 +911,7 @@ func TestFailingControllerKeepsItsBackoffWhenItsEdgeSetConverges(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), withoutGCSweeper())
 	gk := GroupKind{Kind: "Widget"}
 	ctrl := &redeclareController{first: newSignal(), hot: newSignal()}
-	_, err := Register(bh, gk, ctrl)
+	err := Register(bh, gk, ctrl)
 	require.NoError(t, err)
 	client := NewClient[tSpec, tStatus](bh, gk)
 
@@ -1005,8 +993,7 @@ func TestControllerClientHasIncomingEdges(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1033,8 +1020,7 @@ func TestControllerClientWritesScopedToKind(t *testing.T) {
 	ctx := context.Background()
 	bh := newTestBeehive(t, newClientTestStore(t))
 
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}) // controller for "Widget"
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{}) // controller for "Widget"
 	// "Gadget" gets a controller of its own so the finalizer below is legal to
 	// create. It is foreign to cc either way — that is the point of the test — and
 	// having its own controller is what makes ErrWrongKind the *only* thing standing
@@ -1289,8 +1275,7 @@ func TestControllerClientReadEdges(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
@@ -1321,8 +1306,7 @@ func TestUpdateStatusDoesNotTouchTheHandshake(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
-	cc, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
-	require.NoError(t, err)
+	cc := registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1339,6 +1323,41 @@ func TestUpdateStatusDoesNotTouchTheHandshake(t *testing.T) {
 	assert.Contains(t, unsettledIDs(t, store), obj.ID)
 }
 
+// The stamp is a write like any other and wakes the kind's watches. Pinned with
+// the floor tick parked, so only the wake can deliver.
+func TestObservedGenerationStampWakesTheKindsWatches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithWatchFloorInterval(time.Hour))...)
+
+	var settle atomic.Bool
+	ctrl := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+		if settle.Load() {
+			return Settled(0)
+		}
+		return Unsettled(time.Hour)
+	}}
+	err := Register(bh, clientTestGK, ctrl)
+	require.NoError(t, err)
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	defer stop(ctx)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+
+	// Subscribed before the object can settle, so the stamp is the only write
+	// left to deliver.
+	stream, err := client.WatchList(ctx)
+	require.NoError(t, err)
+	settle.Store(true)
+	require.NoError(t, client.Requeue(ctx, obj.ID))
+
+	ev := recv(t, stream.Changes)
+	require.NotNil(t, ev.Object.ObservedGeneration)
+	assert.Equal(t, ev.Object.Generation, *ev.Object.ObservedGeneration)
+}
+
 // The client passed into Reconcile stops working when that call returns: a write
 // arriving later moves status with no pass behind it.
 func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
@@ -1346,13 +1365,25 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
 
-	var captured ControllerClient[cStatus]
+	var (
+		captured ControllerClient[cStatus]
+		passes   int
+	)
 	ran := make(chan struct{}, 4)
 	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
-		captured = cc
+		passes++
+		if passes == 1 {
+			// Only the first pass's client is captured, so the test reads it
+			// after that pass has been signalled and nothing writes it again.
+			captured = cc
+		}
+		// A value per pass: UpdateStatus skips a byte-identical write, so a
+		// constant would make the second pass's write indistinguishable from no
+		// write at all.
+		val := fmt.Sprintf("inside-%d", passes)
 		// Live for the whole of Reconcile, Within included.
 		if err := cc.Within(ctx, func(ctx context.Context) error {
-			return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: "inside"})
+			return cc.UpdateStatus(ctx, obj.ID, cStatus{Val: val})
 		}); err != nil {
 			return Fail(err)
 		}
@@ -1362,8 +1393,7 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 		}
 		return Settled(0)
 	}}
-	registerClient, err := Register(bh, clientTestGK, inner)
-	require.NoError(t, err)
+	require.NoError(t, Register(bh, clientTestGK, inner))
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 	defer stop(ctx)
@@ -1390,15 +1420,21 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 		got, err := client.Get(ctx, obj.ID)
 		require.NoError(t, err)
 		require.NotNil(t, got.Status)
-		assert.Equal(t, "inside", got.Status.Val)
+		assert.Equal(t, "inside-1", got.Status.Val)
 	})
 
-	// The Register client is the application's and outlives every pass by design.
-	t.Run("the Register client is unaffected", func(t *testing.T) {
-		require.NoError(t, registerClient.UpdateStatus(ctx, obj.ID, cStatus{Val: "from outside"}))
+	// The restriction is on the pass, not on the kind: the next pass gets a
+	// working client for the same object.
+	t.Run("the next pass writes", func(t *testing.T) {
+		require.NoError(t, client.Requeue(ctx, obj.ID))
+		select {
+		case <-ran:
+		case <-time.After(testTimeout):
+			t.Fatal("the requeue never reconciled")
+		}
 		got, err := client.Get(ctx, obj.ID)
 		require.NoError(t, err)
-		assert.Equal(t, "from outside", got.Status.Val)
+		assert.Equal(t, "inside-2", got.Status.Val)
 	})
 }
 
@@ -1432,7 +1468,7 @@ func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
 		}
 		return Settled(0)
 	}}
-	_, err := Register(bh, clientTestGK, inner)
+	err := Register(bh, clientTestGK, inner)
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -1458,7 +1494,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 	ctx := context.Background()
 	store := newClientTestStore(t)
 	bh := newTestBeehive(t, store)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1496,16 +1532,27 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		}},
 	}
 
-	inner := &controllerClientImpl[cStatus]{bh: bh, gk: clientTestGK}
-	live := &scopedControllerClient[cStatus]{inner: inner}
+	// The table is the surface, so pin it to the interface: a method added
+	// without a row here would go ungated and nothing else would fail.
+	iface := reflect.TypeFor[ControllerClient[cStatus]]()
+	named := make(map[string]bool, len(calls))
 	for _, c := range calls {
-		t.Run(c.name+" delegates while the pass runs", func(t *testing.T) {
-			// Reaching inner is the assertion; whether inner likes the arguments is not.
+		named[c.name] = true
+	}
+	require.Len(t, named, iface.NumMethod(), "every ControllerClient method needs a row")
+	for i := range iface.NumMethod() {
+		assert.True(t, named[iface.Method(i).Name], "ungated method missing from the table")
+	}
+
+	live := newPassClient[cStatus](bh, clientTestGK)
+	for _, c := range calls {
+		t.Run(c.name+" runs while the pass runs", func(t *testing.T) {
+			// Reaching the store is the assertion; whether it likes the arguments is not.
 			assert.NotErrorIs(t, c.call(live), ErrReconcileReturned)
 		})
 	}
 
-	ended := &scopedControllerClient[cStatus]{inner: inner}
+	ended := newPassClient[cStatus](bh, clientTestGK)
 	ended.end()
 	for _, c := range calls {
 		t.Run(c.name+" refuses once the pass has ended", func(t *testing.T) {

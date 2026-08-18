@@ -417,6 +417,29 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   registering the kind is a one-line workaround and the requirement documents
   itself.
 
+- **An application cannot append to an event log outside a reconcile pass** —
+  removed deliberately, with
+  [Register handing back nothing](adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).
+  `AddEvent` lives on the `ControllerClient`, which now exists only for the pass
+  it is handed to, so a background prober — an ordinary app goroutine watching a
+  connection — has no way to record what it saw. It has to hold the outcome in
+  memory and call `Client.Requeue`, which is a round trip through the work queue
+  for a write that settles nothing.
+
+  The argument that took the client away does not reach `AddEvent`: an event
+  bumps no `resource_version` and is invisible to the handshake, so an out-of-band
+  event breaks no settled checkpoint. It went because it arrived on the same
+  client, and carving one method out would restore the which-half-works table that
+  scoping the client exists to avoid.
+
+  The fix is `Client.AddEvent`, kind-scoped like the `ControllerClient` verb and
+  sitting beside the three event reads already there. What it needs first is a
+  decision, not code: `Client` writing something only a controller may write
+  crosses a line this package has held, and "only controllers write events"
+  (`README.md`) would have to become a sentence about passes instead. What would
+  make it worth doing: an application whose observations genuinely arrive between
+  passes — a prober, a subscription — rather than during one.
+
 - **The store-side tests still spell pre-accessor method names in prose and test
   names** — `sqlite/store_test.go` and `internal/storeapi/storeapi_test.go` carry
   `EventsAdd`, `EventsList`, `ConditionsSet`, `EdgesHasIncoming` in comments, and

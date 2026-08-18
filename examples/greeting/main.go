@@ -79,7 +79,7 @@ func main() {
 	bh, err := beehive.New(store)
 	exitOnErr(err)
 
-	_, err = beehive.Register(bh, GreetingGroupKind, &GreetingController{})
+	err = beehive.Register(bh, GreetingGroupKind, &GreetingController{})
 	exitOnErr(err)
 
 	stop, err := bh.Start(context.Background())

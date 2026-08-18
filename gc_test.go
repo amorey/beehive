@@ -350,7 +350,7 @@ func TestCollectCascadesAndBlocksOnChild(t *testing.T) {
 func cascadeFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], *reconciler) {
 	t.Helper()
 	bh, client := gcFixture(t)
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	r, ok := bh.reconcilerFor(clientTestGK)
 	require.True(t, ok)
@@ -423,7 +423,7 @@ func TestCascadePushesAcrossKinds(t *testing.T) {
 	ctx := context.Background()
 	bh, client, ownerR := cascadeFixture(t)
 	childGK := GroupKind{Kind: "CascadeChild"}
-	_, err := Register(bh, childGK, &noopController[cSpec, cStatus]{})
+	err := Register(bh, childGK, &noopController[cSpec, cStatus]{})
 	require.NoError(t, err)
 	childR, ok := bh.reconcilerFor(childGK)
 	require.True(t, ok)
@@ -732,7 +732,7 @@ func TestIntegrationGCBreaksDependencyCycle(t *testing.T) {
 
 	// Full pass disabled: the cycle must break purely event-driven.
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
-	_, err := Register(bh, clientTestGK, &finalizerClearingController{})
+	err := Register(bh, clientTestGK, &finalizerClearingController{})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -762,7 +762,7 @@ func TestIntegrationGCFinalizerGateIgnoresFinalizingDependent(t *testing.T) {
 
 	// Full pass disabled: the finalizer gate must clear purely event-driven.
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
-	_, err := Register(bh, clientTestGK, &hasIncomingEdgesGatingController{finalizer: "gate"})
+	err := Register(bh, clientTestGK, &hasIncomingEdgesGatingController{finalizer: "gate"})
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -811,7 +811,7 @@ func TestIntegrationGCResumesDanglingDeleteOnStartup(t *testing.T) {
 	// to removal: deletion-pending work is the sweeper's alone, listed cross-kind
 	// rather than per-kind.
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0))...)
-	_, err = Register(bh, clientTestGK, &finalizerClearingController{},
+	err = Register(bh, clientTestGK, &finalizerClearingController{},
 		WithStartupFullPass(false))
 	require.NoError(t, err)
 
@@ -842,7 +842,7 @@ func TestIntegrationGCDeletesAfterFinalizerCleared(t *testing.T) {
 	// the controller clears the finalizer in the same pass.
 	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
-	_, err := Register(bh, clientTestGK, &finalizerClearingController{finalizer: "f"})
+	err := Register(bh, clientTestGK, &finalizerClearingController{finalizer: "f"})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -873,7 +873,7 @@ func TestIntegrationGCCascadeWithFullPassDisabled(t *testing.T) {
 	// directly — there is no backstop tick to re-check it.
 	bh := newTestBeehive(t, newClientTestStore(t), fast(WithFullPassInterval(0))...)
 
-	_, err := Register(bh, clientTestGK, &finalizerClearingController{})
+	err := Register(bh, clientTestGK, &finalizerClearingController{})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -899,7 +899,7 @@ func TestIntegrationGCCascadeDeletesOwnerAndChild(t *testing.T) {
 	// owner once its child (and the owned_by edge) is gone.
 	bh := newTestBeehive(t, newClientTestStore(t), fast(WithGCInterval(5*time.Millisecond))...)
 
-	_, err := Register(bh, clientTestGK, &finalizerClearingController{})
+	err := Register(bh, clientTestGK, &finalizerClearingController{})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -936,7 +936,7 @@ func TestIntegrationGCSweepsClientOnlyKind(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), fast(WithGCInterval(5*time.Millisecond))...)
 
 	// Only the owner kind has a controller; the child kind is client-only.
-	_, err := Register(bh, clientTestGK, &finalizerClearingController{})
+	err := Register(bh, clientTestGK, &finalizerClearingController{})
 	require.NoError(t, err)
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -1090,7 +1090,7 @@ func TestIntegrationDroppedDependencyCollectsWithoutASweep(t *testing.T) {
 	bh := newTestBeehive(t, store, parked()...)
 
 	ctrl := &depReleaseController{}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1295,7 +1295,7 @@ func TestIntegrationClearedFinalizerCollectsWithoutASweep(t *testing.T) {
 	)...)
 
 	ctrl := &siblingFinalizerClearingController{finalizer: "f"}
-	_, err := Register(bh, clientTestGK, ctrl)
+	err := Register(bh, clientTestGK, ctrl)
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
@@ -1555,7 +1555,7 @@ func TestGCSweepDispatchesRegisteredKind(t *testing.T) {
 	bh := newTestBeehive(t, store, fast(WithFullPassInterval(0), WithGCInterval(10*time.Millisecond))...)
 	// The controller clears "gate" once the object is finalizing, which is the step
 	// only a reconcile can take.
-	_, err := Register(bh, clientTestGK, &finalizerClearingController{finalizer: "gate"},
+	err := Register(bh, clientTestGK, &finalizerClearingController{finalizer: "gate"},
 		WithStartupFullPass(false))
 	require.NoError(t, err)
 

@@ -224,8 +224,7 @@ func (o *Object[Spec, Status]) Events() ([]Event, error) {
 var ErrInvalidResult = errors.New("beehive: unusable ReconcileResult")
 
 // ErrReconcileReturned is returned by every method of the ControllerClient
-// Reconcile was passed, once it has returned. The client Register hands back is
-// never scoped this way.
+// Reconcile was passed, once it has returned.
 var ErrReconcileReturned = errors.New("beehive: the ControllerClient passed to Reconcile is no longer usable")
 
 // Zero names no kind, which is what makes the zero ReconcileResult detectable.

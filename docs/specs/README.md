@@ -17,5 +17,4 @@ work we have decided to do.
 No spec is in flight.
 
 The last spec shipped as
-[beehive owning the generation handshake](../adr/2026-08-18-beehive-owns-the-generation-handshake.md)
-and [the pass client dying with the pass](../adr/2026-08-18-the-pass-client-dies-with-the-pass.md).
+[a ControllerClient existing only for the pass it is handed to](../adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).

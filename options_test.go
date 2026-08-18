@@ -144,7 +144,7 @@ func TestPromotedIntervalsDispatchAtNewAndRegister(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, bh.watchFloorInterval)
 
 	gk := GroupKind{Kind: "Widget"}
-	_, err = Register(bh, gk, &noopController[tSpec, tStatus]{},
+	err = Register(bh, gk, &noopController[tSpec, tStatus]{},
 		WithOwedPassInterval(time.Minute),
 		WithStaleDependentsInterval(time.Minute),
 		WithWatchFloorInterval(time.Minute))
@@ -405,7 +405,7 @@ func TestWithWatchScanMinIntervalDisablesTheThrottle(t *testing.T) {
 // option overrides it.
 func TestRegisterBuildsTheQueuesGateFromTheResolvedInterval(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), withMinRequeueInterval(time.Hour))
-	_, err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, withMinRequeueInterval(time.Minute))
+	err := Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}, withMinRequeueInterval(time.Minute))
 	require.NoError(t, err)
 
 	r, ok := bh.reconcilerFor(clientTestGK)
