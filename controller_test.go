@@ -481,15 +481,7 @@ func TestConditionsOnlyControllerSettlesByReturningSettled(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("the create's own enqueue never reconciled")
 	}
-	require.Eventually(t, func() bool {
-		got, err := client.Get(ctx, obj.ID)
-		return err == nil && got.ObservedGeneration != nil
-	}, testTimeout, time.Millisecond, "beehive to record the generation the pass settled")
-
-	got, err := client.Get(ctx, obj.ID)
-	require.NoError(t, err)
-	require.NotNil(t, got.ObservedGeneration)
-	assert.Equal(t, got.Generation, *got.ObservedGeneration)
+	got := waitSettled(t, ctx, client, obj.ID)
 	assert.Nil(t, got.Status, "the handshake writes no status")
 	require.NotNil(t, findCondition(got.Conditions, "Synced"), "the pass's real report")
 

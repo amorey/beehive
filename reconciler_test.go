@@ -2064,11 +2064,10 @@ func TestIntegrationCreateTriggersReconcile(t *testing.T) {
 
 	ctrl.reconciled.wait(t, "first reconcile")
 
-	got, err := client.Get(ctx, obj.ID)
-	require.NoError(t, err)
+	// The signal fires inside Reconcile; the stamp lands after it returns.
+	got := waitSettled(t, ctx, client, obj.ID)
 	require.NotNil(t, got.Status)
 	assert.Equal(t, "done", got.Status.Val)
-	require.NotNil(t, got.ObservedGeneration, "the Settled pass recorded the generation")
 	assert.Equal(t, obj.Generation, *got.ObservedGeneration)
 }
 

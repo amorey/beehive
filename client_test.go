@@ -3235,9 +3235,8 @@ func specWriteFixture(t *testing.T) (*Beehive, Client[cSpec, cStatus], Controlle
 	return bh, NewClient[cSpec, cStatus](bh, clientTestGK), cc, mustReconciler(t, bh, clientTestGK)
 }
 
-// settle drives the generation handshake to "converged" and empties the queue, so
-// a following test step starts from a row that owes nothing.
-// settle records the object's generation as observed: these tests need a settled
+// settle records the object's generation as observed and empties the queue, so a
+// following step starts from a row that owes nothing. These tests need a settled
 // row without running a reconcile loop to get one.
 func settle(t *testing.T, ctx context.Context, cc ControllerClient[cStatus], r *reconciler, obj *Object[cSpec, cStatus]) {
 	t.Helper()

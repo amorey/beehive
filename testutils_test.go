@@ -2018,3 +2018,20 @@ func settleRow(t *testing.T, ctx context.Context, store Store, gk GroupKind, id 
 	_, err = store.Objects().SetObservedGeneration(ctx, gk, id, raw.Generation)
 	require.NoError(t, err)
 }
+
+// waitSettled waits for beehive's generation stamp and returns the settled
+// object. The stamp lands after Reconcile returns, so a controller's own signal
+// fires before it and cannot be waited on in its place.
+func waitSettled(t *testing.T, ctx context.Context, client Client[cSpec, cStatus], id ObjectID) *Object[cSpec, cStatus] {
+	t.Helper()
+	var got *Object[cSpec, cStatus]
+	require.Eventually(t, func() bool {
+		o, err := client.Get(ctx, id)
+		if err != nil || o.ObservedGeneration == nil {
+			return false
+		}
+		got = o
+		return *o.ObservedGeneration == o.Generation
+	}, testTimeout, time.Millisecond, "beehive to record the generation the pass settled")
+	return got
+}
