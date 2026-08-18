@@ -57,19 +57,21 @@ type ControllerClient[Status any] interface {
 	DeleteCondition(ctx context.Context, conditionType string) error
 	DeleteDependency(ctx context.Context, toID ObjectID) error
 	DeleteFinalizer(ctx context.Context, finalizer string) error
-	// GetOwner returns id's owner, if any. ok is false with a nil error when the
-	// object has no owner.
-	GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error)
+	// GetOwner returns the object's owner, if any. ok is false with a nil error
+	// when it has none.
+	GetOwner(ctx context.Context) (ObjectRef, bool, error)
 	// HasIncomingEdges reports whether any object with a live claim still points
-	// at id: an owned child, or a dependent that is not itself being deleted. A
-	// finalizer can gate teardown on it.
-	HasIncomingEdges(ctx context.Context, id ObjectID) (bool, error)
-	// ListDependencies returns the objects id depends on (outgoing depends_on).
-	ListDependencies(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-	// ListDependents returns the objects that depend on id (incoming depends_on).
-	ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error)
-	// ListOwned returns the objects id owns (its incoming owned_by edges).
-	ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error)
+	// at this pass's object: an owned child, or a dependent that is not itself
+	// being deleted. A finalizer can gate teardown on it.
+	HasIncomingEdges(ctx context.Context) (bool, error)
+	// ListDependencies returns the objects this one depends on (outgoing
+	// depends_on).
+	ListDependencies(ctx context.Context) ([]ObjectRef, error)
+	// ListDependents returns the objects that depend on this one (incoming
+	// depends_on).
+	ListDependents(ctx context.Context) ([]ObjectRef, error)
+	// ListOwned returns the objects this one owns (its incoming owned_by edges).
+	ListOwned(ctx context.Context) ([]ObjectRef, error)
 	// SetCondition writes the condition of that type. The store stamps
 	// TransitionedAt and UpdatedAt; the passed values are ignored.
 	SetCondition(ctx context.Context, condition Condition) error
@@ -262,43 +264,43 @@ func (c *controllerClientImpl[Status]) DeleteDependency(ctx context.Context, toI
 	return nil
 }
 
-// The ref reads below are plain edge queries with no kind scoping: a controller
-// reasons about its own object's relationships. To gate a write on
+// The ref reads below are plain edge queries with no kind scoping: the id is the
+// pass's own, whatever kind the other end belongs to. To gate a write on
 // HasIncomingEdges atomically, run both inside Within.
 
-func (c *controllerClientImpl[Status]) GetOwner(ctx context.Context, id ObjectID) (ObjectRef, bool, error) {
+func (c *controllerClientImpl[Status]) GetOwner(ctx context.Context) (ObjectRef, bool, error) {
 	if err := c.live(); err != nil {
 		return ObjectRef{}, false, err
 	}
-	return fetchOwnerRef(ctx, c.bh.store, id)
+	return fetchOwnerRef(ctx, c.bh.store, c.id)
 }
 
-func (c *controllerClientImpl[Status]) ListDependencies(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+func (c *controllerClientImpl[Status]) ListDependencies(ctx context.Context) ([]ObjectRef, error) {
 	if err := c.live(); err != nil {
 		return nil, err
 	}
-	return c.bh.store.Edges().ListOutgoingByRelation(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListOutgoingByRelation(ctx, c.id, RelationDependsOn)
 }
 
-func (c *controllerClientImpl[Status]) ListDependents(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+func (c *controllerClientImpl[Status]) ListDependents(ctx context.Context) ([]ObjectRef, error) {
 	if err := c.live(); err != nil {
 		return nil, err
 	}
-	return c.bh.store.Edges().ListIncoming(ctx, id, RelationDependsOn)
+	return c.bh.store.Edges().ListIncoming(ctx, c.id, RelationDependsOn)
 }
 
-func (c *controllerClientImpl[Status]) ListOwned(ctx context.Context, id ObjectID) ([]ObjectRef, error) {
+func (c *controllerClientImpl[Status]) ListOwned(ctx context.Context) ([]ObjectRef, error) {
 	if err := c.live(); err != nil {
 		return nil, err
 	}
-	return c.bh.store.Edges().ListIncoming(ctx, id, RelationOwnedBy)
+	return c.bh.store.Edges().ListIncoming(ctx, c.id, RelationOwnedBy)
 }
 
-func (c *controllerClientImpl[Status]) HasIncomingEdges(ctx context.Context, id ObjectID) (bool, error) {
+func (c *controllerClientImpl[Status]) HasIncomingEdges(ctx context.Context) (bool, error) {
 	if err := c.live(); err != nil {
 		return false, err
 	}
-	return c.bh.store.Edges().HasIncoming(ctx, id)
+	return c.bh.store.Edges().HasIncoming(ctx, c.id)
 }
 
 // Within groups writes into one transaction. It adds no kind scoping of its

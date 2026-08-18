@@ -328,6 +328,30 @@ func TestDependencyVerbsBindTheSource(t *testing.T) {
 	assert.Empty(t, refs, "the drop names the same source")
 }
 
+// TestReadsBindThePassObject pins the direction of the edge reads: each answers
+// for the object the pass was handed, so the same edge reads as a dependency at
+// one end and a dependent at the other.
+func TestReadsBindThePassObject(t *testing.T) {
+	ctx := context.Background()
+	f := newSameKindFixture(t)
+	require.NoError(t, f.cc.at(f.dep.ID).AddDependency(ctx, f.target.ID))
+
+	deps, err := f.cc.at(f.dep.ID).ListDependencies(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{f.target.ID}, objectRefIDs(deps))
+
+	dependents, err := f.cc.at(f.target.ID).ListDependents(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{f.dep.ID}, objectRefIDs(dependents))
+
+	held, err := f.cc.at(f.target.ID).HasIncomingEdges(ctx)
+	require.NoError(t, err)
+	assert.True(t, held, "the target is pointed at")
+	held, err = f.cc.at(f.dep.ID).HasIncomingEdges(ctx)
+	require.NoError(t, err)
+	assert.False(t, held, "the source is not")
+}
+
 // TestControllerClientWithin verifies the opt-in atomicity surface: writes made
 // inside Within commit together on a nil return and roll back together on error,
 // with the nested ControllerClient writes joining the one transaction.
@@ -1047,11 +1071,11 @@ func TestControllerClientHasIncomingEdges(t *testing.T) {
 	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
 	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 
-	has, err := cc.at(owner.ID).HasIncomingEdges(ctx, owner.ID)
+	has, err := cc.at(owner.ID).HasIncomingEdges(ctx)
 	require.NoError(t, err)
 	assert.True(t, has, "owner is referenced by the child")
 
-	has, err = cc.at(child.ID).HasIncomingEdges(ctx, child.ID)
+	has, err = cc.at(child.ID).HasIncomingEdges(ctx)
 	require.NoError(t, err)
 	assert.False(t, has, "nothing references the child")
 }
@@ -1110,7 +1134,7 @@ func (s *failEdgesHasIncomingStore) hasIncomingEdges(context.Context, ObjectID) 
 func TestControllerClientHasIncomingRefsStoreError(t *testing.T) {
 	bh := newTestBeehive(t, &failEdgesHasIncomingStore{})
 	cc := passClients[tStatus]{bh: bh, gk: GroupKind{Kind: "T"}}
-	_, err := cc.at(1).HasIncomingEdges(context.Background(), 1)
+	_, err := cc.at(1).HasIncomingEdges(context.Background())
 	require.ErrorIs(t, err, errBoom)
 }
 
@@ -1327,20 +1351,20 @@ func TestControllerClientReadEdges(t *testing.T) {
 	child := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "child"}, WithOwner(owner.ID))
 	require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, RelationDependsOn))
 
-	ref, ok, err := cc.at(child.ID).GetOwner(ctx, child.ID)
+	ref, ok, err := cc.at(child.ID).GetOwner(ctx)
 	require.NoError(t, err)
 	assert.True(t, ok)
 	assert.Equal(t, owner.ID, ref.ID)
 
-	deps, err := cc.at(child.ID).ListDependencies(ctx, child.ID)
+	deps, err := cc.at(child.ID).ListDependencies(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{owner.ID}, objectRefIDs(deps))
 
-	dependents, err := cc.at(owner.ID).ListDependents(ctx, owner.ID)
+	dependents, err := cc.at(owner.ID).ListDependents(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{child.ID}, objectRefIDs(dependents))
 
-	owned, err := cc.at(owner.ID).ListOwned(ctx, owner.ID)
+	owned, err := cc.at(owner.ID).ListOwned(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, []ObjectID{child.ID}, objectRefIDs(owned))
 }
@@ -1457,7 +1481,7 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 	})
 
 	t.Run("a read fails too", func(t *testing.T) {
-		_, _, err := captured.GetOwner(ctx, obj.ID)
+		_, _, err := captured.GetOwner(ctx)
 		assert.ErrorIs(t, err, ErrReconcileReturned, "the whole surface stops, not just the writes")
 	})
 
@@ -1543,7 +1567,6 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 	require.NoError(t, err)
 	client := NewClient[cSpec, cStatus](bh, clientTestGK)
 
-	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
 	dep := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "dep"})
 
@@ -1551,20 +1574,20 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		name string
 		call func(cc ControllerClient[cStatus]) error
 	}{
-		{"AddDependency", func(cc ControllerClient[cStatus]) error { return cc.AddDependency(ctx, obj.ID) }},
+		{"AddDependency", func(cc ControllerClient[cStatus]) error { return cc.AddDependency(ctx, dep.ID) }},
 		{"AddEvent", func(cc ControllerClient[cStatus]) error {
 			return cc.AddEvent(ctx, EventSpec{Category: "lifecycle", Reason: "Probed"})
 		}},
 		{"DeleteCondition", func(cc ControllerClient[cStatus]) error { return cc.DeleteCondition(ctx, "Synced") }},
-		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, obj.ID) }},
+		{"DeleteDependency", func(cc ControllerClient[cStatus]) error { return cc.DeleteDependency(ctx, dep.ID) }},
 		{"DeleteFinalizer", func(cc ControllerClient[cStatus]) error {
 			return cc.DeleteFinalizer(ctx, "kstack.sh/none")
 		}},
-		{"GetOwner", func(cc ControllerClient[cStatus]) error { _, _, err := cc.GetOwner(ctx, obj.ID); return err }},
-		{"HasIncomingEdges", func(cc ControllerClient[cStatus]) error { _, err := cc.HasIncomingEdges(ctx, owner.ID); return err }},
-		{"ListDependencies", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependencies(ctx, dep.ID); return err }},
-		{"ListDependents", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependents(ctx, obj.ID); return err }},
-		{"ListOwned", func(cc ControllerClient[cStatus]) error { _, err := cc.ListOwned(ctx, owner.ID); return err }},
+		{"GetOwner", func(cc ControllerClient[cStatus]) error { _, _, err := cc.GetOwner(ctx); return err }},
+		{"HasIncomingEdges", func(cc ControllerClient[cStatus]) error { _, err := cc.HasIncomingEdges(ctx); return err }},
+		{"ListDependencies", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependencies(ctx); return err }},
+		{"ListDependents", func(cc ControllerClient[cStatus]) error { _, err := cc.ListDependents(ctx); return err }},
+		{"ListOwned", func(cc ControllerClient[cStatus]) error { _, err := cc.ListOwned(ctx); return err }},
 		{"SetCondition", func(cc ControllerClient[cStatus]) error {
 			return cc.SetCondition(ctx, Condition{Type: "Synced", Status: ConditionTrue})
 		}},

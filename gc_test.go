@@ -70,7 +70,7 @@ func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc Con
 	if !held {
 		return Settled()
 	}
-	referenced, err := cc.HasIncomingEdges(ctx, obj.ID)
+	referenced, err := cc.HasIncomingEdges(ctx)
 	if err != nil {
 		return Fail(err)
 	}
