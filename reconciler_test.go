@@ -4188,3 +4188,39 @@ func TestReconcilerIndividualPassAdmissionSpreads(t *testing.T) {
 		assert.InDelta(t, want, time.Until(a.fireAt), float64(time.Second), "id %d", id)
 	}
 }
+
+// With no periodic tick behind it, a failed scan that was not retried would
+// leave the kind polling nothing for the life of the process.
+func TestReconcilerIndividualPassAdmissionRetries(t *testing.T) {
+	seen := make(chan ObjectID, 1)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) ReconcileResult {
+			seen <- id
+			return Settled()
+		},
+	}
+	store := &listIDsStore{ids: []ObjectID{7}, failures: 2}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                adapter,
+		store:                  store,
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { return 0 },
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	select {
+	case id := <-seen:
+		assert.Equal(t, ObjectID(7), id)
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the admission scan to succeed")
+	}
+	assert.Equal(t, 3, store.listCalls(), "two failures then the success")
+
+	cancel()
+	waitClosed(t, done, "run to exit")
+}
