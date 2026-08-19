@@ -805,7 +805,9 @@ is admitted by its create's push (case 1), and one collected in between is
 dropped by `forget`.
 
 A pass that returns anything else — a `RequeueAfter`, a failure, a bare
-`Unsettled` — keeps that schedule instead. `d` bounds the idle case only.
+`Unsettled` — keeps that schedule instead, and so does an object the scan meets
+mid-pass: the scan's `alarmAdmit` loses to every pending alarm. `d` bounds the
+idle case only.
 
 Tests: `TestReconcilerIndividualPassRearmsASettledObject`,
 `TestReconcilerIndividualPassYieldsToTheResult`,

@@ -57,10 +57,14 @@ caller wants a synchronized herd — and the only seam is the reconciler's
 source means no jitter, which is what a reconciler built outside `Register`
 wants.
 
-**No fourth `alarmKind`.** The re-arm uses `alarmRequeueAfter`. It is armed at
-the same site with the same lifecycle as a controller's own `RequeueAfter`, and
-the two can never contend, since the re-arm runs only when the result scheduled
-nothing. The existing arbitration is already what this wants.
+**The re-arm reuses `alarmRequeueAfter`; the scan needs `alarmAdmit`.** The
+re-arm is armed at the same site with the same lifecycle as a controller's own
+`RequeueAfter`, and the two can never contend, since it runs only when the
+result scheduled nothing. The scan is the other case: it runs beside the
+workers, so it can reach an id whose startup pass has already scheduled itself.
+`alarmAdmit` therefore loses every arbitration — checked above the floor arm, so
+a pending schedule of any kind survives — and a boot-time offset never displaces
+a `RequeueAfter` or a backoff ladder.
 
 **The admission scan subsumes the startup full pass.** Both list the same kind
 for the same reason, so `run` makes one decision — which window the startup

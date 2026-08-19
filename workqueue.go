@@ -62,6 +62,7 @@ const (
 	alarmRequeueAfter alarmKind = iota // Result.RequeueAfter: the controller's own schedule
 	alarmBackoff                       // reconciler.backoffNext: the pass failed
 	alarmFloor                         // the re-enqueue floor: the id ran too recently
+	alarmAdmit                         // the individual pass's startup scan: it yields to every other schedule
 )
 
 // absorbsAdd reports whether a is already the next dispatch, so an arriving
@@ -80,6 +81,11 @@ func (a *alarm) outranks(incoming alarmKind, fireAt time.Time) bool {
 		// A backoff always takes the slot: the ladder owns the retry and is
 		// meant to push the dispatch out.
 		return false
+	case incoming == alarmAdmit:
+		// Checked before the floor arm, so any pending schedule wins: the scan
+		// runs beside the workers, and a pass that already scheduled this id
+		// knows more than a boot-time offset.
+		return true
 	case a.kind == alarmFloor || incoming == alarmFloor:
 		// Earlier fire time wins, so a held wake never delays work already
 		// scheduled sooner and is never dropped by later work. A tie keeps the

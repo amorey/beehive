@@ -4305,3 +4305,35 @@ func TestReconcilerIndividualPassAdmissionStopsWithTheReconciler(t *testing.T) {
 	cancel()
 	waitClosed(t, done, "run to exit while the scan is still retrying")
 }
+
+// The scan runs beside the workers, so it can reach an id whose startup pass
+// already scheduled itself. A boot-time offset must not displace what that pass
+// asked for.
+func TestReconcilerIndividualPassAdmissionYieldsToALivePass(t *testing.T) {
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		store:                  &allIDsStore{ids: []ObjectID{1, 2, 3}},
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { return 0.5 },
+		maxRetryInterval:       time.Hour,
+		baseRetryInterval:      time.Minute,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	t.Cleanup(r.work.stop)
+	// 1 asked to come back soon, 2 failed and is on its ladder; 3 never ran.
+	r.scheduleNext(1, Settled().RequeueAfter(time.Second))
+	r.scheduleNext(2, Fail(errors.New("boom")))
+
+	require.NoError(t, r.admitAll(context.Background(), time.Hour))
+
+	one := alarmFor(r.work, 1)
+	require.NotNil(t, one)
+	assert.InDelta(t, time.Second, time.Until(one.fireAt), float64(time.Second), "the controller's own schedule survives")
+	two := alarmFor(r.work, 2)
+	require.NotNil(t, two)
+	assert.Equal(t, alarmBackoff, two.kind, "the failure keeps its ladder")
+	three := alarmFor(r.work, 3)
+	require.NotNil(t, three)
+	assert.InDelta(t, time.Hour/2, time.Until(three.fireAt), float64(time.Second), "an unscheduled id is admitted")
+}

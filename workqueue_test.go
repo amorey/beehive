@@ -1122,3 +1122,49 @@ func TestHubWatchScheduleSeedsFromTheGauge(t *testing.T) {
 	_, err = rx.Peek()
 	assert.ErrorIs(t, err, gobus.ErrEmpty)
 }
+
+// The startup admission scan runs beside the workers, so it must lose every
+// arbitration: a pass that already scheduled the id knows more than an offset
+// drawn at boot.
+func TestWorkQueueAdmitAlarmYieldsToAPendingSchedule(t *testing.T) {
+	tests := []struct {
+		name    string
+		pending alarmKind
+		delay   time.Duration
+	}{
+		{"a controller schedule", alarmRequeueAfter, time.Second},
+		{"a backoff", alarmBackoff, time.Second},
+		{"a floor alarm", alarmFloor, time.Second},
+		{"an earlier admission", alarmAdmit, time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := newWorkQueue()
+			t.Cleanup(q.stop)
+			q.addAfter(1, tc.delay, tc.pending)
+
+			q.addAfter(1, time.Hour, alarmAdmit)
+
+			q.mu.Lock()
+			a := q.gauge.alarmFor(1)
+			q.mu.Unlock()
+			require.NotNil(t, a)
+			assert.Equal(t, tc.pending, a.kind, "the pending schedule survives")
+			assert.InDelta(t, tc.delay, time.Until(a.fireAt), float64(time.Second))
+		})
+	}
+}
+
+// Nothing pending, so the scan arms.
+func TestWorkQueueAdmitAlarmArmsAnIdleID(t *testing.T) {
+	q := newWorkQueue()
+	t.Cleanup(q.stop)
+
+	q.addAfter(1, time.Hour, alarmAdmit)
+
+	q.mu.Lock()
+	a := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	require.NotNil(t, a)
+	assert.Equal(t, alarmAdmit, a.kind)
+}

@@ -356,7 +356,9 @@ func (r *reconciler) enqueueSpread(ctx context.Context, list func(context.Contex
 		return err
 	}
 	for _, id := range ids {
-		r.work.addAfter(id, r.spread(window, 1), alarmRequeueAfter)
+		// alarmAdmit yields to a schedule already pending; a zero window
+		// enqueues outright, which is the startup pass and arms nothing.
+		r.work.addAfter(id, r.spread(window, 1), alarmAdmit)
 	}
 	return nil
 }
