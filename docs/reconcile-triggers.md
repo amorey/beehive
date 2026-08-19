@@ -833,7 +833,8 @@ queued through the same path as `Client.Requeue`. `reconciler.run` launches one
 goroutine per declared feed into its own wait group, so a feed ends with the loop it
 pokes and the work queue stops after both. Reads are
 floored at 100ms and what the floor holds back is coalesced into the next drain, so
-a hot feed on one address costs one read per window and nothing is dropped.
+a hot feed on one address costs one read per window and nothing is dropped —
+closing the channel drains what the floor was holding before the feed ends.
 
 **Restart: lost, and nothing re-derives it.** This is the one case in this document
 with no record *and* nothing in the store to recover from. Cases 13 through 16 are

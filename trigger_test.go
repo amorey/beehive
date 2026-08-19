@@ -143,6 +143,43 @@ func TestTriggerStopsOnAClosedChannel(t *testing.T) {
 	}
 }
 
+// A close ends the receives, not the addresses already taken off the channel.
+// The floor holds a poke back on the promise that it is coalesced rather than
+// dropped, and nothing re-derives one, so the last window has to drain.
+func TestTriggerDrainsWhatTheFloorHeldWhenTheChannelCloses(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		poke func(t *testing.T, r *reconciler, eager, held *RawObject)
+	}{
+		{"by id", func(t *testing.T, r *reconciler, eager, held *RawObject) {
+			ch := make(chan ObjectID)
+			startTrigger(t, &trigger{r: r, ids: ch, floor: 200 * time.Millisecond})
+			ch <- eager.ID
+			ch <- held.ID
+			close(ch)
+		}},
+		{"by name", func(t *testing.T, r *reconciler, eager, held *RawObject) {
+			ch := make(chan string)
+			startTrigger(t, &trigger{r: r, names: ch, floor: 200 * time.Millisecond})
+			ch <- eager.Name
+			ch <- held.Name
+			close(ch)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTriggerReconciler(t)
+			eager := triggerObject(t, r, "eager")
+			held := triggerObject(t, r, "held")
+
+			// The first poke admits the gate, so the second is inside the window.
+			tc.poke(t, r, eager, held)
+
+			assert.Equal(t, eager.ID, waitQueued(t, r.work), "the eager poke")
+			assert.Equal(t, held.ID, waitQueued(t, r.work), "the poke the floor was holding")
+		})
+	}
+}
+
 // A failed read says so and drops the poke: a retry ladder here would compete
 // with the kind's own cadence, which is the correctness behind every poke.
 func TestTriggerLogsAFailedReadAndKeepsServing(t *testing.T) {

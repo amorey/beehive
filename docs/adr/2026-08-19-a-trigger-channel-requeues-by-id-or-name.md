@@ -34,6 +34,12 @@ receive loop, its rate against the store, and its place in the lifecycle; the
 app owns the channel and what it sends. Repeated options accumulate, so a kind
 may declare several feeds, and beehive never closes one.
 
+Closing a channel ends that feed *after* draining what it already sent. The
+floor holds a poke back on the promise that it is coalesced rather than dropped,
+so returning on the close would break that promise in the one window where the
+app cannot see it happen. A cancelled context is the other case and drains
+nothing — the reads would fail on it anyway.
+
 ### It is neither a push nor a pull, and nothing recovers a lost poke
 
 [Reconcile triggers](../reconcile-triggers.md) defines a push as a *write* that

@@ -316,8 +316,9 @@ func WithIndividualPassInterval(d time.Duration) Option {
 
 // WithTriggerByID requeues each id received on ch, as Client.Requeue would —
 // retry backoff and all. An id naming nothing, or an object of another kind, is
-// a no-op, and a closed ch stops that feed. Repeated options accumulate;
-// meaningful only at Register, and a channel serves one kind.
+// a no-op, and closing ch ends that feed once what it already sent has drained.
+// Repeated options accumulate; meaningful only at Register, and a channel serves
+// one kind.
 //
 // A poke is a latency hint that nothing records, so correctness rests on the
 // kind's own cadence. See

@@ -65,11 +65,13 @@ func (t *trigger) run(ctx context.Context) {
 			return
 		case id, ok := <-t.ids:
 			if !ok {
+				t.drain(ctx, pending)
 				return
 			}
 			pending[addr{id: id}] = struct{}{}
 		case name, ok := <-t.names:
 			if !ok {
+				t.drain(ctx, pending)
 				return
 			}
 			pending[addr{name: name}] = struct{}{}
@@ -88,11 +90,19 @@ func (t *trigger) run(ctx context.Context) {
 		// Disarm before draining, or the timer fires on an empty pending.
 		timer.Stop()
 		armed = false
-		for a := range pending {
-			t.poke(ctx, a)
-		}
-		clear(pending)
+		t.drain(ctx, pending)
 	}
+}
+
+// drain resolves everything accumulated since the last one and empties the set.
+// The close arms above call it past the floor deliberately: the floor paces a
+// stream of pokes, and this is the last one. A cancelled ctx gets no such drain
+// — the reads would fail on it anyway.
+func (t *trigger) drain(ctx context.Context, pending map[addr]struct{}) {
+	for a := range pending {
+		t.poke(ctx, a)
+	}
+	clear(pending)
 }
 
 // poke resolves a within the kind and queues what it found. An address that
