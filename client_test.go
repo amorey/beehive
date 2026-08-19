@@ -3767,3 +3767,22 @@ func TestClientCreateOrUpdateWakesTheKindOnUpdate(t *testing.T) {
 	assert.Equal(t, obj.ID, evt.Object.ID)
 	assert.Equal(t, "v2", evt.Object.Spec.Val)
 }
+
+// Both branches share one transaction, which is the verb's reason to exist.
+// The absent-row assertion is what pins it: hoist the insert into a transaction
+// of its own and it commits before the decode fails, leaving the row behind.
+func TestClientCreateOrUpdateRollsBackOnDecodeError(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	gk := GroupKind{Kind: "BadDecode"}
+	client := NewClient[badDecodeSpec, cStatus](bh, gk)
+
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", badDecodeSpec{Val: "a"})
+	require.Error(t, err, "the new row's bytes must fail to decode")
+	assert.Nil(t, obj)
+	assert.False(t, created, "a rolled-back create must report created=false")
+
+	_, err = store.Objects().GetByName(ctx, gk, "w1")
+	require.ErrorIs(t, err, ErrNotFound, "the insert must roll back with the decode")
+}
