@@ -241,6 +241,14 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		bh.wg.Go(func() {
 			r.run(runCtx)
 		})
+		// A trigger is not a driver: it services a feed the app owns. runCtx is
+		// what ends it, and a poke that lands after the cancel finds the workers
+		// already returned.
+		for _, trig := range r.triggers {
+			bh.wg.Go(func() {
+				trig.run(runCtx)
+			})
+		}
 	}
 
 	bh.wg.Go(func() {

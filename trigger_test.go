@@ -226,6 +226,70 @@ func TestTriggerCoalescesInsideTheFloor(t *testing.T) {
 	waitClosed(t, done, "the trigger loop to return")
 }
 
+// Start launches the declared feeds; parked leaves the trigger the only thing
+// that can dispatch once the startup pass has settled the object.
+func TestTriggerDispatchesAfterStart(t *testing.T) {
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, parked()...)
+
+	passes := make(chan ObjectID, 4)
+	ctl := &funcController{fn: func(_ context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+		passes <- obj.ID
+		return Settled()
+	}}
+	ch := make(chan string)
+	registerWithClient(t, bh, clientTestGK, ctl, WithTriggerByName(ch))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, "one", cSpec{})
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
+
+	require.Equal(t, obj.ID, waitRead(t, passes), "the startup pass settles it first")
+
+	sendName(t, ch, "one")
+	assert.Equal(t, obj.ID, waitRead(t, passes), "the trigger dispatched a settled object")
+}
+
+// The app owns the channel and beehive never closes it, so stop must not wait
+// on a producer: an idle feed with nothing to say still drains promptly.
+func TestTriggerDoesNotHoldUpStop(t *testing.T) {
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store, parked()...)
+
+	ch := make(chan string)
+	registerWithClient(t, bh, clientTestGK, &noopController[cSpec, cStatus]{}, WithTriggerByName(ch))
+
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+
+	require.NoError(t, stop(ctx))
+
+	// The feed outlives the beehive that read it; a poke now reaches nobody.
+	select {
+	case ch <- "one":
+		t.Fatal("a stopped beehive must not still be servicing the feed")
+	default:
+	}
+}
+
+// sendName pokes a running feed, or fails the test rather than blocking on a
+// beehive that is not servicing it.
+func sendName(t *testing.T, ch chan<- string, name string) {
+	t.Helper()
+	select {
+	case ch <- name:
+	case <-time.After(testTimeout):
+		t.Fatalf("timed out sending %q: nothing is servicing the feed", name)
+	}
+}
+
 // waitRead takes one recorded store read, or fails the test.
 func waitRead(t *testing.T, reads <-chan ObjectID) ObjectID {
 	t.Helper()
