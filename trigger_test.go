@@ -91,3 +91,44 @@ func TestTriggerByIDRequeuesTheObject(t *testing.T) {
 	cancel()
 	waitClosed(t, done, "the trigger loop to return")
 }
+
+func TestTriggerByNameRequeuesTheObject(t *testing.T) {
+	r := newTriggerReconciler(t)
+	obj := triggerObject(t, r, "one")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan string)
+	done := runTrigger(ctx, &trigger{r: r, names: ch})
+
+	ch <- "one"
+	assert.Equal(t, obj.ID, waitQueued(t, r.work))
+
+	cancel()
+	waitClosed(t, done, "the trigger loop to return")
+}
+
+// A name the kind does not hold is the app's business, not an error: whether a
+// record exists for an address changes under the producer. "" is the same
+// branch — the ErrInvalidName check lives on Client, above the store.
+func TestTriggerByNameIgnoresAnUnknownName(t *testing.T) {
+	r := newTriggerReconciler(t)
+	obj := triggerObject(t, r, "one")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan string)
+	done := runTrigger(ctx, &trigger{r: r, names: ch})
+
+	ch <- "no-such-name"
+	ch <- ""
+	// The known name behind them proves the loop survived both and that
+	// neither queued anything: one signal, one id.
+	ch <- "one"
+	assert.Equal(t, obj.ID, waitQueued(t, r.work))
+	_, ok := r.work.get()
+	assert.False(t, ok, "an unresolvable name must queue nothing")
+
+	cancel()
+	waitClosed(t, done, "the trigger loop to return")
+}
