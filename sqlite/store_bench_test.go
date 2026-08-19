@@ -221,7 +221,6 @@ func benchSpecWrite(b *testing.B, specKB, conds int, mode string) {
 	require.False(b, changed)
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
 		switch mode {
 		case "txn":
@@ -239,6 +238,8 @@ func benchSpecWrite(b *testing.B, specKB, conds int, mode string) {
 				_, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"n":%d}`, i), 0)
 				return err
 			})
+		default:
+			b.Fatalf("unknown mode %q", mode)
 		}
 		require.NoError(b, err)
 	}

@@ -14,12 +14,11 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-In flight, from [#126](https://github.com/amorey/beehive/issues/126):
+Nothing in flight.
 
-- [A name-keyed CreateOrUpdate](2026-08-19-a-name-keyed-create-or-update.md) —
-  proposed, not decided.
-
-Also from #126, and both closed: [a spec write refuses a deletion-pending
-row](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md) shipped, and the
-probe that was to follow it was
-[measured and dropped](../adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md).
+[#126](https://github.com/amorey/beehive/issues/126) produced three, all closed:
+[a spec write refuses a deletion-pending
+row](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md) and [a name-keyed
+CreateOrUpdate](../adr/2026-08-19-a-name-keyed-create-or-update.md) shipped, and
+the probe between them was [measured and
+dropped](../adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md).
