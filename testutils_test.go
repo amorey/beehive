@@ -1081,16 +1081,6 @@ func changedAt(versions ...int64) []ObjectWrite {
 // seedProbe answers the waker's seed read itself — the wrapped store serves
 // everything else — and reports what it was asked. onRead runs inside the read,
 // for a test that needs to act at that instant.
-// noWithinStore fails every transaction, so a verb that reaches one is caught
-// by the error it returns instead of the sentinel its caller expected.
-type noWithinStore struct {
-	Store
-}
-
-func (s *noWithinStore) Within(context.Context, func(context.Context) error) error {
-	return errBoom
-}
-
 type seedProbe struct {
 	Store
 	mark    int64

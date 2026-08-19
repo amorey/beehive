@@ -343,6 +343,11 @@ func TestClientRejectsEmptyName(t *testing.T) {
 		_, err := client.UpdateByName(ctx, "", cSpec{Val: "a"})
 		require.ErrorIs(t, err, ErrInvalidName)
 	})
+	t.Run("CreateOrUpdate", func(t *testing.T) {
+		_, created, err := client.CreateOrUpdate(ctx, "", cSpec{Val: "a"})
+		require.ErrorIs(t, err, ErrInvalidName)
+		assert.False(t, created)
+	})
 	t.Run("Get", func(t *testing.T) {
 		// Not ErrNotFound: that would send the caller hunting for a missing row
 		// when what is missing is a config value.
@@ -369,6 +374,9 @@ func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 	bad := NewClient[errMarshaler, cStatus](bh, clientTestGK)
 	_, err := bad.Create(ctx, "", errMarshaler{})
 	require.ErrorIs(t, err, ErrInvalidName)
+	_, created, err := bad.CreateOrUpdate(ctx, "", errMarshaler{})
+	require.ErrorIs(t, err, ErrInvalidName)
+	assert.False(t, created)
 
 	after, err := client.List(ctx)
 	require.NoError(t, err)
@@ -3737,10 +3745,18 @@ func TestClientCreateOrUpdateEnqueuesOnlyAChangedUpdate(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
 	settle(t, ctx, cc, r, obj)
 
-	_, created, err := client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "a"})
+	before, err := cc.bh.store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+
+	same, created, err := client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "a"})
 	require.NoError(t, err)
 	require.False(t, created)
 	assert.Empty(t, queuedIDs(r.work), "byte-identical bytes write nothing, so nothing is owed")
+	assert.Equal(t, obj.Generation, same.Generation)
+
+	after, err := cc.bh.store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "an identical spec must append nothing")
 
 	_, _, err = client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "b"})
 	require.NoError(t, err)
@@ -3867,19 +3883,6 @@ func TestClientCreateOrUpdateRefusesADeletingRow(t *testing.T) {
 	assert.Equal(t, "a", got.Spec.Val)
 }
 
-// The store rejects "" too, so the sentinel alone proves nothing about where
-// the check ran. Refusing the transaction is what pins checkName to the front,
-// which is the point of it: a bad name must not take the write lock.
-func TestClientCreateOrUpdateRejectsAnEmptyNameBeforeTheTransaction(t *testing.T) {
-	ctx := context.Background()
-	bh := newTestBeehive(t, &noWithinStore{Store: newClientTestStore(t)})
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	_, created, err := client.CreateOrUpdate(ctx, "", cSpec{Val: "a"})
-	require.ErrorIs(t, err, ErrInvalidName)
-	assert.False(t, created)
-}
-
 // The resolve is kind-scoped, so another kind holding the name is not found and
 // this creates its own row under the same name.
 func TestClientCreateOrUpdateIsKindScoped(t *testing.T) {
@@ -3898,30 +3901,6 @@ func TestClientCreateOrUpdateIsKindScoped(t *testing.T) {
 	untouched, err := other.GetByName(ctx, "shared")
 	require.NoError(t, err)
 	assert.Equal(t, "theirs", untouched.Spec.Val)
-}
-
-// Byte-identical bytes reach the store and it declines the write, so nothing is
-// appended to the log the watch tailers and the waker read.
-func TestClientCreateOrUpdateWritesNothingForIdenticalBytes(t *testing.T) {
-	ctx := context.Background()
-	bh := newTestBeehive(t, newClientTestStore(t))
-
-	client := NewClient[cSpec, cStatus](bh, clientTestGK)
-	first, _, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.NoError(t, err)
-
-	before, err := bh.store.GetLatestResourceVersion(ctx)
-	require.NoError(t, err)
-
-	second, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
-	require.NoError(t, err)
-	assert.False(t, created)
-	assert.Equal(t, first.Generation, second.Generation)
-	assert.Equal(t, first.ResourceVersion, second.ResourceVersion)
-
-	after, err := bh.store.GetLatestResourceVersion(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, before, after, "an identical spec must append nothing")
 }
 
 // The one behavioural difference from GetOrCreate: the update branch decodes

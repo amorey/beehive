@@ -299,10 +299,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on
   its own; `Within` groups writes that must land together. Id-keyed writes are
   scoped to the caller's `GroupKind` (`ErrWrongKind`). `CreateOrUpdate` is the one
-  name-keyed upsert, and it exists because the two-call composition has a right
-  order and a wrong one: start with `GetOrCreate` and the loser of a concurrent
-  create writes its spec onto the winner's row, start with `UpdateByName` and it
-  silently does not. `Create`, `GetOrCreate` and `Delete` still never write to a
+  name-keyed upsert; `Create`, `GetOrCreate` and `Delete` still never write to a
   row they found.
   → [ADR](docs/adr/2026-08-19-a-name-keyed-create-or-update.md) **A
   write's durable record is what a driver lists**: a spec write bumps the
@@ -315,8 +312,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   stamp and the byte compare, and that order is contractual on `Store`.
   → [ADR](docs/adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md)
   **A converged spec write still takes its transaction**: skipping it on a
-  lock-free probe was measured at 6µs against a cost of one extra read per real
-  write, and declined. `BenchmarkConvergedSpecWrite` holds the numbers.
+  lock-free probe was measured and declined.
   → [ADR](docs/adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md)
   A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being

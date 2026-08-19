@@ -64,6 +64,19 @@ Kubernetes-inspired that is a false cognate: apply there means server-side apply
 spec, so a reader who knows the Kubernetes meaning would be wrong in the
 direction that clobbers.
 
+### Not `Client.Within`
+
+The general alternative is a transaction handle on `Client`, which would serve
+every multi-call composition rather than this one. It is refused because it hands
+arbitrary caller code `BEGIN IMMEDIATE` on a single-connection store, for as long
+as that code runs — the cost
+[#126](https://github.com/amorey/beehive/issues/126) was about in the first
+place. `ControllerClient.Within` is bounded by a pass beehive dispatched; a
+`Client` is held by the embedder and reaches anywhere.
+
+So the rule is: a composition that must be atomic earns a verb, not a handle.
+A second such verb is a second ADR, not a reason to reopen this one.
+
 ### The deletion-pending answer
 
 `ErrDeletionPending`, not the issue's proposal 3, "a tombstoned row returned

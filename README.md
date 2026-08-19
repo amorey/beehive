@@ -529,21 +529,19 @@ never two store calls. The hazard is only in composing two of them.
 
 The two name-keyed creates differ **only in what they do when the name is taken**, and that holds under concurrency. `GetOrCreate` does its read and write in one transaction, so two callers racing on a name never both insert — the loser sees the winner's row and returns it. `Create` does no lookup at all, so the loser of that race fails on `UNIQUE`, just as it would against a row that was already there:
 
-| Name already held by    | `Create`         | `GetOrCreate`                         | `UpdateByName`       |
-| ----------------------- | ---------------- | ------------------------------------- | -------------------- |
-| nothing                 | creates          | creates, `created=true`               | `ErrNotFound`        |
-| a live row              | fails (`UNIQUE`) | returns it untouched, `created=false` | writes the spec      |
-| a deletion-pending row  | fails (`UNIQUE`) | returns it untouched, `created=false` | `ErrDeletionPending` |
+| Name already held by    | `Create`         | `GetOrCreate`                         | `UpdateByName`       | `CreateOrUpdate`             |
+| ----------------------- | ---------------- | ------------------------------------- | -------------------- | ---------------------------- |
+| nothing                 | creates          | creates, `created=true`               | `ErrNotFound`        | creates, `created=true`      |
+| a live row              | fails (`UNIQUE`) | returns it untouched, `created=false` | writes the spec      | writes the spec, `created=false` |
+| a deletion-pending row  | fails (`UNIQUE`) | returns it untouched, `created=false` | `ErrDeletionPending` | `ErrDeletionPending`         |
 
 The bottom row is one state read three ways, and the differences are the point. A deletion-pending row still holds its name, so `Create` cannot take it. It is still readable, so `GetOrCreate` hands it back. But a pass on it runs collection rather than reconcile, so a spec written onto it would be discarded — and would wake every watcher and dependent on the way — so `Update` and `UpdateByName` refuse it with **`ErrDeletionPending`** instead.
 
 That sentinel is deliberately not `ErrNotFound`, because the two ask for opposite responses: absent means create it, pending means you cannot until GC releases the name. A caller whose object is owned answers it by doing nothing — [a physical delete pushes its owner](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md), so the owner's next pass creates the replacement. Left unhandled inside a `Reconcile` it surfaces as a failure and enters the retry ladder, against a condition that retrying does not clear.
 
-**`CreateOrUpdate` is the name-keyed upsert.** Neither create branch ever writes to a row it found, so `GetOrCreate` alone never changes an existing object. `CreateOrUpdate` does: it makes whatever holds the name hold the spec, creating it if absent, and `created` says which happened. The resolve and the write are one transaction.
+**`CreateOrUpdate` is the name-keyed upsert.** `Create` and `GetOrCreate` never write to a row they found, so neither changes an existing object. `CreateOrUpdate` does, in one transaction, and its options follow `GetOrCreate`'s — honoured on create, ignored on update, so it never re-parents.
 
-Composing it by hand works, but only in one order. `GetOrCreate` then `Update` on the id it returned is correct — `GetOrCreate` is atomic, so the loser of a concurrent create gets the winner's row and writes its spec onto that. `UpdateByName` first, falling back to `GetOrCreate` on `ErrNotFound`, is not: the loser gets `created=false`, no error, and its spec is never applied. `CreateOrUpdate` removes the choice.
-
-Its options follow `GetOrCreate`'s: honoured on create, ignored on update, so it never re-parents. A deletion-pending row is refused with `ErrDeletionPending` rather than rewritten.
+Composing it by hand works, but only in one order: `GetOrCreate` then `Update` on the id it returned. Starting from `UpdateByName` and falling back on `ErrNotFound` loses the spec when a concurrent create wins, silently. `CreateOrUpdate` removes the choice. → [ADR](docs/adr/2026-08-19-a-name-keyed-create-or-update.md)
 
 Re-applying the spec a row already holds does nothing at all: no generation bump, no `resource_version` bump, and so nothing for a scan to find — no watch delivery, no reconcile. That matters when a controller re-applies a spec of its own kind on every pass, because the object stays settled instead of owing itself another pass forever.
 
