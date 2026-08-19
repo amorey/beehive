@@ -270,7 +270,7 @@ func TestPassClientBindsThePassObject(t *testing.T) {
 	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 	sibling := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "x"})
 
-	cc := newPassClient[cStatus](bh, clientTestGK, obj.ID)
+	cc := newPassClient[cStatus](bh, clientTestGK, obj.ID, nil)
 	require.NoError(t, cc.UpdateStatus(ctx, cStatus{Val: "mine"}))
 	require.NoError(t, cc.SetCondition(ctx, Condition{Type: "Ready", Status: ConditionTrue}))
 	require.NoError(t, cc.AddEvent(ctx, EventSpec{Category: "c", Type: EventNormal, Reason: "Started"}))
@@ -1550,7 +1550,7 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		assert.True(t, named[iface.Method(i).Name], "ungated method missing from the table")
 	}
 
-	live := newPassClient[cStatus](bh, clientTestGK, obj.ID)
+	live := newPassClient[cStatus](bh, clientTestGK, obj.ID, nil)
 	for _, c := range calls {
 		t.Run(c.name+" runs while the pass runs", func(t *testing.T) {
 			// Reaching the store is the assertion; whether it likes the arguments is not.
@@ -1558,13 +1558,124 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		})
 	}
 
-	ended := newPassClient[cStatus](bh, clientTestGK, obj.ID)
+	ended := newPassClient[cStatus](bh, clientTestGK, obj.ID, nil)
 	ended.end()
 	for _, c := range calls {
 		t.Run(c.name+" refuses once the pass has ended", func(t *testing.T) {
 			assert.ErrorIs(t, c.call(ended), ErrReconcileReturned)
 		})
 	}
+}
+
+// countingStatusStore counts the status writes that reach the store, so a test
+// can tell a skipped write from one the store compared and declined.
+type countingStatusStore struct {
+	Store
+	statusWrites atomic.Int64
+}
+
+func (s *countingStatusStore) Objects() storeapi.Objects {
+	inner := s.Store.Objects()
+	return objectsOverride{
+		Objects: inner,
+		updateStatus: func(ctx context.Context, gk GroupKind, id ObjectID, status []byte, v int) (bool, error) {
+			s.statusWrites.Add(1)
+			return inner.UpdateStatus(ctx, gk, id, status, v)
+		},
+	}
+}
+
+// newStatusBaselineFixture stores one object and returns a pass client bound to
+// it, carrying the baseline the reconcile loop would have handed over.
+func newStatusBaselineFixture(t *testing.T) (
+	context.Context, *countingStatusStore, *Beehive, *controllerClientImpl[cStatus], ObjectID,
+) {
+	t.Helper()
+	ctx := context.Background()
+	store := &countingStatusStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+	return ctx, store, bh, passClientAt(t, ctx, bh, store, obj.ID), obj.ID
+}
+
+// passClientAt builds the client a pass would get for id: bound to the object,
+// carrying the status bytes as currently stored.
+func passClientAt(
+	t *testing.T, ctx context.Context, bh *Beehive, store Store, id ObjectID,
+) *controllerClientImpl[cStatus] {
+	t.Helper()
+	raw, err := store.Objects().Get(ctx, id)
+	require.NoError(t, err)
+	return newPassClient[cStatus](bh, clientTestGK, id, newStatusBaseline(raw.Status, raw.StatusVersion))
+}
+
+// The bytes the pass was handed are what the store holds, so a status equal to
+// them is a write the store would decline. Skip it without the transaction.
+func TestUpdateStatusSkipsWhatThePassCanSeeIsANoOp(t *testing.T) {
+	ctx, store, bh, pass, id := newStatusBaselineFixture(t)
+
+	// A first status differs from the stored NULL, so it is written. Pins that
+	// the empty baseline is "no bytes stored", not "no baseline".
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "done"}))
+	assert.EqualValues(t, 1, store.statusWrites.Load(), "a first status is a write")
+
+	// Same bytes again, this time against the baseline its own write promoted.
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "done"}))
+	assert.EqualValues(t, 1, store.statusWrites.Load(), "promotion must re-enable the skip")
+
+	// A fresh pass loads those bytes as its baseline and skips from the start.
+	next := passClientAt(t, ctx, bh, store, id)
+	require.NoError(t, next.UpdateStatus(ctx, cStatus{Val: "done"}))
+	assert.EqualValues(t, 1, store.statusWrites.Load(), "a load-time match skips too")
+}
+
+// The write-loss regression: a pass that writes A and then writes back the value
+// it was loaded with must reach the store the second time.
+func TestUpdateStatusBaselineAdvancesWithItsOwnWrites(t *testing.T) {
+	ctx, store, bh, _, id := newStatusBaselineFixture(t)
+
+	// Stored state, and the baseline a pass now loads.
+	admin := NewAdminClient[cStatus](bh, clientTestGK)
+	require.NoError(t, admin.UpdateStatus(ctx, id, cStatus{Val: "loaded"}))
+	pass := passClientAt(t, ctx, bh, store, id)
+	before := store.statusWrites.Load()
+
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "other"}))
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "loaded"}))
+	assert.EqualValues(t, before+2, store.statusWrites.Load(),
+		"the second write differs from what is stored and must not be skipped")
+
+	raw, err := store.Objects().Get(ctx, id)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"Val":"loaded"}`, string(raw.Status), "the pass's last word is what is stored")
+}
+
+// AdminClient is handed no object, so it holds no baseline: every call reaches
+// the store, and none of the baseline methods may panic on the nil.
+func TestAdminClientHasNoBaseline(t *testing.T) {
+	ctx, store, bh, _, id := newStatusBaselineFixture(t)
+
+	admin := NewAdminClient[cStatus](bh, clientTestGK)
+	require.NoError(t, admin.UpdateStatus(ctx, id, cStatus{Val: "same"}))
+	require.NoError(t, admin.UpdateStatus(ctx, id, cStatus{Val: "same"}))
+	assert.EqualValues(t, 2, store.statusWrites.Load(), "no baseline, no skip")
+}
+
+// A skip never reads, so it cannot notice that the row was collected mid-pass.
+// Documented behavior: the write would have written nothing either way.
+func TestUpdateStatusSkipOnACollectedObject(t *testing.T) {
+	ctx, store, bh, pass, id := newStatusBaselineFixture(t)
+
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "done"}))
+	next := passClientAt(t, ctx, bh, store, id)
+
+	require.NoError(t, store.Objects().Delete(ctx, id))
+	before := store.statusWrites.Load()
+
+	assert.NoError(t, next.UpdateStatus(ctx, cStatus{Val: "done"}),
+		"a skip answers from the baseline and never learns the row is gone")
+	assert.Equal(t, before, store.statusWrites.Load())
 }
 
 // A status write the store declined to make bumps no resource_version, so waking
