@@ -66,7 +66,7 @@ can be read.
 
 | Push path | Made by | Starts | Gate |
 |---|---|---|---|
-| A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` |
+| A spec write enqueues its own object | `clientImpl.signalSpecWritten` | the object that was written | the store reports `changed` — never set for a byte-identical write, or for one refused with `ErrDeletionPending` |
 | A new edge enqueues the edge's source | `ControllerClient.AddDependency` | the declaring pass's own object | `EdgesAddResult.ReconcileOwedStamped` |
 | A delete request enqueues its own object | `clientImpl.signalDeletionRequested` | the object that was marked | the store reports `marked` |
 | A cascade enqueues the children it marked | `Beehive.signalRequeueManyNow` | each newly-marked owned child | `DeletionCascadeChild.Marked` |

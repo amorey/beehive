@@ -1443,6 +1443,78 @@ func TestObjectsUpdateSpecIdenticalSpecIsNoOp(t *testing.T) {
 	probe.expectNone()
 }
 
+// A pass on a deleting row runs collection, not reconcile, so a spec written
+// here would never be applied — and it would still wake every watcher and
+// dependent on its way to being discarded.
+func TestObjectsUpdateSpecRefusesADeletingRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+	_, err := store.DeletionRequests().Create(ctx, testGK, created.ID)
+	require.NoError(t, err)
+	marked, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+
+	probe := newWriteProbe(t, store)
+
+	_, changed, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":2}`), 0)
+	require.ErrorIs(t, err, beehive.ErrDeletionPending)
+	assert.False(t, changed)
+
+	byName, changed, err := store.Objects().UpdateSpecByName(ctx, testGK, created.Name, []byte(`{"v":2}`), 0)
+	require.ErrorIs(t, err, beehive.ErrDeletionPending, "both entry points share the refusal")
+	assert.False(t, changed)
+	assert.Nil(t, byName)
+
+	after, err := store.Objects().Get(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, marked.Spec, after.Spec, "a refused write leaves the spec alone")
+	assert.Equal(t, marked.Generation, after.Generation)
+	assert.Equal(t, marked.ResourceVersion, after.ResourceVersion)
+	// Half the reason for refusing: no log entry, so no tailer and no waker wake.
+	probe.expectNone()
+}
+
+// The refusal must not depend on the bytes the caller happens to hold, or
+// "may I write this object" would be answered by the compare below it.
+func TestObjectsUpdateSpecRefusesADeletingRowForIdenticalBytes(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
+		Name: uniqueName(),
+		Spec: []byte(`{"v":1}`),
+	})
+	require.NoError(t, err)
+	_, err = store.DeletionRequests().Create(ctx, testGK, created.ID)
+	require.NoError(t, err)
+
+	_, _, err = store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":1}`), 0)
+	require.ErrorIs(t, err, beehive.ErrDeletionPending)
+}
+
+// The check sits before stampVersion: the row is going away, so a schema
+// complaint about it is noise, and the answer must not depend on which of two
+// problems the caller has. The probe spec makes this the leading check.
+func TestObjectsUpdateSpecRefusesADeletingRowBeforeTheVersionStamp(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
+		Name:        uniqueName(),
+		Spec:        []byte(`{"v":1}`),
+		SpecVersion: 3,
+	})
+	require.NoError(t, err)
+	_, err = store.DeletionRequests().Create(ctx, testGK, created.ID)
+	require.NoError(t, err)
+
+	_, _, err = store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":2}`), 2)
+	require.ErrorIs(t, err, beehive.ErrDeletionPending)
+	assert.NotErrorIs(t, err, beehive.ErrSchemaVersionDowngrade)
+}
+
 // A status write moves the row's version and no part of the handshake.
 func TestUpdateStatusRecordsStatusAlone(t *testing.T) {
 	store := newTestStore(t)
@@ -5332,19 +5404,27 @@ func TestOnlyUpdateSpecCanFailAssemblingConditions(t *testing.T) {
 	_, err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{}`), 0)
 	require.NoError(t, err,
 		"a status write does not read conditions, so a missing table cannot fail it")
-	_, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
-	require.NoError(t, err, "nor does a deletion mark")
 
 	// Both of ObjectsUpdateSpec's branches assemble conditions, by two different
 	// routes, so both fail here. A changed spec writes and scans the row back
 	// (scanWritten); an identical one returns the row it read (attachConditions
 	// directly). newConditionObject's spec is `{}`, so the order matters: the
 	// changed write has to come first for the second call to be the no-op.
+	//
+	// Both must also run before the deletion mark below, or the refusal answers
+	// them first and neither reaches the assembly this test is here for. The
+	// NotErrorIs is what keeps that regression from passing quietly, since a
+	// refusal is an error too.
 	_, _, err = store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
 	require.Error(t, err, "the write path assembles through scanWritten")
+	require.NotErrorIs(t, err, storeapi.ErrDeletionPending)
 
 	_, _, err = store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
 	require.Error(t, err, "the content no-op assembles onto the row it read")
+	require.NotErrorIs(t, err, storeapi.ErrDeletionPending)
+
+	_, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
+	require.NoError(t, err, "nor does a deletion mark")
 }
 
 func TestDeleteObjectCascadesConditions(t *testing.T) {

@@ -301,7 +301,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   scoped to the caller's `GroupKind` (`ErrWrongKind`). There is no name-keyed
   upsert — none of `Create`/`GetOrCreate`/`Delete` writes to a row it found. **A
   write's durable record is what a driver lists**: a spec write bumps the
-  generation, a delete sets `deletion_requested_at`. A spec write also enqueues
+  generation, a delete sets `deletion_requested_at`. **A spec write to a
+  deletion-pending row is refused** with `ErrDeletionPending` and appends nothing
+  to the write log — a pass on such a row runs collection, so the spec would be
+  discarded after waking every watcher and dependent. Distinct from `ErrNotFound`
+  because the answers are opposite: absent means create it, pending means you
+  cannot until GC releases the name. The refusal is checked before the schema
+  stamp and the byte compare, and that order is contractual on `Store`.
+  → [ADR](docs/adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md)
+  A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
   thirteen users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
