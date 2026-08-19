@@ -48,13 +48,14 @@ own statement wins — a failure keeps its ladder, and a bare `Unsettled` keeps 
 owed pass's cadence. `d` is a default cadence, not a ceiling; clamping would let
 a blanket option silently override the specific statement a pass just made.
 
-**Both armings are jittered upward.** The re-arm adds up to
-`individualPassJitterFrac` (a tenth) so two objects that settled together drift
-apart. The admission offset spreads across the *whole* interval, since a restart
-would otherwise re-synchronize the kind. Neither is configurable — no caller
-wants a synchronized herd — and the only seam is `withIndividualPassRand`, which
-replaces the randomness rather than the fractions so one knob makes every
-schedule in a test exact.
+**Both armings are jittered upward, by one `spread` helper.** The re-arm adds up
+to `individualPassJitterFrac` (a tenth) so two objects that settled together
+drift apart; the admission spreads across the *whole* interval, since a restart
+would otherwise re-synchronize the kind. Neither fraction is configurable — no
+caller wants a synchronized herd — and the only seam is the reconciler's
+`individualPassRand`, which a test replaces so every schedule is exact. A nil
+source means no jitter, which is what a reconciler built outside `Register`
+wants.
 
 **No fourth `alarmKind`.** The re-arm uses `alarmRequeueAfter`. It is armed at
 the same site with the same lifecycle as a controller's own `RequeueAfter`, and
@@ -62,10 +63,11 @@ the two can never contend, since the re-arm runs only when the result scheduled
 nothing. The existing arbitration is already what this wants.
 
 **The admission scan subsumes the startup full pass.** Both list the same kind
-for the same reason, so with the individual pass on, the scan drops its offset
-and `enqueueAll` is skipped. The startup pass thereby gains a retry ladder it did
-not have: `enqueueFrom` warns and skips a failed listing, which is harmless when
-a tick will come again and fatal for a scan that runs once.
+for the same reason, so `run` makes one decision — which window the startup
+listing spreads over, `0` for the startup pass and the interval otherwise — and
+`enqueueSpread` does the work for both. The startup pass thereby gains a retry
+ladder it did not have: `enqueueFrom` warns and skips a failed listing, which is
+harmless when a tick will come again and fatal for a scan that runs once.
 
 ## Consequences
 
@@ -89,6 +91,7 @@ a tick will come again and fatal for a scan that runs once.
 - **A failed admission scan retries on its own ladder** (`admitRetryBase` to
   `admitRetryMax`), not on one of the public cadences. Nothing else would re-run
   it.
-- **`!gone` is load-bearing.** Both collected paths return `Settled(), true`,
-  which lands in the branch that arms; arming there resurrects an id `forget`
-  just dropped, into a dispatch that can only read `ErrNotFound`.
+- **A collected object is never scheduled.** Both collected paths return
+  `Settled(), true`, which lands in the branch that arms, so `runWorker` skips
+  `scheduleNext` entirely after `forget`. Scheduling there would resurrect an id
+  into a dispatch that can only read `ErrNotFound`.

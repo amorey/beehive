@@ -117,8 +117,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   arms the objects no pass would reach, spread across the whole interval, and
   with the individual pass on that scan *is* the startup full pass — same
   listing, zero offset, plus the retry `enqueueAll` lacks. Both armings jitter
-  upward and neither is configurable; `withIndividualPassRand` replaces the
-  randomness so a test's schedule is exact. It reuses `alarmRequeueAfter`, since
+  upward through one `spread` helper and neither is configurable; a test sets
+  `individualPassRand` directly so its schedule is exact. It reuses `alarmRequeueAfter`, since
   the re-arm runs only where the result scheduled nothing and so can never
   contend with one. `d` is a **default cadence, not a ceiling**: a
   `RequeueAfter` wins either way, a failure keeps its ladder, and `!gone` guards
