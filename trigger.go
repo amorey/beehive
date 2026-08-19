@@ -17,6 +17,9 @@ package beehive
 import (
 	"context"
 	"errors"
+	"time"
+
+	"github.com/amorey/beehive/internal/rategate"
 )
 
 // trigger is one feed declared by WithTriggerByID or WithTriggerByName: a
@@ -26,6 +29,11 @@ type trigger struct {
 	r     *reconciler
 	ids   <-chan ObjectID
 	names <-chan string
+	// floor is the minimum gap between two drains, keeping a producer-driven
+	// read loop off the single connection; <= 0 turns it off.
+	floor time.Duration
+	// now sources the floor's clock; nil means time.Now.
+	now func() time.Time
 }
 
 // addr is one address received on a trigger channel: an id, or a name when the
@@ -38,7 +46,27 @@ type addr struct {
 // run services the feed until ctx ends or the app closes the channel. A nil
 // channel blocks forever, which is what leaves the unused half of the select
 // silent.
+//
+// The receive never reads the store: an address joins pending and a floored
+// drain resolves it, so a producer is held up by another receive at most, never
+// by the connection. pending is a set, so a hot feed on one address costs one
+// read per window; nothing is dropped, because no driver re-derives a poke.
 func (t *trigger) run(ctx context.Context) {
+	now := t.now
+	if now == nil {
+		now = time.Now
+	}
+	gate := rategate.NewSingle(t.floor)
+	pending := make(map[addr]struct{})
+
+	var timer *time.Timer
+	var opened <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -47,14 +75,39 @@ func (t *trigger) run(ctx context.Context) {
 			if !ok {
 				return
 			}
-			t.poke(ctx, addr{id: id})
+			pending[addr{id: id}] = struct{}{}
 		case name, ok := <-t.names:
 			if !ok {
 				return
 			}
-			t.poke(ctx, addr{name: name})
+			pending[addr{name: name}] = struct{}{}
+		case <-opened:
+			opened = nil
 		}
+
+		if len(pending) == 0 {
+			continue
+		}
+		opensAt, held := gate.Allow(now())
+		if held {
+			// One timer for the whole window: re-arming per arrival would
+			// push the drain out for as long as the feed keeps talking.
+			if opened == nil {
+				timer = time.NewTimer(opensAt.Sub(now()))
+				opened = timer.C
+			}
+			continue
+		}
+		t.drain(ctx, pending)
 	}
+}
+
+// drain resolves everything accumulated since the last one and empties the set.
+func (t *trigger) drain(ctx context.Context, pending map[addr]struct{}) {
+	for a := range pending {
+		t.poke(ctx, a)
+	}
+	clear(pending)
 }
 
 // poke resolves a within the kind and queues what it found. An address that

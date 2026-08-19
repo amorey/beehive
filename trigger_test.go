@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
@@ -182,6 +183,59 @@ func TestTriggerLogsAFailedReadAndKeepsServing(t *testing.T) {
 
 	cancel()
 	waitClosed(t, done, "the trigger loop to return")
+}
+
+// The floor keeps a producer-driven read loop off the single connection, and
+// what it holds back is coalesced rather than dropped: a trigger has no pull
+// behind it, so a dropped poke is never re-derived. Three pokes for one address
+// inside one window cost one read, and a distinct address joins the same drain.
+func TestTriggerCoalescesInsideTheFloor(t *testing.T) {
+	r := newTriggerReconciler(t)
+	a := triggerObject(t, r, "a")
+	b := triggerObject(t, r, "b")
+
+	reads := make(chan ObjectID, 8)
+	real := r.store
+	r.store = &objectsOverrideStore{Store: real, override: objectsOverride{
+		getMeta: func(ctx context.Context, id ObjectID) (*RawObject, error) {
+			reads <- id
+			return real.Objects().GetMeta(ctx, id)
+		},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan ObjectID)
+	done := runTrigger(ctx, &trigger{r: r, ids: ch, floor: 50 * time.Millisecond})
+
+	// The first poke is eager: an idle feed pays no added latency.
+	ch <- a.ID
+	// These land inside that window. The three for a collapse to one read, and
+	// b rides the same drain.
+	ch <- a.ID
+	ch <- a.ID
+	ch <- a.ID
+	ch <- b.ID
+
+	got := []ObjectID{waitRead(t, reads), waitRead(t, reads), waitRead(t, reads)}
+	slices.Sort(got)
+	assert.Equal(t, []ObjectID{a.ID, a.ID, b.ID}, got,
+		"the eager read, then one drain holding each address once")
+
+	cancel()
+	waitClosed(t, done, "the trigger loop to return")
+}
+
+// waitRead takes one recorded store read, or fails the test.
+func waitRead(t *testing.T, reads <-chan ObjectID) ObjectID {
+	t.Helper()
+	select {
+	case id := <-reads:
+		return id
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the trigger to read the store")
+		return 0
+	}
 }
 
 // A name the kind does not hold is the app's business, not an error: whether a

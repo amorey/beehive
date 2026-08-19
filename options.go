@@ -332,7 +332,7 @@ func WithTriggerByID(ch <-chan ObjectID) Option {
 			return fmt.Errorf("%w: WithTriggerByID needs a non-nil channel", ErrInvalidOption)
 		}
 		if t, ok := target.(*reconciler); ok {
-			t.triggers = append(t.triggers, &trigger{r: t, ids: ch})
+			t.triggers = append(t.triggers, &trigger{r: t, ids: ch, floor: defaultTriggerFloor})
 		}
 		return nil
 	}
@@ -350,7 +350,7 @@ func WithTriggerByName(ch <-chan string) Option {
 			return fmt.Errorf("%w: WithTriggerByName needs a non-nil channel", ErrInvalidOption)
 		}
 		if t, ok := target.(*reconciler); ok {
-			t.triggers = append(t.triggers, &trigger{r: t, names: ch})
+			t.triggers = append(t.triggers, &trigger{r: t, names: ch, floor: defaultTriggerFloor})
 		}
 		return nil
 	}

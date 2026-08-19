@@ -94,6 +94,9 @@ const (
 	// Floors the gap between two wake-driven drains, so a write stream cannot
 	// make its kind's tailer hold the single connection back from the writers.
 	defaultWatchScanMinInterval = 100 * time.Millisecond
+	// The same floor for a trigger channel, whose rate is set by a producer
+	// outside this process. What it holds back is coalesced, never dropped.
+	defaultTriggerFloor = 100 * time.Millisecond
 	// The first retry after a failed tail step; it doubles up to watchRetryMax.
 	watchRetryBase = 100 * time.Millisecond
 	// watchRetryMax caps that ladder. Its own constant rather than the floor: the
