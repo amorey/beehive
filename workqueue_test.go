@@ -1210,3 +1210,51 @@ func TestWorkQueueBackoffReplacesACadenceAlarm(t *testing.T) {
 	assert.Equal(t, alarmBackoff, a.kind)
 	assert.InDelta(t, time.Minute, time.Until(a.fireAt), float64(time.Second), "the ladder's delay, not the cadence's")
 }
+
+// alarmAdmit loses as the pending kind too, or a boot offset landing inside the
+// floor window swallows the wake the floor was holding.
+func TestWorkQueueAPendingAdmitAlarmLosesToEverything(t *testing.T) {
+	tests := []struct {
+		name     string
+		incoming alarmKind
+	}{
+		{"a floor alarm", alarmFloor},
+		{"a controller schedule", alarmRequeueAfter},
+		{"a backoff", alarmBackoff},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := newWorkQueue()
+			t.Cleanup(q.stop)
+			q.addAfter(1, time.Minute, alarmAdmit) // sooner than the incoming one
+
+			q.addAfter(1, time.Hour, tc.incoming)
+
+			a := alarmFor(q, 1)
+			require.NotNil(t, a)
+			assert.Equal(t, tc.incoming, a.kind, "the admission must not survive")
+		})
+	}
+}
+
+// The wake behind a dropped floor alarm must not vanish: an admission alarm
+// that takes the floor's slot is dropped mid-pass, leaving the id neither dirty
+// nor scheduled.
+func TestWorkQueueAdmitAlarmDoesNotSwallowAHeldWake(t *testing.T) {
+	q := throttled(time.Hour)
+	t.Cleanup(q.stop)
+	q.add(1)
+	id, ok := q.get() // the pass starts; the floor closes behind it
+	require.True(t, ok)
+	q.addAfter(1, time.Minute, alarmAdmit) // a boot offset inside the floor window
+
+	q.add(1) // the wake: held by the floor
+
+	a := alarmFor(q, 1)
+	require.NotNil(t, a)
+	require.Equal(t, alarmFloor, a.kind, "the floor owns the held wake")
+	q.timerFired(1, a)
+	q.done(id)
+
+	assert.False(t, q.scheduleAt(1).NextRequeueAt.IsZero(), "the wake is still scheduled")
+}

@@ -86,6 +86,11 @@ func (a *alarm) outranks(incoming alarmKind, fireAt time.Time) bool {
 		// runs beside the workers, and a pass that already scheduled this id
 		// knows more than a boot-time offset.
 		return true
+	case a.kind == alarmAdmit:
+		// And it loses pending, or an offset landing inside the floor window
+		// takes the slot the floor was holding a wake in — then goes silently
+		// when it fires mid-pass, leaving nothing to dispatch.
+		return false
 	case a.kind == alarmFloor || incoming == alarmFloor:
 		// Earlier fire time wins, so a held wake never delays work already
 		// scheduled sooner and is never dropped by later work. A tie keeps the
