@@ -145,6 +145,14 @@ func runInBackground(r *reconciler, ctx context.Context) <-chan struct{} {
 	return done
 }
 
+// alarmFor reads an id's pending alarm under the queue's lock: a timer firing
+// concurrently writes the same map.
+func alarmFor(q *workQueue, id ObjectID) *alarm {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.gauge.alarmFor(id)
+}
+
 func TestRunExitsOnCancelWithFullPassDisabled(t *testing.T) {
 	// fullPassInterval <= 0 means no ticker is created (NewTicker would panic).
 	r := &reconciler{fullPassInterval: 0}
@@ -4027,9 +4035,11 @@ func TestReconcilerNoIndividualPassArmsNothing(t *testing.T) {
 	adapter := &fakeAdapter{reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult { return Settled() }}
 	r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
 
+	t.Cleanup(r.work.stop)
+
 	r.scheduleNext(1, Settled())
 
-	assert.Nil(t, r.work.gauge.alarmFor(1))
+	assert.Nil(t, alarmFor(r.work, 1))
 }
 
 // A collected object comes back Settled, which is the branch that arms. Arming
@@ -4061,7 +4071,7 @@ func TestReconcilerIndividualPassArmsNothingForACollectedObject(t *testing.T) {
 	cancel()
 	waitClosed(t, done, "run to exit")
 
-	assert.Nil(t, r.work.gauge.alarmFor(1))
+	assert.Nil(t, alarmFor(r.work, 1))
 }
 
 // What the individual pass must not override. It is a default cadence, not a
@@ -4078,7 +4088,7 @@ func TestReconcilerIndividualPassYieldsToTheResult(t *testing.T) {
 	}{
 		{"a sooner RequeueAfter wins", Settled().RequeueAfter(time.Second), time.Second, alarmRequeueAfter},
 		{"a later RequeueAfter wins too", Settled().RequeueAfter(time.Hour), time.Hour, alarmRequeueAfter},
-		{"a failure keeps its ladder", Fail(errors.New("boom")), 5 * time.Millisecond, alarmBackoff},
+		{"a failure keeps its ladder", Fail(errors.New("boom")), time.Minute, alarmBackoff},
 		{"unsettled keeps the owed cadence", Unsettled(), defaultOwedPassInterval, alarmRequeueAfter},
 		{"settled with nothing owed takes the individual pass", Settled(), d, alarmRequeueAfter},
 	}
@@ -4088,14 +4098,17 @@ func TestReconcilerIndividualPassYieldsToTheResult(t *testing.T) {
 				work:                   newWorkQueue(),
 				individualPassInterval: d,
 				owedPassInterval:       defaultOwedPassInterval,
-				maxRetryInterval:       time.Second,
-				baseRetryInterval:      5 * time.Millisecond,
+				maxRetryInterval:       time.Hour,
+				baseRetryInterval:      time.Minute,
 				backoffFor:             make(map[ObjectID]time.Duration),
 			}
+			// Every delay here is minutes out, and stop cancels what is left:
+			// an alarm firing after its test lands in whichever test is running.
+			t.Cleanup(r.work.stop)
 
 			r.scheduleNext(1, tc.result)
 
-			a := r.work.gauge.alarmFor(1)
+			a := alarmFor(r.work, 1)
 			require.NotNil(t, a)
 			assert.Equal(t, tc.kind, a.kind)
 			assert.InDelta(t, tc.want, time.Until(a.fireAt), float64(time.Second))
@@ -4182,12 +4195,14 @@ func TestReconcilerIndividualPassAdmissionSpreads(t *testing.T) {
 		backoffFor:             make(map[ObjectID]time.Duration),
 	}
 
+	t.Cleanup(r.work.stop)
+
 	require.NoError(t, r.admitAll(context.Background(), time.Hour))
 
 	// Id 1 drew 0 and is due now; the rest are spread over the interval.
-	assert.Nil(t, r.work.gauge.alarmFor(1), "a zero offset dispatches rather than arming")
+	assert.Nil(t, alarmFor(r.work, 1), "a zero offset dispatches rather than arming")
 	for id, want := range map[ObjectID]time.Duration{2: time.Hour / 4, 3: time.Hour / 2} {
-		a := r.work.gauge.alarmFor(id)
+		a := alarmFor(r.work, id)
 		require.NotNil(t, a, "id %d", id)
 		assert.InDelta(t, want, time.Until(a.fireAt), float64(time.Second), "id %d", id)
 	}
