@@ -2475,7 +2475,7 @@ func TestOwedPassTickDispatchesOwedWake(t *testing.T) {
 	real, reconciled := newOwedPassHarness(t, gk, func(s wakeStampingStore) {
 		raw, err := s.Objects().Create(ctx, gk, ObjectsCreateInput{Name: uniqueName(), Spec: []byte(`{}`)})
 		require.NoError(t, err)
-		err = s.Objects().UpdateStatus(ctx, gk, raw.ID, []byte(`{}`), 0)
+		_, err = s.Objects().UpdateStatus(ctx, gk, raw.ID, []byte(`{}`), 0)
 		require.NoError(t, err)
 		id = raw.ID
 	})

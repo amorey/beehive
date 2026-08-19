@@ -780,7 +780,7 @@ func (fakeObjects) UpdateSpecByName(context.Context, GroupKind, string, []byte, 
 	panic("not implemented: fakeStore.Objects().UpdateSpecByName")
 }
 
-func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, []byte, int) error {
+func (fakeObjects) UpdateStatus(context.Context, GroupKind, ObjectID, []byte, int) (bool, error) {
 	panic("not implemented: fakeStore.Objects().UpdateStatus")
 }
 
@@ -807,7 +807,7 @@ type objectsOverride struct {
 	delete             func(context.Context, ObjectID) error
 	updateSpec         func(context.Context, GroupKind, ObjectID, []byte, int) (*RawObject, bool, error)
 	getByName          func(context.Context, GroupKind, string) (*RawObject, error)
-	updateStatus       func(context.Context, GroupKind, ObjectID, []byte, int) error
+	updateStatus       func(context.Context, GroupKind, ObjectID, []byte, int) (bool, error)
 	setObservedGen     func(context.Context, GroupKind, ObjectID, int64) (bool, error)
 }
 
@@ -902,7 +902,7 @@ func (o objectsOverride) GetByName(ctx context.Context, gk GroupKind, name strin
 	return o.Objects.GetByName(ctx, gk, name)
 }
 
-func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte, version int) error {
+func (o objectsOverride) UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte, version int) (bool, error) {
 	if o.updateStatus != nil {
 		return o.updateStatus(ctx, gk, id, status, version)
 	}

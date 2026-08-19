@@ -411,8 +411,8 @@ because its own generation never moved. The cost is time, never divergence.
 See [the ADR](adr/2026-07-30-durable-waker-cursor.md).
 
 **What bumps a target's `resource_version`**, and thus wakes its dependents, is
-wider than a spec change. The full list is `Objects().Create`, `Objects().UpdateSpec`, the
-content and handshake-only paths of `Objects().UpdateStatus`,
+wider than a spec change. The full list is `Objects().Create`, `Objects().UpdateSpec`,
+`Objects().UpdateStatus` when the bytes or the status schema version change,
 `Objects().SetObservedGeneration`, `Conditions().Set`,
 `Conditions().Delete`, `Objects().DeleteFinalizer`, `markForDeletion`, and the cascade mark.
 `Events().Add` is the one write that does not bump it. That is by design.

@@ -780,9 +780,10 @@ type Objects interface {
 	// leaves SetObservedGeneration the sole writer of observed_generation and so
 	// that column monotonic.
 	//
-	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
-	// Returns no row.
-	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte, statusVersion int) error
+	// Changed reports whether it wrote, so a caller can gate a wake on the write
+	// rather than on the call. Scoped to gk: wrong kind → ErrWrongKind, missing
+	// id → ErrNotFound. Returns no row.
+	UpdateStatus(ctx context.Context, gk GroupKind, id ObjectID, status []byte, statusVersion int) (changed bool, err error)
 }
 
 // Dependencies is the dependency-watermark table: what each dependent was last

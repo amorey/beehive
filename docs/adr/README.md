@@ -60,6 +60,7 @@ for the mapping.
 - [The driver cadences are configurable, because every trigger pushes at commit](2026-08-06-driver-cadences-are-configurable.md)
 - [The startup full pass may be depended on; the periodic one may not](2026-08-07-the-startup-pass-may-be-depended-on.md)
 - [A per-object cadence is armed by a pass and admitted by a startup scan](2026-08-19-an-individual-pass-interval.md)
+- [A pass skips a status write it can see is a no-op](2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md)
 - [A spec write enqueues its own object](2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [The dependency waker persists its scan cursor](2026-07-30-durable-waker-cursor.md)

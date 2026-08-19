@@ -95,7 +95,8 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	}
 	raw := &load.Object
 	deleting := raw.DeletionRequestedAt != nil
-	obj, err := rawToTyped[Spec, Status](raw, t.bh.migratorFor(t.gk))
+	migrator := t.bh.migratorFor(t.gk)
+	obj, err := rawToTyped[Spec, Status](raw, migrator)
 	if err != nil {
 		// Quarantine, as List and the watch polls do: returning the error would
 		// retry the identical bytes forever under backoff. Treated as a no-op
@@ -120,6 +121,9 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 	// Ended below, before beehive's own writes: nothing the controller captured
 	// may write past that point.
 	pass := newPassClient[Status](t.bh, t.gk, obj.ID)
+	// The status as loaded: what a status write must differ from to be worth a
+	// transaction.
+	pass.baseline = newStatusBaseline(raw, migratorStatusVersion(migrator))
 	// Normalized before any gate below reads it.
 	result := t.inner.Reconcile(ctx, pass, obj).normalize()
 	pass.end()

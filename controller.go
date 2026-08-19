@@ -81,8 +81,10 @@ type ControllerClient[Status any] interface {
 	// stamping as SetCondition.
 	SetConditions(ctx context.Context, conditions []Condition) error
 	// UpdateStatus records status and nothing else — the handshake is beehive's,
-	// recorded by returning Settled. Status that marshals to the stored bytes
-	// writes nothing, so a controller can report on every poll.
+	// recorded by returning Settled. Status that marshals to the bytes this pass
+	// was loaded with writes nothing and reaches no store, so a controller can
+	// report on every poll. That skip reads nothing, so it cannot report an
+	// object collected mid-pass: it returns nil where a write returns ErrNotFound.
 	UpdateStatus(ctx context.Context, status Status) error
 	// Within runs fn inside a single transaction: writes made with fn's ctx all
 	// commit together or roll back on error. Pass fn's ctx to every store call
@@ -100,6 +102,9 @@ type controllerClientImpl[Status any] struct {
 	gk   GroupKind
 	id   ObjectID
 	done atomic.Bool
+
+	// nil for a client built outside a pass, which then never skips.
+	baseline *statusBaseline
 }
 
 // newPassClient is the only constructor. The pass ends its client; AdminClient
@@ -141,8 +146,10 @@ func (c *controllerClientImpl[Status]) live() error {
 // else would catch it — up to the watch floor for a subscriber, and up to the
 // stale-dependents pass for a dependent, since the waker has no tick behind it.
 //
-// AddEvent is the one that does not, and must not: an event bumps no
-// resource_version, so it appends no entry for a watch to read.
+// Two do not. AddEvent must not: an event bumps no resource_version, so it
+// appends no entry for a watch to read. UpdateStatus signals inline instead,
+// because it wakes on what the store reported writing rather than on a nil
+// error — the two part company when identical bytes are re-reported.
 func (c *controllerClientImpl[Status]) wakeAfter(ctx context.Context, err error) error {
 	if err != nil {
 		return err
@@ -159,8 +166,35 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, status 
 	if err != nil {
 		return err
 	}
-	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
-		ctx, c.gk, c.id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
+	version := c.statusVersion()
+	if !c.baseline.claim(b, version) {
+		// The store would compare these and write nothing. Its cancellation check
+		// goes with it, so make it here: which path a caller takes depends on the
+		// bytes, and the two must not disagree about a dead context.
+		return ctx.Err()
+	}
+	changed, err := c.bh.store.Objects().UpdateStatus(ctx, c.gk, c.id, b, version)
+	if err != nil || !changed {
+		// Neither promotes, so this pass keeps reaching the store.
+		return err // nothing written, so no resource_version bump and nothing to wake
+	}
+	if bl := c.baseline; bl != nil {
+		// Promote only at commit: a write rolled back inside the caller's Within
+		// never landed.
+		c.bh.store.AfterCommit(ctx, func(context.Context) { bl.promote(b, version) })
+	}
+	c.bh.signalKindWritten(ctx, c.gk)
+	return nil
+}
+
+// statusVersion is the status schema version this build writes. A pass resolves
+// it once, when its baseline is built: migratorFor takes the beehive-wide lock,
+// which the skip path must not.
+func (c *controllerClientImpl[Status]) statusVersion() int {
+	if c.baseline != nil {
+		return c.baseline.writeVersion
+	}
+	return migratorStatusVersion(c.bh.migratorFor(c.gk))
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, condition Condition) error {

@@ -285,14 +285,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   generation, a delete sets `deletion_requested_at`. A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
-  twelve users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
+  thirteen users: `WithOnCreate`, the spec-write enqueue, the new-edge enqueue, the
   delete-request enqueue, the cleared-finalizer enqueue, the dropped-dependency
   target push, the create's push of an already-deleting owner (all shared via
   `Beehive.signalRequeueNow` and `signalRequeueThrottled`), the GC cascade's own
   hook, the physical delete's owner push, the delete request's push of the
   targets its mark unblocked (all three `signalRequeueManyNow`),
   `signalKindWritten` — which feeds the watch tailers and the dependency waker —
-  and `signalEventsWritten`, which feeds one object's event readers.
+  `signalEventsWritten`, which feeds one object's event readers, and the status
+  baseline's promote, the one user that signals nothing.
   → [ADR](docs/adr/2026-07-27-name-keyed-writes.md),
   [ADR](docs/adr/2026-07-31-a-spec-write-enqueues-its-own-object.md),
   [ADR](docs/adr/2026-08-04-a-delete-request-pushes-its-own-collect.md),
@@ -379,6 +380,20 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   second case — a pass whose load predated the delete request, where the tail
   `gcCollect` is gated on a stale `deleting`.
   → [ADR](docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md)
+- **A pass skips a status write it can see is a no-op.** Being bound to its
+  object, the client is handed that object's stored status, so `UpdateStatus`
+  compares in memory and skips the transaction on a match (`statusbaseline.go`).
+  The store's compare stays behind it for every caller holding no baseline, and
+  the in-memory one must remain a **strict subset** of it — a false negative
+  costs a transaction, a false positive loses a write. `Objects().UpdateStatus`
+  now reports `changed`, which gates the pass's `signalKindWritten`, so a
+  declined write wakes nobody. A write in flight **poisons** the skip rather than
+  advancing it, since `AfterCommit` runs at the outermost commit and a sibling
+  call inside a `Within` would otherwise match a stale baseline; a failed or
+  rolled-back write never promotes, leaving that pass on the slow path. The whole
+  thing rests on `objects.status` having one writer, pinned by
+  `TestObjectStatusIsWrittenInOnePlace`. A skip cannot report a collected object.
+  → [ADR](docs/adr/2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md)
 - **`AdminClient` writes outside a pass, id-keyed**, for the two callers that
   need what only a pass can write: a fixture (a controller reading *another
   kind's* status needs a stored one) and maintenance on a **stopped** beehive (a

@@ -1488,9 +1488,10 @@ func checkObservedGeneration(observedGeneration int64) error {
 // Objects().UpdateStatus skips the write when the incoming bytes equal the stored
 // ones at the same schema version: no resource_version bump, so no spurious
 // watch diff or dependent wake. It touches no part of the handshake.
-func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, status []byte, statusVersion int) error {
+func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, status []byte, statusVersion int) (bool, error) {
+	var changed bool
 	// Within keeps the read-compare-write atomic.
-	return s.Within(ctx, func(ctx context.Context) error {
+	err := s.Within(ctx, func(ctx context.Context) error {
 		c := s.conn(ctx)
 		// Scoped read enforces the kind boundary while doubling as the compare's
 		// load — two columns, not the row.
@@ -1508,6 +1509,9 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		if err != nil {
 			return err
 		}
+		// A pass shadows this compare in memory to skip the transaction entirely
+		// (statusBaseline.claim). Loosening this one widens that one: keep the
+		// in-memory skip a subset, or it starts dropping writes this would make.
 		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
 			return nil // no version bump, so no watch diff and no wake
 		}
@@ -1522,8 +1526,13 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 			SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
 			WHERE id = ?`,
 			jsonText(status), stamp, rv, now, id)
+		changed = err == nil
 		return err
 	})
+	if err != nil {
+		return false, err // a failed commit wrote nothing, whatever the closure saw
+	}
+	return changed, nil
 }
 
 // conditionColumns is the canonical select list for a condition row;
