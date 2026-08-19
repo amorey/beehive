@@ -1168,3 +1168,30 @@ func TestWorkQueueAdmitAlarmArmsAnIdleID(t *testing.T) {
 	require.NotNil(t, a)
 	assert.Equal(t, alarmAdmit, a.kind)
 }
+
+// An admission alarm that fires mid-pass must be dropped: the pass in flight
+// arms this id itself a line later, and dirtying it here would dispatch ahead
+// of whatever that pass asked for.
+func TestWorkQueueAdmitAlarmMidPassIsDropped(t *testing.T) {
+	q := newWorkQueue()
+	t.Cleanup(q.stop)
+	q.add(1)
+	id, ok := q.get() // the pass starts; id is in flight
+	require.True(t, ok)
+	q.addAfter(1, time.Hour, alarmAdmit)
+
+	q.mu.Lock()
+	admit := q.gauge.alarmFor(1)
+	q.mu.Unlock()
+	require.NotNil(t, admit)
+	q.timerFired(1, admit) // the admission offset elapses mid-pass
+
+	// runWorker's tail for a failing pass.
+	q.done(id)
+	q.addAfter(id, time.Hour, alarmBackoff)
+
+	_, ok = q.get()
+	assert.False(t, ok, "the admission must not jump the backoff ladder")
+	at := q.scheduleAt(1).NextRequeueAt
+	assert.True(t, at.After(time.Now().Add(time.Minute)), "id is on the ladder, got %s", at)
+}

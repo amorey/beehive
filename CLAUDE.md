@@ -120,8 +120,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   upward through one `spread` helper and neither is configurable; a test sets
   `individualPassRand` directly so its schedule is exact. The re-arm reuses `alarmRequeueAfter`, since it runs
   only where the result scheduled nothing; the scan gets `alarmAdmit`, which
-  **loses every arbitration**, because it runs beside the workers and must not
-  displace a schedule a startup pass already set. `d` is a **default cadence, not a ceiling**: a
+  **loses every arbitration and is dropped if it fires mid-pass**, because it
+  runs beside the workers and must not displace — or pre-empt — a schedule a
+  startup pass is about to set. `d` is a **default cadence, not a ceiling**: a
   `RequeueAfter` wins either way, a failure keeps its ladder, and `!gone` guards
   the arm or a collected id is resurrected into `ErrNotFound`.
   → [ADR](docs/adr/2026-08-19-an-individual-pass-interval.md)

@@ -64,7 +64,10 @@ result scheduled nothing. The scan is the other case: it runs beside the
 workers, so it can reach an id whose startup pass has already scheduled itself.
 `alarmAdmit` therefore loses every arbitration — checked above the floor arm, so
 a pending schedule of any kind survives — and a boot-time offset never displaces
-a `RequeueAfter` or a backoff ladder.
+a `RequeueAfter` or a backoff ladder. One firing mid-pass is dropped rather than
+dirtying the id, for the reason the floor's own in-flight arm exists: `done`
+would queue it ahead of the alarm the pass sets a line later. Nothing is
+stranded by the drop, since every branch of `scheduleNext` arms something.
 
 **The admission scan subsumes the startup full pass.** Both list the same kind
 for the same reason, so `run` makes one decision — which window the startup

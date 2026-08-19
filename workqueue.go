@@ -277,13 +277,18 @@ func (q *workQueue) timerFired(id ObjectID, a *alarm) {
 		if s, ok := q.gauge.clearAlarm(id); ok {
 			pending.put(s)
 		}
-		if _, inFlight := q.processing[id]; inFlight && a.kind == alarmFloor {
+		_, inFlight := q.processing[id]
+		switch {
+		case inFlight && a.kind == alarmFloor:
 			// The floor bounds the gap between dispatches and the last one has
 			// not finished, so the window has not started. Marking the id dirty
 			// here would let done queue it ahead of the alarm the pass sets a
 			// line later, losing a failing pass its ladder.
 			q.addAfterLocked(id, time.Now().Add(q.gate.Interval()), alarmFloor, &pending)
-		} else {
+		case inFlight && a.kind == alarmAdmit:
+			// Dropped for the same reason: the pass in flight arms this id
+			// itself, and the admission yields to whatever it asks for.
+		default:
 			q.addLocked(id, &pending, addImmediate) // no-op if stop ran between firing and here
 		}
 	}
