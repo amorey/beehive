@@ -16,8 +16,7 @@ work we have decided to do.
 
 In flight, from [#126](https://github.com/amorey/beehive/issues/126):
 
-- [A name-keyed CreateOrUpdate](2026-08-19-a-name-keyed-create-or-update.md) —
-  proposed, not decided.
+- [A name-keyed CreateOrUpdate](2026-08-19-a-name-keyed-create-or-update.md)
 
 Also from #126, and both closed: [a spec write refuses a deletion-pending
 row](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md) shipped, and the
