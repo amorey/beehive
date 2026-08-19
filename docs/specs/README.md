@@ -14,7 +14,9 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-No spec is in flight.
+In flight:
+
+- [A pass skips a status write it can see is a no-op](2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md)
 
 The last spec shipped as
 [A per-object cadence is armed by a pass and admitted by a startup scan](../adr/2026-08-19-an-individual-pass-interval.md).
