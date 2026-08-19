@@ -5404,19 +5404,27 @@ func TestOnlyUpdateSpecCanFailAssemblingConditions(t *testing.T) {
 	_, err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{}`), 0)
 	require.NoError(t, err,
 		"a status write does not read conditions, so a missing table cannot fail it")
-	_, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
-	require.NoError(t, err, "nor does a deletion mark")
 
 	// Both of ObjectsUpdateSpec's branches assemble conditions, by two different
 	// routes, so both fail here. A changed spec writes and scans the row back
 	// (scanWritten); an identical one returns the row it read (attachConditions
 	// directly). newConditionObject's spec is `{}`, so the order matters: the
 	// changed write has to come first for the second call to be the no-op.
+	//
+	// Both must also run before the deletion mark below, or the refusal answers
+	// them first and neither reaches the assembly this test is here for. The
+	// NotErrorIs is what keeps that regression from passing quietly, since a
+	// refusal is an error too.
 	_, _, err = store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
 	require.Error(t, err, "the write path assembles through scanWritten")
+	require.NotErrorIs(t, err, storeapi.ErrDeletionPending)
 
 	_, _, err = store.Objects().UpdateSpec(ctx, testGK, obj.ID, []byte(`{"x":1}`), 0)
 	require.Error(t, err, "the content no-op assembles onto the row it read")
+	require.NotErrorIs(t, err, storeapi.ErrDeletionPending)
+
+	_, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
+	require.NoError(t, err, "nor does a deletion mark")
 }
 
 func TestDeleteObjectCascadesConditions(t *testing.T) {
