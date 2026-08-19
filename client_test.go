@@ -3952,3 +3952,69 @@ func TestClientCreateOrUpdateRepairsAPoisonSpec(t *testing.T) {
 	require.NoError(t, err, "the stored bytes decode now")
 	assert.Equal(t, "a", got.Spec.Val)
 }
+
+func TestClientCreateOrUpdateMarshalError(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
+	_, created, err := client.CreateOrUpdate(ctx, "w1", errMarshaler{})
+	require.Error(t, err)
+	assert.False(t, created)
+}
+
+// Options are validated up front, so the same call fails whether or not the row
+// exists — the eager-validation rule GetOrCreate documents.
+func TestClientCreateOrUpdateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"}, WithFinalizers("cleanup"))
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.False(t, created)
+
+	mustCreate(t, ctx, client, "w2", cSpec{Val: "a"})
+	_, created, err = client.CreateOrUpdate(ctx, "w2", cSpec{Val: "b"}, WithFinalizers("cleanup"))
+	require.ErrorIs(t, err, ErrInvalidOption, "the found branch validates too")
+	assert.False(t, created)
+}
+
+func TestClientCreateOrUpdateOwnerRefError(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.CreateOrUpdate(ctx, "orphan", cSpec{Val: "child"}, WithOwner(9999))
+	require.Error(t, err)
+	assert.False(t, created)
+
+	objs, err := client.List(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, objs, "the half-made child rolls back with its ref")
+}
+
+// The update branch decodes what it wrote, so bytes that do not round-trip roll
+// the write back and leave the stored spec alone.
+func TestClientCreateOrUpdateRollsBackAnUndecodableUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	gk := GroupKind{Kind: "BadDecode"}
+
+	orig, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{
+		Name: "w1",
+		Spec: []byte(`{"Val":"a"}`),
+	})
+	require.NoError(t, err)
+
+	client := NewClient[badDecodeSpec, cStatus](bh, gk)
+	_, created, err := client.CreateOrUpdate(ctx, "w1", badDecodeSpec{Val: "b"})
+	require.Error(t, err)
+	assert.False(t, created)
+
+	got, err := store.Objects().GetByName(ctx, gk, "w1")
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"Val":"a"}`, string(got.Spec), "the write must roll back")
+	assert.Equal(t, orig.Generation, got.Generation)
+}
