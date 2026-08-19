@@ -349,8 +349,12 @@ func (r *reconciler) admit(ctx context.Context) {
 
 // admitOffset spreads one admission across the whole interval, unlike the
 // arming jitter's tenth: what it prevents is a restart dispatching the kind at
-// once.
+// once. A kind that asked for the startup pass wants its first pass promptly
+// instead, and takes no offset.
 func (r *reconciler) admitOffset() time.Duration {
+	if r.startupFullPass {
+		return 0
+	}
 	return time.Duration(r.randFrac() * float64(r.individualPassInterval))
 }
 
@@ -460,7 +464,10 @@ func (r *reconciler) run(ctx context.Context) {
 	// enables it may depend on it — see
 	// docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md. The work queue
 	// collapses the overlap with the owed pass.
-	if r.startupFullPass {
+	// The admission scan lists the same kind for the same reason, so with the
+	// individual pass on it is the startup pass — at a zero offset, and with the
+	// retry ladder enqueueAll does not have.
+	if r.startupFullPass && r.individualPassInterval <= 0 {
 		r.enqueueAll(ctx)
 	}
 

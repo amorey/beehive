@@ -4224,3 +4224,44 @@ func TestReconcilerIndividualPassAdmissionRetries(t *testing.T) {
 	cancel()
 	waitClosed(t, done, "run to exit")
 }
+
+// The startup pass and the admission scan list the same kind for the same
+// reason. With both on, the scan drops its offset and does the work once.
+func TestReconcilerIndividualPassSubsumesTheStartupPass(t *testing.T) {
+	seen := make(chan ObjectID, 2)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) ReconcileResult {
+			seen <- id
+			return Settled()
+		},
+	}
+	store := &listIDsStore{ids: []ObjectID{1, 2}}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                adapter,
+		store:                  store,
+		work:                   newWorkQueue(),
+		startupFullPass:        true,
+		individualPassInterval: time.Hour,
+		// A source that would spread the armings; the startup pass overrides it.
+		individualPassRand: func() float64 { return 0.5 },
+		backoffFor:         make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	for range 2 {
+		select {
+		case <-seen:
+		case <-time.After(testTimeout):
+			t.Fatal("timed out waiting for the startup dispatch")
+		}
+	}
+	cancel()
+	waitClosed(t, done, "run to exit")
+
+	// Counted after the loop exits, so the scan goroutine has finished either
+	// way and the count is not a race.
+	assert.Equal(t, 1, store.listCalls(), "the scan is the startup pass, not a second listing")
+}
