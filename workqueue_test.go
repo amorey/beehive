@@ -1195,3 +1195,18 @@ func TestWorkQueueAdmitAlarmMidPassIsDropped(t *testing.T) {
 	at := q.scheduleAt(1).NextRequeueAt
 	assert.True(t, at.After(time.Now().Add(time.Minute)), "id is on the ladder, got %s", at)
 }
+
+// A failure keeps its ladder against a pending cadence alarm too: the backoff
+// owns the retry, and the individual pass arms the same kind a RequeueAfter does.
+func TestWorkQueueBackoffReplacesACadenceAlarm(t *testing.T) {
+	q := newWorkQueue()
+	t.Cleanup(q.stop)
+	q.addAfter(1, time.Hour, alarmRequeueAfter)
+
+	q.addAfter(1, time.Minute, alarmBackoff)
+
+	a := alarmFor(q, 1)
+	require.NotNil(t, a)
+	assert.Equal(t, alarmBackoff, a.kind)
+	assert.InDelta(t, time.Minute, time.Until(a.fireAt), float64(time.Second), "the ladder's delay, not the cadence's")
+}

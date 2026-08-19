@@ -4337,3 +4337,21 @@ func TestReconcilerIndividualPassAdmissionYieldsToALivePass(t *testing.T) {
 	require.NotNil(t, three)
 	assert.InDelta(t, time.Hour/2, time.Until(three.fireAt), float64(time.Second), "an unscheduled id is admitted")
 }
+
+// RequeueAfter(0) means "call me as soon as the floor allows", so it dispatches
+// rather than arming — the individual pass must not turn that into a delay.
+func TestReconcilerIndividualPassYieldsToRequeueAfterZero(t *testing.T) {
+	r := &reconciler{
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	t.Cleanup(r.work.stop)
+
+	r.scheduleNext(1, Settled().RequeueAfter(0))
+
+	assert.Nil(t, alarmFor(r.work, 1), "no alarm: the id is dispatchable now")
+	id, ok := r.work.get()
+	require.True(t, ok)
+	assert.Equal(t, ObjectID(1), id)
+}

@@ -41,6 +41,24 @@ scan, and objects created afterwards are admitted by the create's own commit
 push. Under the sole-writer rule there is no third way for an object of a
 registered kind to come into being.
 
+Precedence, first match wins — the individual pass is the last branch, never
+combined with another:
+
+| Result | What is armed |
+|---|---|
+| `Fail(err)` | the backoff ladder, capped by `WithMaxRetryInterval` |
+| `RequeueAfter(d>0)` | exactly `d`, clamped in neither direction |
+| `RequeueAfter(0)` | dispatchable now; the per-object floor paces it |
+| bare `Unsettled()` | the owed pass's cadence |
+| `Settled()`, nothing asked | the individual pass |
+| collected | nothing; `forget` drops the id |
+
+At the queue, a second schedule for one id arbitrates by `outranks`: an incoming
+backoff always takes the slot, an incoming `alarmAdmit` never does, a floor on
+either side is decided by fire time, and two controller schedules resolve
+newest-wins. An individual-pass alarm does not absorb an arriving wake, so a
+push still dispatches at once — `d` bounds idleness, never real work.
+
 **The guarantee is narrower than the name suggests, deliberately.** An object
 whose pass returns settled *without scheduling anything* gets its next pass about
 `d` later. A `RequeueAfter` is not clamped — longer or shorter, the controller's
