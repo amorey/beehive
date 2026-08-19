@@ -1,7 +1,8 @@
 # A trigger channel requeues a kind's objects, by id or by name
 
-- **Status:** Accepted — implemented in `trigger.go`, `options.go`, `beehive.go`,
-  and `Objects().GetMetaByName` in `internal/storeapi` and `sqlite`.
+- **Status:** Accepted — implemented in `trigger.go`, `options.go`,
+  `reconciler.go`, `beehive.go`, and `Objects().GetMetaByName` in
+  `internal/storeapi` and `sqlite`.
 - **Date:** 2026-08-19
 
 ## Context
@@ -89,27 +90,30 @@ burst across N addresses costs N reads in one drain rather than N drains. That
 is coalescing, not buffering — it is bounded by distinct addresses in flight,
 never by poke count.
 
-It also answers backpressure. A send blocks only until the receive goroutine
-takes it, never behind a store read, so the connection cannot hold up a
-producer. A producer that must not block even that far owns its own buffer or
-its own drop; beehive cannot drop on its behalf without inventing a buffer size
-it has no basis to pick.
+It also bounds backpressure. A send waits only for the goroutine to come back
+around the loop, and the loop reads the store once per window rather than once
+per poke — a drain still holds the receive, so this is a bound rather than an
+exemption. A producer that must not block at all owns its own buffer or its own
+drop; beehive cannot drop on its behalf without inventing a buffer size it has
+no basis to pick.
 
-### Shutdown needed no new phase
+### A trigger's lifetime nests inside the reconciler it pokes
 
 The requirement is that a poke must not arrive at a kind whose reconcilers are
-draining. It already holds, and the guarantee is worth stating exactly because
-the obvious reading of it is wrong:
+draining, and `reconciler.run` is what makes it structural rather than merely
+harmless. The feeds are launched into `run`'s own `sync.WaitGroup`, beside its
+workers, so its deferred `wg.Wait()` covers them and `workQueue.stop` — which
+makes `addLocked` a no-op — runs only once no trigger is left to poke it.
 
-- `stop` cancels `runCtx`, which every reconcile worker selects on, so the
-  workers return without draining the queue.
-- A trigger's resolve runs on the same `runCtx`. Once cancelled it fails with
-  the context error and takes the ordinary dropped-poke path.
-- `workQueue.stop`, which makes `addLocked` a no-op, runs *later* still — in
-  `reconciler.run`'s deferred block, after its workers are drained. A poke
-  landing between the cancel and that defer is accepted by a live queue. It is
-  harmless because no worker is left to dispatch it, but it is **not** stopped
-  by the `stopped` gate, and a guard built on that belief would guard nothing.
+`Start` therefore has no trigger case at all: it launches `r.run` and the
+Beehive-owned drivers, as before. Cancelling `runCtx` ends the workers and the
+feeds together, and a resolve in flight fails with the context error and takes
+the ordinary dropped-poke path.
+
+Launching the feeds from `Start` instead would leave a window between the cancel
+and that deferred `stop` in which a poke reaches a live queue. It is harmless —
+no worker is left to dispatch it — but it is a window to reason about rather
+than one that cannot exist.
 
 ## Consequences
 

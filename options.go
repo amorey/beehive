@@ -314,16 +314,14 @@ func WithIndividualPassInterval(d time.Duration) Option {
 	}
 }
 
-// WithTriggerByID requeues each id received on ch, as Client.Requeue would. An
-// id naming nothing, or an object of another kind, is a no-op. Meaningful only
-// at Register.
+// WithTriggerByID requeues each id received on ch, as Client.Requeue would —
+// retry backoff and all. An id naming nothing, or an object of another kind, is
+// a no-op, and a closed ch stops that feed. Repeated options accumulate;
+// meaningful only at Register, and a channel serves one kind.
 //
-// A poke is a latency hint and nothing records it: unlike every push a write
-// makes, no driver re-derives it, so correctness rests on the kind's own
-// cadence. Beehive never closes ch, a closed ch stops that feed, and a channel
-// serves one kind — sharing one across two Register calls races the receive.
-// Repeated options accumulate, so a kind may declare several feeds. Retry
-// backoff is preserved, as a plain Requeue preserves it.
+// A poke is a latency hint that nothing records, so correctness rests on the
+// kind's own cadence. See
+// docs/adr/2026-08-19-a-trigger-channel-requeues-by-id-or-name.md.
 func WithTriggerByID(ch <-chan ObjectID) Option {
 	return func(target any) error {
 		// Checked before the target switch: a nil channel blocks forever, so it
@@ -332,25 +330,22 @@ func WithTriggerByID(ch <-chan ObjectID) Option {
 			return fmt.Errorf("%w: WithTriggerByID needs a non-nil channel", ErrInvalidOption)
 		}
 		if t, ok := target.(*reconciler); ok {
-			t.triggers = append(t.triggers, &trigger{r: t, ids: ch, floor: defaultTriggerFloor})
+			t.triggers = append(t.triggers, &trigger{ids: ch})
 		}
 		return nil
 	}
 }
 
-// WithTriggerByName requeues the object holding each name received on ch, as
-// Client.Requeue would. A name matching nothing — "" included — is a no-op,
-// since whether a record exists for an address is the app's business and
-// changes under it. Meaningful only at Register.
-//
-// Carries the same contract as WithTriggerByID.
+// WithTriggerByName is WithTriggerByID keyed by name, carrying the same
+// contract. A name matching nothing — "" included — is a no-op, since whether a
+// record exists for an address is the app's business and changes under it.
 func WithTriggerByName(ch <-chan string) Option {
 	return func(target any) error {
 		if ch == nil {
 			return fmt.Errorf("%w: WithTriggerByName needs a non-nil channel", ErrInvalidOption)
 		}
 		if t, ok := target.(*reconciler); ok {
-			t.triggers = append(t.triggers, &trigger{r: t, names: ch, floor: defaultTriggerFloor})
+			t.triggers = append(t.triggers, &trigger{names: ch})
 		}
 		return nil
 	}

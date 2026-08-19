@@ -22,7 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/amorey/beehive/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -33,13 +32,9 @@ var triggerGK = GroupKind{Kind: "Trigger"}
 // running but its work queue, so a test observes exactly what a trigger queued.
 func newTriggerReconciler(t *testing.T) *reconciler {
 	t.Helper()
-	store, err := sqlite.OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, store.Close()) })
-
 	r := &reconciler{
 		gk:               triggerGK,
-		store:            store,
+		store:            newClientTestStore(t),
 		work:             newWorkQueue(),
 		maxRetryInterval: time.Minute,
 		backoffFor:       make(map[ObjectID]time.Duration),
@@ -57,48 +52,41 @@ func triggerObject(t *testing.T, r *reconciler, name string) *RawObject {
 	return obj
 }
 
-// runTrigger starts trig and returns a channel closed when it has returned.
-func runTrigger(ctx context.Context, trig *trigger) <-chan struct{} {
+// startTrigger runs trig for the rest of the test, ending it on cleanup. The
+// returned channel closes when the loop has returned.
+func startTrigger(t *testing.T, trig *trigger) <-chan struct{} {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		trig.run(ctx)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		waitClosed(t, done, "the trigger loop to return")
+	})
 	return done
 }
 
 // waitQueued waits for the queue to signal and takes what it holds.
 func waitQueued(t *testing.T, q *workQueue) ObjectID {
 	t.Helper()
-	waitClosedOrValue(t, q)
+	waitClosed(t, q.ready, "the trigger to queue an object")
 	id, ok := q.get()
 	require.True(t, ok, "the queue signalled but held nothing")
 	return id
-}
-
-func waitClosedOrValue(t *testing.T, q *workQueue) {
-	t.Helper()
-	select {
-	case <-q.ready:
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the trigger to queue an object")
-	}
 }
 
 func TestTriggerByIDRequeuesTheObject(t *testing.T) {
 	r := newTriggerReconciler(t)
 	obj := triggerObject(t, r, "one")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ch := make(chan ObjectID)
-	done := runTrigger(ctx, &trigger{r: r, ids: ch})
+	startTrigger(t, &trigger{r: r, ids: ch})
 
 	ch <- obj.ID
 	assert.Equal(t, obj.ID, waitQueued(t, r.work))
-
-	cancel()
-	waitClosed(t, done, "the trigger loop to return")
 }
 
 // Objects().GetForReconcile takes a bare id, so a foreign id reaching the queue
@@ -112,10 +100,8 @@ func TestTriggerByIDIgnoresAForeignKind(t *testing.T) {
 		ObjectsCreateInput{Name: "theirs", Spec: []byte(`{}`)})
 	require.NoError(t, err)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ch := make(chan ObjectID)
-	done := runTrigger(ctx, &trigger{r: r, ids: ch})
+	startTrigger(t, &trigger{r: r, ids: ch})
 
 	ch <- foreign.ID
 	ch <- ObjectID(9999) // and one that names nothing at all
@@ -123,37 +109,38 @@ func TestTriggerByIDIgnoresAForeignKind(t *testing.T) {
 	assert.Equal(t, mine.ID, waitQueued(t, r.work))
 	_, ok := r.work.get()
 	assert.False(t, ok, "only this kind's id may be queued")
-
-	cancel()
-	waitClosed(t, done, "the trigger loop to return")
 }
 
 func TestTriggerByNameRequeuesTheObject(t *testing.T) {
 	r := newTriggerReconciler(t)
 	obj := triggerObject(t, r, "one")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ch := make(chan string)
-	done := runTrigger(ctx, &trigger{r: r, names: ch})
+	startTrigger(t, &trigger{r: r, names: ch})
 
 	ch <- "one"
 	assert.Equal(t, obj.ID, waitQueued(t, r.work))
-
-	cancel()
-	waitClosed(t, done, "the trigger loop to return")
 }
 
 // The app owns the subscription, so a closed channel is how it says it is done.
 // Beehive never closes one, and an unhandled close would spin the select.
 func TestTriggerStopsOnAClosedChannel(t *testing.T) {
-	r := newTriggerReconciler(t)
-
-	ch := make(chan ObjectID)
-	done := runTrigger(context.Background(), &trigger{r: r, ids: ch})
-
-	close(ch)
-	waitClosed(t, done, "the trigger loop to return on a closed channel")
+	ids := make(chan ObjectID)
+	names := make(chan string)
+	for _, tc := range []struct {
+		name  string
+		trig  func(*reconciler) *trigger
+		close func()
+	}{
+		{"by id", func(r *reconciler) *trigger { return &trigger{r: r, ids: ids} }, func() { close(ids) }},
+		{"by name", func(r *reconciler) *trigger { return &trigger{r: r, names: names} }, func() { close(names) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			done := startTrigger(t, tc.trig(newTriggerReconciler(t)))
+			tc.close()
+			waitClosed(t, done, "the trigger loop to return on a closed channel")
+		})
+	}
 }
 
 // A failed read says so and drops the poke: a retry ladder here would compete
@@ -177,18 +164,13 @@ func TestTriggerLogsAFailedReadAndKeepsServing(t *testing.T) {
 		},
 	}}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ch := make(chan ObjectID)
-	done := runTrigger(ctx, &trigger{r: r, ids: ch})
+	startTrigger(t, &trigger{r: r, ids: ch})
 
 	ch <- obj.ID
 	ch <- obj.ID
 	assert.Equal(t, obj.ID, waitQueued(t, r.work), "the loop serves the poke after the failure")
 	assert.Contains(t, logs.String(), "trigger", "a failed read must name itself")
-
-	cancel()
-	waitClosed(t, done, "the trigger loop to return")
 }
 
 // A poke is an address, not a claim that a failure is over, so it leaves the
@@ -198,10 +180,8 @@ func TestTriggerPreservesTheBackoffLadder(t *testing.T) {
 	obj := triggerObject(t, r, "one")
 	ladder := r.backoffNext(obj.ID)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ch := make(chan ObjectID)
-	done := runTrigger(ctx, &trigger{r: r, ids: ch})
+	startTrigger(t, &trigger{r: r, ids: ch})
 
 	ch <- obj.ID
 	require.Equal(t, obj.ID, waitQueued(t, r.work))
@@ -209,9 +189,6 @@ func TestTriggerPreservesTheBackoffLadder(t *testing.T) {
 	r.backoffMu.Lock()
 	defer r.backoffMu.Unlock()
 	assert.Equal(t, ladder, r.backoffFor[obj.ID], "a trigger must not reset the ladder")
-
-	cancel()
-	waitClosed(t, done, "the trigger loop to return")
 }
 
 // The floor keeps a producer-driven read loop off the single connection, and
@@ -232,10 +209,8 @@ func TestTriggerCoalescesInsideTheFloor(t *testing.T) {
 		},
 	}}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ch := make(chan ObjectID)
-	done := runTrigger(ctx, &trigger{r: r, ids: ch, floor: 50 * time.Millisecond})
+	startTrigger(t, &trigger{r: r, ids: ch, floor: 200 * time.Millisecond})
 
 	// The first poke is eager: an idle feed pays no added latency.
 	ch <- a.ID
@@ -246,13 +221,10 @@ func TestTriggerCoalescesInsideTheFloor(t *testing.T) {
 	ch <- a.ID
 	ch <- b.ID
 
-	got := []ObjectID{waitRead(t, reads), waitRead(t, reads), waitRead(t, reads)}
+	got := []ObjectID{recv(t, reads), recv(t, reads), recv(t, reads)}
 	slices.Sort(got)
 	assert.Equal(t, []ObjectID{a.ID, a.ID, b.ID}, got,
 		"the eager read, then one drain holding each address once")
-
-	cancel()
-	waitClosed(t, done, "the trigger loop to return")
 }
 
 // Start launches the declared feeds; parked leaves the trigger the only thing
@@ -278,10 +250,10 @@ func TestTriggerDispatchesAfterStart(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, stop(context.Background())) })
 
-	require.Equal(t, obj.ID, waitRead(t, passes), "the startup pass settles it first")
+	require.Equal(t, obj.ID, recv(t, passes), "the startup pass settles it first")
 
 	sendName(t, ch, "one")
-	assert.Equal(t, obj.ID, waitRead(t, passes), "the trigger dispatched a settled object")
+	assert.Equal(t, obj.ID, recv(t, passes), "the trigger dispatched a settled object")
 }
 
 // The app owns the channel and beehive never closes it, so stop must not wait
@@ -319,18 +291,6 @@ func sendName(t *testing.T, ch chan<- string, name string) {
 	}
 }
 
-// waitRead takes one recorded store read, or fails the test.
-func waitRead(t *testing.T, reads <-chan ObjectID) ObjectID {
-	t.Helper()
-	select {
-	case id := <-reads:
-		return id
-	case <-time.After(testTimeout):
-		t.Fatal("timed out waiting for the trigger to read the store")
-		return 0
-	}
-}
-
 // A name the kind does not hold is the app's business, not an error: whether a
 // record exists for an address changes under the producer. "" is the same
 // branch — the ErrInvalidName check lives on Client, above the store.
@@ -338,10 +298,8 @@ func TestTriggerByNameIgnoresAnUnknownName(t *testing.T) {
 	r := newTriggerReconciler(t)
 	obj := triggerObject(t, r, "one")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ch := make(chan string)
-	done := runTrigger(ctx, &trigger{r: r, names: ch})
+	startTrigger(t, &trigger{r: r, names: ch})
 
 	ch <- "no-such-name"
 	ch <- ""
@@ -351,7 +309,4 @@ func TestTriggerByNameIgnoresAnUnknownName(t *testing.T) {
 	assert.Equal(t, obj.ID, waitQueued(t, r.work))
 	_, ok := r.work.get()
 	assert.False(t, ok, "an unresolvable name must queue nothing")
-
-	cancel()
-	waitClosed(t, done, "the trigger loop to return")
 }

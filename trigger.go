@@ -17,23 +17,23 @@ package beehive
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
+	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/beehive/internal/rategate"
 )
 
 // trigger is one feed declared by WithTriggerByID or WithTriggerByName: a
-// channel of addresses the app resolves within the kind and requeues. Exactly
-// one of the two channels is set, and which one also selects the resolution.
+// channel of addresses to resolve within the kind and requeue. Exactly one of
+// the two channels is set, and which one also selects the resolution.
+// See docs/adr/2026-08-19-a-trigger-channel-requeues-by-id-or-name.md.
 type trigger struct {
 	r     *reconciler
 	ids   <-chan ObjectID
 	names <-chan string
-	// floor is the minimum gap between two drains, keeping a producer-driven
-	// read loop off the single connection; <= 0 turns it off.
+	// floor is the minimum gap between two drains; <= 0 turns it off.
 	floor time.Duration
-	// now sources the floor's clock; nil means time.Now.
-	now func() time.Time
 }
 
 // addr is one address received on a trigger channel: an id, or a name when the
@@ -44,28 +44,20 @@ type addr struct {
 }
 
 // run services the feed until ctx ends or the app closes the channel. A nil
-// channel blocks forever, which is what leaves the unused half of the select
-// silent.
+// channel blocks forever, which is what silences the unused half of the select.
 //
 // The receive never reads the store: an address joins pending and a floored
-// drain resolves it, so a producer is held up by another receive at most, never
-// by the connection. pending is a set, so a hot feed on one address costs one
-// read per window; nothing is dropped, because no driver re-derives a poke.
+// drain resolves it. pending is a set, so a hot feed on one address costs one
+// read per window, and nothing is dropped — no driver re-derives a poke.
 func (t *trigger) run(ctx context.Context) {
-	now := t.now
-	if now == nil {
-		now = time.Now
-	}
 	gate := rategate.NewSingle(t.floor)
 	pending := make(map[addr]struct{})
-
-	var timer *time.Timer
-	var opened <-chan time.Time
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
+	// One timer, armed only while the floor holds addresses back. Since Go 1.23
+	// Stop leaves no stale value to receive.
+	timer := time.NewTimer(0)
+	timer.Stop()
+	defer timer.Stop()
+	armed := false
 
 	for {
 		select {
@@ -81,33 +73,26 @@ func (t *trigger) run(ctx context.Context) {
 				return
 			}
 			pending[addr{name: name}] = struct{}{}
-		case <-opened:
-			opened = nil
+		case <-timer.C:
+			armed = false
 		}
 
-		if len(pending) == 0 {
-			continue
-		}
-		opensAt, held := gate.Allow(now())
-		if held {
-			// One timer for the whole window: re-arming per arrival would
-			// push the drain out for as long as the feed keeps talking.
-			if opened == nil {
-				timer = time.NewTimer(opensAt.Sub(now()))
-				opened = timer.C
+		now := time.Now()
+		if opensAt, held := gate.Allow(now); held {
+			if !armed {
+				driver.Rearm(timer, opensAt.Sub(now))
+				armed = true
 			}
 			continue
 		}
-		t.drain(ctx, pending)
+		// Disarm before draining, or the timer fires on an empty pending.
+		timer.Stop()
+		armed = false
+		for a := range pending {
+			t.poke(ctx, a)
+		}
+		clear(pending)
 	}
-}
-
-// drain resolves everything accumulated since the last one and empties the set.
-func (t *trigger) drain(ctx context.Context, pending map[addr]struct{}) {
-	for a := range pending {
-		t.poke(ctx, a)
-	}
-	clear(pending)
 }
 
 // poke resolves a within the kind and queues what it found. An address that
@@ -116,16 +101,23 @@ func (t *trigger) drain(ctx context.Context, pending map[addr]struct{}) {
 func (t *trigger) poke(ctx context.Context, a addr) {
 	obj, err := t.resolve(ctx, a)
 	if errors.Is(err, ErrNotFound) {
-		t.r.log().DebugContext(ctx, "trigger address matched no object; skipping",
-			"id", a.id, "name", a.name)
+		t.r.log().DebugContext(ctx, "trigger address matched no object; skipping", t.key(a))
 		return
 	}
 	if err != nil {
 		t.r.log().WarnContext(ctx, "trigger failed to resolve an address; this poke is dropped",
-			"id", a.id, "name", a.name, "err", err)
+			t.key(a), "err", err)
 		return
 	}
 	t.r.requeueNow(obj.ID)
+}
+
+// key names the half of a that this feed populates.
+func (t *trigger) key(a addr) slog.Attr {
+	if t.names != nil {
+		return slog.String("name", a.name)
+	}
+	return slog.Int64("id", int64(a.id))
 }
 
 // resolve reads existence and kind, and nothing else: a trigger never looks at

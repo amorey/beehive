@@ -829,8 +829,9 @@ Tests: `TestReconcilerIndividualPassRearmsASettledObject`,
 
 `WithTriggerByID(ch)` or `WithTriggerByName(ch)` at `Register`. Each address
 received is resolved within the kind — one metadata-only read, kind-scoped — and
-queued through the same path as `Client.Requeue`. `Start` launches one goroutine per
-declared feed, ended by the same context that ends the reconcile loops. Reads are
+queued through the same path as `Client.Requeue`. `reconciler.run` launches one
+goroutine per declared feed into its own wait group, so a feed ends with the loop it
+pokes and the work queue stops after both. Reads are
 floored at 100ms and what the floor holds back is coalesced into the next drain, so
 a hot feed on one address costs one read per window and nothing is dropped.
 

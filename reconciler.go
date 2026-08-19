@@ -475,6 +475,14 @@ func (r *reconciler) run(ctx context.Context) {
 			r.runWorker(ctx)
 		})
 	}
+	// A trigger is not a driver — it services a feed the app owns — but its
+	// lifetime is this loop's: counted here, the queue is stopped below only
+	// once no trigger is left to poke it.
+	for _, trig := range r.triggers {
+		wg.Go(func() {
+			trig.run(ctx)
+		})
+	}
 	r.logger.Info("reconciler started", "workers", n,
 		"owedPassInterval", r.owedPassInterval, "fullPassInterval", r.fullPassInterval)
 	// An owed pass disabled by accident fails silently — work stops being

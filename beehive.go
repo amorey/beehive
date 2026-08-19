@@ -241,14 +241,6 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		bh.wg.Go(func() {
 			r.run(runCtx)
 		})
-		// A trigger is not a driver: it services a feed the app owns. runCtx is
-		// what ends it, and a poke that lands after the cancel finds the workers
-		// already returned.
-		for _, trig := range r.triggers {
-			bh.wg.Go(func() {
-				trig.run(runCtx)
-			})
-		}
 	}
 
 	bh.wg.Go(func() {
@@ -510,6 +502,13 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	// Resolve once with overrides applied; tag every record with the kind.
 	r.logger = logging.Resolve(r.logger, r.logLevel).With("group", gk.Group, "kind", gk.Kind)
 	adapter.logger = r.logger
+
+	// The options record only the feed; its reconciler and its floor are derived
+	// state, like the queue's gate above.
+	for _, trig := range r.triggers {
+		trig.r = r
+		trig.floor = defaultTriggerFloor
+	}
 
 	// Promote a WithMigrator option to the shared registry so both decode paths
 	// resolve the same migrator.

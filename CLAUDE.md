@@ -126,9 +126,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   connection and a hot feed on one address costs one read per window. The floor
   **coalesces rather than drops**, which every other read loop is free to do
   because a driver sits behind it. Options accumulate, a channel serves one kind,
-  a nil channel is `ErrInvalidOption`, and beehive never closes one. Shutdown needed
-  no new phase — the workers exit on `runCtx` and `workQueue.stop` runs later still,
-  so a poke in that gap reaches a live queue with nothing left to dispatch it.
+  a nil channel is `ErrInvalidOption`, and beehive never closes one. **A feed is
+  launched into `reconciler.run`'s own wait group**, not by `Start`, so the queue
+  stops only once no trigger is left to poke it.
   → [ADR](docs/adr/2026-08-19-a-trigger-channel-requeues-by-id-or-name.md)
 - **The individual pass is a per-object cadence with no tick behind it**
   (`WithIndividualPassInterval`, off by default). A settled pass that scheduled
