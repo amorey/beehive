@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -165,4 +166,80 @@ func reviveChildren(b *testing.B, store *sqliteStore) {
 	_, err := store.db.ExecContext(context.Background(),
 		`UPDATE objects SET deletion_requested_at = NULL WHERE deletion_requested_at IS NOT NULL`)
 	require.NoError(b, err)
+}
+
+// BenchmarkConvergedSpecWrite measures what a spec write that changes nothing
+// costs, against what the same answer would cost without a write transaction.
+// The no-txn arm measures no production path: it is the counterfactual behind
+// the decision not to probe, kept so the number can be rechecked. See
+// docs/adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md.
+//
+// resolve is the read a probe would add in front of a write that happens
+// anyway, so no-txn against txn is the saving and resolve against changed is
+// the cost.
+//
+// On disk, not OpenMemory: the transaction is what is being measured and only a
+// file database pays for one.
+func BenchmarkConvergedSpecWrite(b *testing.B) {
+	for _, specKB := range []int{0, 8} {
+		for _, conds := range []int{0, 4} {
+			for _, mode := range []string{"txn", "no-txn", "resolve", "changed"} {
+				b.Run(fmt.Sprintf("spec=%dKB/conditions=%d/%s", specKB, conds, mode), func(b *testing.B) {
+					benchSpecWrite(b, specKB, conds, mode)
+				})
+			}
+		}
+	}
+}
+
+func benchSpecWrite(b *testing.B, specKB, conds int, mode string) {
+	ctx := context.Background()
+
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	spec := []byte(fmt.Sprintf(`{"pad":%q}`, strings.Repeat("x", specKB*1024)))
+	obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
+		Name: "converged",
+		Spec: spec,
+	})
+	require.NoError(b, err)
+
+	for i := range conds {
+		require.NoError(b, store.Conditions().Set(ctx, testGK, obj.ID, storeapi.Condition{
+			Type:   fmt.Sprintf("Cond%d", i),
+			Status: "True",
+			Reason: "Bench",
+		}))
+	}
+
+	// Untimed, and the assertion is the point: a converged write that quietly
+	// started writing would read as a slowdown rather than as a bug.
+	_, changed, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, spec, 0)
+	require.NoError(b, err)
+	require.False(b, changed)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; b.Loop(); i++ {
+		switch mode {
+		case "txn":
+			err = store.Within(ctx, func(ctx context.Context) error {
+				_, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, spec, 0)
+				return err
+			})
+		case "no-txn":
+			// Get, not GetMeta: a skip owes the caller conditions too.
+			_, err = store.Objects().Get(ctx, obj.ID)
+		case "resolve":
+			_, err = store.Objects().GetMeta(ctx, obj.ID)
+		case "changed":
+			err = store.Within(ctx, func(ctx context.Context) error {
+				_, _, err := store.Objects().UpdateSpec(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"n":%d}`, i), 0)
+				return err
+			})
+		}
+		require.NoError(b, err)
+	}
 }

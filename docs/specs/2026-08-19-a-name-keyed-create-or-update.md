@@ -1,21 +1,22 @@
 # A name-keyed CreateOrUpdate
 
-- **Status:** Proposed, not decided. Blocked on [the deletion
-  refusal](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md) and [the
-  probe](2026-08-19-a-spec-write-probes-before-it-transacts.md), and to be
-  re-argued once they ship — most of the reported pain is theirs, not this
-  verb's. If the answer then is no, this becomes a `TODO.md` entry, not a file
-  here.
+- **Status:** Proposed, not decided. Everything it was sequenced behind is
+  settled: [the deletion
+  refusal](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md) shipped, and
+  the probe was [measured and
+  dropped](../adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md).
+  What is left is the question below, and it is not a performance question.
 - **Date:** 2026-08-19
 - **Issue:** [#126](https://github.com/amorey/beehive/issues/126)
 
-## The gap, as it will stand after the other two
+## The gap, as it stands
 
 [#126](https://github.com/amorey/beehive/issues/126) asks for one call that
-makes a named object hold a spec. Today that is fifteen lines, three of them
-about beehive rather than about the caller's domain. The refusal removes the
-deletion guard; the probe removes the comparison and the reason for it. What is
-left is:
+makes a named object hold a spec. In the issue that was fifteen lines, three of
+them about beehive rather than about the caller's domain. The refusal removes the
+deletion guard, and the caller's own spec comparison was never needed — the store
+compares bytes on the way in, so dropping it costs the 41µs the ADR above
+measures. What is left is:
 
 ```go
 obj, err := client.UpdateByName(ctx, name, spec)
@@ -74,26 +75,17 @@ direction that silently clobbers.
 `CreateOrUpdate` says what it does, matches the bare-CRUD convention on `Client`
 (the receiver is already its kind), and is the name this shipped under before.
 
-### It must probe first, like a plain update
+### One transaction, no probe
 
-The obvious implementation — one `Within` around resolve-then-write — is
-**slower in the steady state than the composition it replaces**, because
-atomicity means the lock is taken before anything is known, and the steady state
-of an ensure call is that nothing needs doing.
+One `Within` around resolve-then-write:
 
-So the shape is the probe's, not the transaction's:
+- absent → `insertObject` + `signalCreated`, `created=true`;
+- deletion-pending → `ErrDeletionPending`;
+- present → `UpdateSpec` on the resolved id, opts ignored.
 
-1. Probe lock-free. Row present, not deleting, spec and version already
-   matching → return it, `created=false`. This is the steady state and it takes
-   no write transaction.
-2. Otherwise one `Within`: resolve, and
-   - absent → `insertObject` + `signalCreated`, `created=true`;
-   - deletion-pending → `ErrDeletionPending`;
-   - present → `UpdateSpec` on the resolved id, opts ignored.
-
-Which is why this is sequenced last rather than built first: without the probe
-it inherits the slow path, and retrofitting the fast path afterwards means
-re-deriving the linearization argument inside a verb that also creates.
+This costs what `UpdateByName` costs, which is what the composition it replaces
+already pays: both take the lock before anything is known. The verb is neither
+faster nor slower, so it has to earn its place on the question below.
 
 ### The deletion-pending answer
 
@@ -123,8 +115,8 @@ On the `Client` interface, between `Create` and `Delete`:
 // deletion-pending row is refused with ErrDeletionPending rather than rewritten,
 // and its name stays held until GC releases it.
 //
-// A spec whose bytes already match writes nothing and takes no write
-// transaction. Like GetOrCreate's, created is synchronous inside a caller's
+// A spec whose bytes already match writes nothing, as UpdateByName's do.
+// Like GetOrCreate's, created is synchronous inside a caller's
 // Within — route create-conditional side effects through WithOnCreate.
 CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 ```
