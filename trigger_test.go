@@ -37,7 +37,13 @@ func newTriggerReconciler(t *testing.T) *reconciler {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, store.Close()) })
 
-	r := &reconciler{gk: triggerGK, store: store, work: newWorkQueue()}
+	r := &reconciler{
+		gk:               triggerGK,
+		store:            store,
+		work:             newWorkQueue(),
+		maxRetryInterval: time.Minute,
+		backoffFor:       make(map[ObjectID]time.Duration),
+	}
 	t.Cleanup(r.work.stop)
 	return r
 }
@@ -180,6 +186,29 @@ func TestTriggerLogsAFailedReadAndKeepsServing(t *testing.T) {
 	ch <- obj.ID
 	assert.Equal(t, obj.ID, waitQueued(t, r.work), "the loop serves the poke after the failure")
 	assert.Contains(t, logs.String(), "trigger", "a failed read must name itself")
+
+	cancel()
+	waitClosed(t, done, "the trigger loop to return")
+}
+
+// A poke is an address, not a claim that a failure is over, so it leaves the
+// retry ladder where a plain Client.Requeue would leave it.
+func TestTriggerPreservesTheBackoffLadder(t *testing.T) {
+	r := newTriggerReconciler(t)
+	obj := triggerObject(t, r, "one")
+	ladder := r.backoffNext(obj.ID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan ObjectID)
+	done := runTrigger(ctx, &trigger{r: r, ids: ch})
+
+	ch <- obj.ID
+	require.Equal(t, obj.ID, waitQueued(t, r.work))
+
+	r.backoffMu.Lock()
+	defer r.backoffMu.Unlock()
+	assert.Equal(t, ladder, r.backoffFor[obj.ID], "a trigger must not reset the ladder")
 
 	cancel()
 	waitClosed(t, done, "the trigger loop to return")
