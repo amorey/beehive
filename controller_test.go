@@ -1662,6 +1662,120 @@ func TestAdminClientHasNoBaseline(t *testing.T) {
 	assert.EqualValues(t, 2, store.statusWrites.Load(), "no baseline, no skip")
 }
 
+// AfterCommit hooks run at the outermost commit, so inside a controller's own
+// transaction no write has promoted yet. The arm is what stops the second call
+// matching the stale load-time baseline and dropping the pass's last word.
+func TestUpdateStatusInsideWithinDoesNotSkipOnAStaleBaseline(t *testing.T) {
+	ctx, store, bh, _, id := newStatusBaselineFixture(t)
+
+	admin := NewAdminClient[cStatus](bh, clientTestGK)
+	require.NoError(t, admin.UpdateStatus(ctx, id, cStatus{Val: "loaded"}))
+	pass := passClientAt(t, ctx, bh, store, id)
+
+	require.NoError(t, pass.Within(ctx, func(ctx context.Context) error {
+		if err := pass.UpdateStatus(ctx, cStatus{Val: "other"}); err != nil {
+			return err
+		}
+		return pass.UpdateStatus(ctx, cStatus{Val: "loaded"})
+	}))
+
+	raw, err := store.Objects().Get(ctx, id)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"Val":"loaded"}`, string(raw.Status),
+		"the last write in the transaction is what stands")
+}
+
+// The promote hook carries its own bytes, so a later write that failed cannot
+// be promoted by an earlier write's hook.
+func TestUpdateStatusFailedWriteDoesNotPromoteAnEarlierOne(t *testing.T) {
+	ctx := context.Background()
+	store := &failSecondStatusWriteStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+
+	raw, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	pass := newPassClient[cStatus](bh, clientTestGK, obj.ID, newStatusBaseline(raw.Status, raw.StatusVersion))
+
+	_ = pass.Within(ctx, func(ctx context.Context) error {
+		require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "first"}))
+		store.failNext.Store(true)
+		require.Error(t, pass.UpdateStatus(ctx, cStatus{Val: "second"}))
+		store.failNext.Store(false)
+		return nil // the controller swallows it
+	})
+
+	// "second" never reached the store, so writing it now must not be skipped.
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "second"}))
+	raw, err = store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"Val":"second"}`, string(raw.Status))
+}
+
+// A failed write stores nothing, so the bytes it carried must not become the
+// baseline. With no other write outstanding there is nothing else to keep the
+// fast path off, so this is the case that a promote on the error path loses.
+func TestUpdateStatusFailedWriteDoesNotPromoteItsOwnBytes(t *testing.T) {
+	ctx := context.Background()
+	store := &failSecondStatusWriteStore{Store: newClientTestStore(t)}
+	bh := newTestBeehive(t, store)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "hello"})
+
+	raw, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	pass := newPassClient[cStatus](bh, clientTestGK, obj.ID, newStatusBaseline(raw.Status, raw.StatusVersion))
+
+	store.failNext.Store(true)
+	require.Error(t, pass.UpdateStatus(ctx, cStatus{Val: "attempted"}))
+	store.failNext.Store(false)
+
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "attempted"}))
+	raw, err = store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"Val":"attempted"}`, string(raw.Status),
+		"the retry must reach the store: the first attempt stored nothing")
+}
+
+// failSecondStatusWriteStore fails the status writes made while failNext is set.
+type failSecondStatusWriteStore struct {
+	Store
+	failNext atomic.Bool
+}
+
+func (s *failSecondStatusWriteStore) Objects() storeapi.Objects {
+	inner := s.Store.Objects()
+	return objectsOverride{
+		Objects: inner,
+		updateStatus: func(ctx context.Context, gk GroupKind, id ObjectID, status []byte, v int) (bool, error) {
+			if s.failNext.Load() {
+				return false, errBoom
+			}
+			return inner.UpdateStatus(ctx, gk, id, status, v)
+		},
+	}
+}
+
+// A rolled-back write never landed, so the baseline must not claim it.
+func TestUpdateStatusRolledBackWriteDoesNotPromote(t *testing.T) {
+	ctx, store, bh, _, id := newStatusBaselineFixture(t)
+	pass := passClientAt(t, ctx, bh, store, id)
+
+	require.Error(t, pass.Within(ctx, func(ctx context.Context) error {
+		if err := pass.UpdateStatus(ctx, cStatus{Val: "rolled-back"}); err != nil {
+			return err
+		}
+		return errBoom
+	}))
+
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "rolled-back"}))
+	raw, err := store.Objects().Get(ctx, id)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"Val":"rolled-back"}`, string(raw.Status),
+		"the write must reach the store, not match a baseline that never committed")
+}
+
 // A skip never reads, so it cannot notice that the row was collected mid-pass.
 // Documented behavior: the write would have written nothing either way.
 func TestUpdateStatusSkipOnACollectedObject(t *testing.T) {
