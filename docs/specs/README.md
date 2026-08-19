@@ -17,12 +17,10 @@ work we have decided to do.
 In flight, from [#126](https://github.com/amorey/beehive/issues/126) and to be
 built in this order — each one shrinks the next:
 
-1. [A spec write refuses a deletion-pending
-   row](2026-08-19-a-spec-write-refuses-a-deleting-row.md)
-2. [A spec write probes before it
+1. [A spec write probes before it
    transacts](2026-08-19-a-spec-write-probes-before-it-transacts.md)
-3. [A name-keyed CreateOrUpdate](2026-08-19-a-name-keyed-create-or-update.md) —
-   proposed, not decided; re-argue once 1 and 2 ship.
+2. [A name-keyed CreateOrUpdate](2026-08-19-a-name-keyed-create-or-update.md) —
+   proposed, not decided; re-argue once 1 ships.
 
 The last spec shipped as
-[A trigger channel requeues a kind's objects, by id or by name](../adr/2026-08-19-a-trigger-channel-requeues-by-id-or-name.md).
+[A spec write refuses a deletion-pending row](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md).

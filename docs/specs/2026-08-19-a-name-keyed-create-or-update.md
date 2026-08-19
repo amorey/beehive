@@ -1,7 +1,7 @@
 # A name-keyed CreateOrUpdate
 
 - **Status:** Proposed, not decided. Blocked on [the deletion
-  refusal](2026-08-19-a-spec-write-refuses-a-deleting-row.md) and [the
+  refusal](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md) and [the
   probe](2026-08-19-a-spec-write-probes-before-it-transacts.md), and to be
   re-argued once they ship — most of the reported pain is theirs, not this
   verb's. If the answer then is no, this becomes a `TODO.md` entry, not a file

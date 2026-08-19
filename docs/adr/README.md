@@ -62,6 +62,7 @@ for the mapping.
 - [A per-object cadence is armed by a pass and admitted by a startup scan](2026-08-19-an-individual-pass-interval.md)
 - [A pass skips a status write it can see is a no-op](2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md)
 - [A spec write enqueues its own object](2026-07-31-a-spec-write-enqueues-its-own-object.md)
+- [A spec write refuses a deletion-pending row](2026-08-19-a-spec-write-refuses-a-deleting-row.md)
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [The dependency waker persists its scan cursor](2026-07-30-durable-waker-cursor.md)
 - [Store write shapes: narrow in, narrow out](2026-07-30-store-write-shapes.md)

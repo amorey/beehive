@@ -1,7 +1,7 @@
 # A spec write probes before it transacts
 
 - **Status:** Planned. Sequenced after [a spec write refuses a deleting
-  row](2026-08-19-a-spec-write-refuses-a-deleting-row.md).
+  row](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md).
 - **Date:** 2026-08-19
 - **Issue:** [#126](https://github.com/amorey/beehive/issues/126),
   [#125](https://github.com/amorey/beehive/issues/125)
@@ -116,7 +116,7 @@ func (s *sqliteStore) specWriteSettled(
 Three things it must get exactly right, all of them shared with the transaction:
 
 1. The deletion refusal from
-   [its spec](2026-08-19-a-spec-write-refuses-a-deleting-row.md), first.
+   [the refusal](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md), first.
 2. `stampVersion`, whose `ErrSchemaVersionDowngrade` is returned here too — it
    is pure, so the fast path can answer it and a downgrade never needs the lock.
 3. The compare gated on `stamp == obj.SpecVersion && bytes.Equal(...)`, not on
@@ -133,7 +133,7 @@ read failure costs a transaction rather than a spurious failure.
 (`changed=false`) wakes nobody — same as today's in-transaction skip.
 
 The `Objects` interface godoc does **not** change, unlike [the
-refusal](2026-08-19-a-spec-write-refuses-a-deleting-row.md), which adds a clause
+refusal](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md), which adds a clause
 there. The contract states outcomes, and this changes none — it is an
 implementation's choice about when to take its own lock, which no `Store`
 implementer is obliged to copy.
@@ -192,7 +192,7 @@ is nothing to observe from another goroutine — see "what it does not buy".
 - Fold into an ADR carrying the linearization argument. That argument is what
   the change rests on, and it is not obvious from the diff.
 - `CLAUDE.md`: extend the same bullet
-  [the refusal spec](2026-08-19-a-spec-write-refuses-a-deleting-row.md) touches.
+  [the refusal](../adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md) touches.
 - `README.md`: `Update`'s no-op paragraph gains the probe, matching how the
   delete verb's lock-free probe is already described around line 602.
 - Re-measure [#126](https://github.com/amorey/beehive/issues/126) with the
