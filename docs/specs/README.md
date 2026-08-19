@@ -14,11 +14,7 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-In flight:
-
-- [An individual pass interval](2026-08-19-an-individual-pass-interval.md) — every
-  object of a kind gets a pass every `d`, armed by its own last pass rather than
-  by a whole-kind tick.
+No spec is in flight.
 
 The last spec shipped as
-[A ControllerClient exists only for the pass it is handed to, and writes only that pass's object](../adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md).
+[A per-object cadence is armed by a pass and admitted by a startup scan](../adr/2026-08-19-an-individual-pass-interval.md).
