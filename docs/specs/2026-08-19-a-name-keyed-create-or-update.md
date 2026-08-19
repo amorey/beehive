@@ -46,7 +46,10 @@ lines it saves, but making the correct ordering the only ordering.**
 CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 ```
 
-One `Within`: `resolveCreate` up front, then `UpdateSpecByName` and
+`checkName`, `json.Marshal` and `resolveCreate` run first, outside the
+transaction — the marshal because it would otherwise hold the single
+connection's write lock across arbitrary user `MarshalJSON` code, as
+`client.update` notes. Then one `Within` around `UpdateSpecByName` and
 
 - it wrote → `created=false`, plus `signalSpecWritten` and `signalKindWritten`
   gated on `changed`, exactly as `client.update` does;
@@ -55,8 +58,13 @@ One `Within`: `resolveCreate` up front, then `UpdateSpecByName` and
 
 Leading with `UpdateSpecByName` rather than resolving first keeps the common
 path to one row read, and it is already the atomic resolve-and-write the
-composition needs. It introduces no store call and costs what the composition
-costs.
+composition needs.
+
+It introduces no store call. On the update path it is **one** transaction where
+the composition is two — `GetOrCreate`'s and `Update`'s — and on the create path
+the two are equal at one. The steady state takes `BEGIN IMMEDIATE`
+unconditionally, like every other spec write.
+→ [ADR](../adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md)
 
 ### Not `Apply`
 
@@ -99,7 +107,8 @@ On the `Client` interface, between `Create` and `Delete`:
 CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 ```
 
-`fakeStore` gains whatever this path touches, if it is still panicking on it.
+`fakeStore` panics on `UpdateSpec` and `UpdateSpecByName`
+(`testutils_test.go:779`, `:783`); both need filling in.
 
 ## Edge cases the implementer would otherwise guess at
 
@@ -123,6 +132,12 @@ CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Ob
   byte-identical write wakes the kind for nothing; miss the calls and a real one
   reaches no watch tailer and no dependency waker.
 
+- **Both branches are in the one transaction**, which is the verb's reason to
+  exist. Hoisting the `ErrNotFound` branch out — `UpdateSpecByName` in one
+  transaction, the insert in another — rebuilds the race the verb removes. The
+  decode-rollback test below is what catches it: a hoisted insert commits before
+  the decode fails, so the row survives.
+
 - **It repairs a poison spec, and `GetOrCreate` cannot.** The update branch
   decodes the row `UpdateSpecByName` hands back, which carries the new bytes, so
   a row whose stored spec no longer decodes comes back healthy. `GetOrCreate`'s
@@ -142,7 +157,8 @@ In `client_test.go`:
   bump.
 - Deletion-pending → `ErrDeletionPending`, nothing written.
 - Wrong kind holding the name → creates, since the resolve is kind-scoped.
-- A create that fails to decode rolls back and reports `created=false`.
+- A create that fails to decode rolls back and reports `created=false` — and
+  **the row is gone**, which is what pins the insert inside the one transaction.
 - Inside a caller's `Within` that later fails: nothing is committed and
   `WithOnCreate` never fires.
 - A changed update enqueues the object and wakes the kind; a byte-identical one
@@ -158,4 +174,9 @@ In `client_test.go`:
 - `CLAUDE.md`: the "Reconcile is not transactional" bullet says outright that
   there is no name-keyed upsert. Rewrite it, do not append to it.
 - `README.md`: the paragraph at line 542 is about the absence of this verb.
+- `docs/reconcile-triggers.md`: no new row — both branches reuse
+  `signalSpecWritten`/`signalCreated` — but the prose at lines ~246 and ~690
+  names `Create` and `GetOrCreate` as the verbs that insert with `generation` 1
+  and write the `owned_by` edge inside the insert. Add the create branch to
+  both.
 - Close [#126](https://github.com/amorey/beehive/issues/126).
