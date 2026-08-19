@@ -1388,6 +1388,12 @@ func (s *sqliteStore) updateSpec(
 		if err != nil {
 			return err
 		}
+		// Checked before the version stamp and the byte compare: a pass on a
+		// deleting row runs collection, so a spec written here is discarded, and
+		// the write would still wake every watcher and dependent on the way.
+		if obj.DeletionRequestedAt != nil {
+			return fmt.Errorf("%w: object %d", storeapi.ErrDeletionPending, obj.ID)
+		}
 		// Never downward — see stampVersion.
 		stamp, err := stampVersion(obj.SpecVersion, specVersion)
 		if err != nil {

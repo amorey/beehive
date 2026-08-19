@@ -43,6 +43,11 @@ var ErrNotFound = errors.New("beehive: object not found")
 // the client, must refuse it: Store is a public extension point.
 var ErrInvalidName = errors.New("beehive: name must not be empty")
 
+// ErrDeletionPending is returned by a spec write to an object whose deletion has
+// been requested. Distinct from ErrNotFound: the row is still there and still
+// holds its name, so a create answers ErrNameTaken until GC releases it.
+var ErrDeletionPending = errors.New("beehive: object is deletion-pending")
+
 // ErrNameTaken is returned by a create whose name is already held within the
 // GroupKind, tombstones included. Implementations MUST report this sentinel,
 // not the driver's raw constraint error.

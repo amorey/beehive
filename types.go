@@ -101,6 +101,17 @@ var ErrInvalidName = storeapi.ErrInvalidName
 // row or a deletion-pending one. GetOrCreate returns the existing row instead.
 var ErrNameTaken = storeapi.ErrNameTaken
 
+// ErrDeletionPending is returned by Update and UpdateByName when the object is
+// being torn down. The write is refused rather than applied: a pass on a
+// deleting row runs collection, not reconcile, so the spec would be discarded.
+//
+// Distinct from ErrNotFound, because the answers differ — ErrNotFound means
+// create it, ErrDeletionPending means you cannot, since the name stays held
+// until GC releases it. A caller whose object is owned can treat it as "not
+// yet" and do nothing: a physical delete pushes its owner, so the owner's next
+// pass creates the replacement.
+var ErrDeletionPending = storeapi.ErrDeletionPending
+
 // ErrDuplicateConditionType is returned by SetConditions when one call names a
 // condition type twice, whose outcome would otherwise depend on apply order.
 var ErrDuplicateConditionType = storeapi.ErrDuplicateConditionType
