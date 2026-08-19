@@ -208,6 +208,9 @@ type reconciler struct {
 	// migrator is set by WithMigrator at Register, which copies it into
 	// bh.migrators so the client path shares it. nil when the kind opted out.
 	migrator Migrator
+	// triggers are the feeds declared by WithTriggerByID/WithTriggerByName, each
+	// its own goroutine launched by Start.
+	triggers []*trigger
 	logger   *slog.Logger
 	logLevel slog.Leveler
 

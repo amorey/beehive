@@ -429,3 +429,52 @@ func TestRegisterBuildsTheQueuesGateFromTheResolvedInterval(t *testing.T) {
 	require.True(t, held, "the queue's gate must carry the resolved interval")
 	assert.True(t, opensAt.Before(time.Now().Add(2*time.Minute)), "got the New-level interval, not Register's")
 }
+
+// A trigger channel is bound to one kind, so it accumulates rather than
+// replacing: a kind driven by two feeds declares two options and both must fire.
+func TestWithTriggerAccumulatesPerKind(t *testing.T) {
+	names := make(chan string)
+	ids := make(chan ObjectID)
+
+	r := &reconciler{}
+	require.NoError(t, WithTriggerByName(names)(r))
+	require.NoError(t, WithTriggerByName(names)(r))
+	require.NoError(t, WithTriggerByID(ids)(r))
+
+	assert.Len(t, r.triggers, 3, "every declared feed is kept")
+}
+
+// Nil is rejected wherever it was aimed: a nil channel blocks forever, so
+// accepting one registers a trigger that silently never fires — the failure the
+// option exists to prevent.
+func TestWithTriggerRejectsANilChannel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  Option
+	}{
+		{"WithTriggerByName", WithTriggerByName(nil)},
+		{"WithTriggerByID", WithTriggerByID(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &reconciler{}
+			err := tc.opt(r)
+			require.ErrorIs(t, err, ErrInvalidOption)
+			assert.Contains(t, err.Error(), tc.name, "name the option that was misused")
+			assert.Empty(t, r.triggers, "a rejected option must not have written")
+
+			// Checked before the target switch.
+			require.ErrorIs(t, tc.opt(&Beehive{}), ErrInvalidOption)
+			require.ErrorIs(t, tc.opt("unrelated"), ErrInvalidOption)
+		})
+	}
+}
+
+// The options have no meaningful target but a reconciler, and the convention is
+// that an option ignores a target it does not recognise. Pinned so the silence
+// is deliberate: a trigger declared at New drives nothing.
+func TestWithTriggerIgnoresAForeignTarget(t *testing.T) {
+	names := make(chan string)
+	bh := &Beehive{}
+	require.NoError(t, WithTriggerByName(names)(bh))
+	require.NoError(t, WithTriggerByName(names)("unrelated"))
+}
