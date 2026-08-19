@@ -121,6 +121,19 @@ type Client[Spec, Status any] interface {
 	// when "already there" is acceptable. The new object is unsettled and owed
 	// its first reconcile.
 	Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+	// CreateOrUpdate makes whatever holds name hold spec, creating it if
+	// absent; created says which. The resolve and the write are one
+	// transaction, which is what composing GetOrCreate with Update by hand
+	// cannot guarantee.
+	//
+	// opts are honoured on create and IGNORED on update, as in GetOrCreate: a
+	// created=false result says nothing about whether the row matches opts. A
+	// deletion-pending row is refused with ErrDeletionPending rather than
+	// rewritten, and its name stays held until GC releases it.
+	//
+	// Like GetOrCreate's, created is synchronous inside a caller's Within —
+	// route create-conditional side effects through WithOnCreate.
+	CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	// Delete soft-deletes id by setting DeletionRequestedAt. A registered kind
 	// reaches its controller at commit; a client-only kind waits for the GC
 	// sweeper, which takes every deletion from there either way. Returns
@@ -473,6 +486,62 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 		created = true
 		// Wake and WithOnCreate fire only for a row we just made; returning an
 		// existing object is a pure read.
+		c.signalCreated(ctx, raw, co)
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return obj, created, nil
+}
+
+// CreateOrUpdate leads with the spec write and falls back to an insert, so the
+// common path is one row read and the resolve-and-write is the store's own. See
+// the Client interface for the contract.
+func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
+	if err := checkName(name); err != nil {
+		return nil, false, err
+	}
+	// Marshal outside the transaction: it runs arbitrary user MarshalJSON, and
+	// the store has one connection (see update).
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return nil, false, err
+	}
+	co, err := c.resolveCreate(opts)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var obj *Object[Spec, Status]
+	var created bool
+	// One Within over both branches: split them and a concurrent create lands
+	// between, leaving this caller's spec unapplied.
+	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		raw, changed, err := c.bh.store.Objects().UpdateSpecByName(
+			ctx, c.gk, name, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		switch {
+		case err == nil:
+			if obj, err = c.decode(raw); err != nil {
+				return err
+			}
+			if changed {
+				c.signalSpecWritten(ctx, raw.ID)
+				c.bh.signalKindWritten(ctx, c.gk)
+			}
+			return nil
+		case !errors.Is(err, ErrNotFound):
+			return err
+		}
+		if raw, err = c.insertObject(ctx, name, b, co); err != nil {
+			return err
+		}
+		// Decode inside the transaction (see Create); created is set only after
+		// it succeeds, so a rolled-back create reports created=false.
+		if obj, err = c.decode(raw); err != nil {
+			return err
+		}
+		created = true
 		c.signalCreated(ctx, raw, co)
 		return nil
 	})

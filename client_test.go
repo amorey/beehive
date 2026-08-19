@@ -3688,3 +3688,21 @@ func TestSendOrDoneReportsACancelledSend(t *testing.T) {
 // Every one of them runs with the poll turned off, so a value a test observes is
 // provably the hub's. Without that they would pass on the poll alone and say
 // nothing about push.
+
+func TestClientCreateOrUpdateCreates(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.NotZero(t, obj.ID)
+	assert.Equal(t, "w1", obj.Name)
+	assert.Equal(t, int64(1), obj.Generation)
+	assert.Equal(t, "a", obj.Spec.Val)
+
+	got, err := client.GetByName(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, obj.ID, got.ID)
+}
