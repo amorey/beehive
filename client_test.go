@@ -3895,3 +3895,27 @@ func TestClientCreateOrUpdateIsKindScoped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "theirs", untouched.Spec.Val)
 }
+
+// Byte-identical bytes reach the store and it declines the write, so nothing is
+// appended to the log the watch tailers and the waker read.
+func TestClientCreateOrUpdateWritesNothingForIdenticalBytes(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first, _, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	before, err := bh.store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+
+	second, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first.Generation, second.Generation)
+	assert.Equal(t, first.ResourceVersion, second.ResourceVersion)
+
+	after, err := bh.store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "an identical spec must append nothing")
+}
