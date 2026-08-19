@@ -65,11 +65,9 @@ func (b *statusBaseline) claim(status []byte, version int) bool {
 
 // promote records a committed write. The bytes travel with the hook rather than
 // being read from here: it runs at the outermost commit, by which time a later
-// write may have been issued and failed.
+// write may have been issued and failed. Callers hold a non-nil baseline —
+// unlike claim, this takes no nil receiver.
 func (b *statusBaseline) promote(status []byte, version int) {
-	if b == nil {
-		return
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.status, b.version = status, version

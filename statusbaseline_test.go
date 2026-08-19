@@ -108,8 +108,23 @@ func TestUpdateStatusBaselineAdvancesWithItsOwnWrites(t *testing.T) {
 	assertStoredStatus(t, ctx, store, id, `{"Val":"loaded"}`)
 }
 
+// Which path a call takes depends on the bytes, so the skip must report a dead
+// context exactly as the store call it replaced would have.
+func TestUpdateStatusSkipReportsACanceledContext(t *testing.T) {
+	ctx, store, bh, id := newStatusBaselineFixture(t)
+	pass := passClientAt(t, ctx, bh, store, id)
+	require.NoError(t, pass.UpdateStatus(ctx, cStatus{Val: "done"}))
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	before := store.writes.Load()
+
+	assert.ErrorIs(t, pass.UpdateStatus(canceled, cStatus{Val: "done"}), context.Canceled)
+	assert.Equal(t, before, store.writes.Load(), "still a skip: the store is never reached")
+}
+
 // AdminClient is handed no object, so it holds no baseline: every call reaches
-// the store, and none of the baseline methods may panic on the nil.
+// the store, and claim must not panic on the nil.
 func TestAdminClientHasNoBaseline(t *testing.T) {
 	ctx, store, bh, id := newStatusBaselineFixture(t)
 

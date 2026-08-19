@@ -8544,8 +8544,9 @@ func TestObservedGenerationIsMonotonic(t *testing.T) {
 // A pass compares a status write against the bytes it was loaded with, which is
 // sound only while nothing else can move the column under it. "No statement
 // writes it" is a claim over an open set, so this asserts the structure instead.
-// Blind to a statement built by concatenation, and to an INSERT ... SELECT that
-// names no columns.
+// Blind to a statement built by concatenation, to an INSERT ... SELECT that names
+// no columns, and to SQL outside this package — a second Store implementation is
+// out of its reach entirely.
 // See docs/adr/2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md.
 func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 	// Word-bounded, so schema_version_status is not mistaken for the column.

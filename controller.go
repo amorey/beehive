@@ -168,17 +168,21 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, status 
 	}
 	version := c.statusVersion()
 	if !c.baseline.claim(b, version) {
-		return nil // the store would compare these and write nothing
+		// The store would compare these and write nothing. Its cancellation check
+		// goes with it, so make it here: which path a caller takes depends on the
+		// bytes, and the two must not disagree about a dead context.
+		return ctx.Err()
 	}
 	changed, err := c.bh.store.Objects().UpdateStatus(ctx, c.gk, c.id, b, version)
 	if err != nil || !changed {
 		// Neither promotes, so this pass keeps reaching the store.
 		return err // nothing written, so no resource_version bump and nothing to wake
 	}
-	// Promote only at commit: a write rolled back inside the caller's Within
-	// never landed.
-	bl := c.baseline
-	c.bh.store.AfterCommit(ctx, func(context.Context) { bl.promote(b, version) })
+	if bl := c.baseline; bl != nil {
+		// Promote only at commit: a write rolled back inside the caller's Within
+		// never landed.
+		c.bh.store.AfterCommit(ctx, func(context.Context) { bl.promote(b, version) })
+	}
 	c.bh.signalKindWritten(ctx, c.gk)
 	return nil
 }

@@ -59,6 +59,10 @@ turns a row collected mid-pass into `ErrNotFound`; a skipped call never reads. A
 controller re-reporting an unchanged status for a collected object now gets `nil`.
 The reconcile loop already treats a mid-pass collect as a no-op success.
 
+That is the only error the skip drops. Cancellation is checked explicitly on the
+skip path, because which path a call takes depends on its bytes: a caller cannot
+predict it, so the two must not disagree about a dead context.
+
 **Soundness rests on `objects.status` having one writer.** The create sets it to
 `NULL` and `Objects().UpdateStatus` is the only statement that moves it after
 that. `TestObjectStatusIsWrittenInOnePlace` pins it; a backfill or repair verb
