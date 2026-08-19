@@ -8612,3 +8612,33 @@ func TestUpdateStatusReportsWhetherItWrote(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, changed, "new bytes are a write")
 }
+
+// ObjectsGetMetaByName is GetMeta keyed by name within gk: the trigger channel's
+// resolution, which needs existence and kind and never reads conditions.
+func TestGetObjectMetaByNameSkipsConditions(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	created := newRefObject(t, store)
+	err := store.Conditions().Set(ctx, testGK, created.ID,
+		storeapi.Condition{Type: "Ready", Status: "True"})
+	require.NoError(t, err)
+
+	meta, err := store.Objects().GetMetaByName(ctx, testGK, created.Name)
+	require.NoError(t, err)
+	assert.Equal(t, created.ID, meta.ID)
+	assert.Nil(t, meta.Conditions, "ObjectsGetMetaByName must not assemble conditions")
+
+	// The kind is in the WHERE, so a foreign kind reads as absent rather than
+	// as ErrWrongKind.
+	_, err = store.Objects().GetMetaByName(ctx, beehive.GroupKind{Kind: "Other"}, created.Name)
+	require.ErrorIs(t, err, beehive.ErrNotFound)
+
+	_, err = store.Objects().GetMetaByName(ctx, testGK, "no-such-name")
+	require.ErrorIs(t, err, beehive.ErrNotFound)
+
+	// Empty is a name that matches nothing, not ErrInvalidName: the check lives
+	// on Client, above the store.
+	_, err = store.Objects().GetMetaByName(ctx, testGK, "")
+	require.ErrorIs(t, err, beehive.ErrNotFound)
+}

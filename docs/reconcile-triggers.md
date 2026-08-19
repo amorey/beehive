@@ -37,11 +37,21 @@ restart and it works when the push was lost.
 **Push** means a write starts the work itself, at commit time. A push holds no
 state in the store. It puts an object in a work queue in memory.
 
-**Every push has a pull behind it. A push is never the only route to a reconcile.**
+**Every push from a write has a pull behind it. A push is never the only route to a
+reconcile.**
 
 This rule is the centre of the design. A push lives in memory only. A crash between
 the commit and the dispatch discards it. Thus a lost push must cost time, and must
 never cost correctness. The durable record and its driver are what make that true.
+
+**A trigger channel is neither.** `WithTriggerByID` and `WithTriggerByName` hand
+beehive a feed of addresses from outside the process, and each one received is
+resolved within its kind and queued. It is not a write, so it commits nothing and
+records nothing; what it reports — a file, a cloud API, a probe — never entered the
+store, so there is no column for a driver to scan. It makes an object *dispatched*
+without ever making it *owed*, which is why it appears in section D and in no
+push-path count. See
+[the trigger-channel ADR](adr/2026-08-19-a-trigger-channel-requeues-by-id-or-name.md).
 
 One trigger qualifies the word *timer* rather than the rule: the individual pass
 (case 16) has no tick, and the pull behind it — the admission scan — runs once per
@@ -703,7 +713,7 @@ Tests: `TestCreateUnderADeletingOwnerQueuesTheOwner`,
 
 ## D. In-memory only
 
-Cases 13 through 16 leave no record. `workQueue.stop` cancels every pending timer at
+Cases 13 through 17 leave no record. `workQueue.stop` cancels every pending timer at
 shutdown.
 
 **Restart: lost.** An object is recovered only if it also carries a durable record.
@@ -814,6 +824,30 @@ Tests: `TestReconcilerIndividualPassRearmsASettledObject`,
 `TestReconcilerIndividualPassAdmitsColdObjects`,
 `TestReconcilerIndividualPassAdmissionRetries`,
 `TestReconcilerIndividualPassSubsumesTheStartupPass`.
+
+### 17. A trigger channel
+
+`WithTriggerByID(ch)` or `WithTriggerByName(ch)` at `Register`. Each address
+received is resolved within the kind — one metadata-only read, kind-scoped — and
+queued through the same path as `Client.Requeue`. `reconciler.run` launches one
+goroutine per declared feed into its own wait group, so a feed ends with the loop it
+pokes and the work queue stops after both. Reads are
+floored at 100ms and what the floor holds back is coalesced into the next drain, so
+a hot feed on one address costs one read per window and nothing is dropped —
+closing the channel drains what the floor was holding before the feed ends.
+
+**Restart: lost, and nothing re-derives it.** This is the one case in this document
+with no record *and* nothing in the store to recover from. Cases 13 through 16 are
+in-memory schedules over state the store still holds; here the change itself
+happened outside the store, so a poke lost to a crash, a cancelled context or a
+failed read is gone. What recovers the object is whatever cadence the kind runs for
+its own reasons — and for a kind whose truth is entirely external, that may be
+nothing. That is the app's trade to make, and `Client.Requeue` in a loop of the
+app's own makes the same one.
+
+Tests: `TestTriggerByIDRequeuesTheObject`, `TestTriggerByNameRequeuesTheObject`,
+`TestTriggerByIDIgnoresAForeignKind`, `TestTriggerCoalescesInsideTheFloor`,
+`TestTriggerDispatchesAfterStart`, `TestTriggerDoesNotHoldUpStop`.
 
 ## E. Not triggers
 

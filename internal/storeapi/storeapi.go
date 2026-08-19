@@ -722,6 +722,11 @@ type Objects interface {
 	// always nil). ErrNotFound if no object matches.
 	GetMeta(ctx context.Context, id ObjectID) (*RawObject, error)
 
+	// GetMetaByName is GetMeta keyed by name within gk, for a caller that needs
+	// existence and kind and no more. The kind is in the WHERE, so a name held
+	// by another kind reads as ErrNotFound rather than ErrWrongKind.
+	GetMetaByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
+
 	// List returns every object of kind gk, ordered by id.
 	List(ctx context.Context, gk GroupKind) ([]*RawObject, error)
 

@@ -79,5 +79,6 @@ for the mapping.
 - [Events API](2026-07-27-events-api.md)
 - [Event retention is a ring per timeline, and it is off by default](2026-08-06-event-retention-is-a-ring-per-timeline.md)
 - [Schedule watch](2026-07-27-schedule-watch.md)
+- [A trigger channel requeues a kind's objects, by id or by name](2026-08-19-a-trigger-channel-requeues-by-id-or-name.md)
 - [The client surfaces are named VerbNoun](2026-08-07-verb-noun-on-the-client-surfaces.md)
 - [NounsVerb method naming and the watch return shape](2026-07-27-noun-verb-naming.md) (superseded)

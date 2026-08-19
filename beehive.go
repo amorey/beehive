@@ -94,6 +94,9 @@ const (
 	// Floors the gap between two wake-driven drains, so a write stream cannot
 	// make its kind's tailer hold the single connection back from the writers.
 	defaultWatchScanMinInterval = 100 * time.Millisecond
+	// The same floor for a trigger channel, whose rate is set by a producer
+	// outside this process. What it holds back is coalesced, never dropped.
+	defaultTriggerFloor = 100 * time.Millisecond
 	// The first retry after a failed tail step; it doubles up to watchRetryMax.
 	watchRetryBase = 100 * time.Millisecond
 	// watchRetryMax caps that ladder. Its own constant rather than the floor: the
@@ -499,6 +502,13 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	// Resolve once with overrides applied; tag every record with the kind.
 	r.logger = logging.Resolve(r.logger, r.logLevel).With("group", gk.Group, "kind", gk.Kind)
 	adapter.logger = r.logger
+
+	// The options record only the feed; its reconciler and its floor are derived
+	// state, like the queue's gate above.
+	for _, trig := range r.triggers {
+		trig.r = r
+		trig.floor = defaultTriggerFloor
+	}
 
 	// Promote a WithMigrator option to the shared registry so both decode paths
 	// resolve the same migrator.

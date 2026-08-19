@@ -314,6 +314,44 @@ func WithIndividualPassInterval(d time.Duration) Option {
 	}
 }
 
+// WithTriggerByID requeues each id received on ch, as Client.Requeue would —
+// retry backoff and all. An id naming nothing, or an object of another kind, is
+// a no-op, and closing ch ends that feed once what it already sent has drained.
+// Repeated options accumulate; meaningful only at Register, and a channel serves
+// one kind.
+//
+// A poke is a latency hint that nothing records, so correctness rests on the
+// kind's own cadence. See
+// docs/adr/2026-08-19-a-trigger-channel-requeues-by-id-or-name.md.
+func WithTriggerByID(ch <-chan ObjectID) Option {
+	return func(target any) error {
+		// Checked before the target switch: a nil channel blocks forever, so it
+		// is nonsense wherever it was aimed.
+		if ch == nil {
+			return fmt.Errorf("%w: WithTriggerByID needs a non-nil channel", ErrInvalidOption)
+		}
+		if t, ok := target.(*reconciler); ok {
+			t.triggers = append(t.triggers, &trigger{ids: ch})
+		}
+		return nil
+	}
+}
+
+// WithTriggerByName is WithTriggerByID keyed by name, carrying the same
+// contract. A name matching nothing — "" included — is a no-op, since whether a
+// record exists for an address is the app's business and changes under it.
+func WithTriggerByName(ch <-chan string) Option {
+	return func(target any) error {
+		if ch == nil {
+			return fmt.Errorf("%w: WithTriggerByName needs a non-nil channel", ErrInvalidOption)
+		}
+		if t, ok := target.(*reconciler); ok {
+			t.triggers = append(t.triggers, &trigger{names: ch})
+		}
+		return nil
+	}
+}
+
 // WithGCInterval sets how often the global GC sweeper runs: collecting
 // deletion-pending objects of every kind, applying event-log retention, and
 // releasing freed space. Meaningful only at New.

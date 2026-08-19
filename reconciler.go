@@ -208,6 +208,9 @@ type reconciler struct {
 	// migrator is set by WithMigrator at Register, which copies it into
 	// bh.migrators so the client path shares it. nil when the kind opted out.
 	migrator Migrator
+	// triggers are the feeds declared by WithTriggerByID/WithTriggerByName, each
+	// its own goroutine launched by Start.
+	triggers []*trigger
 	logger   *slog.Logger
 	logLevel slog.Leveler
 
@@ -470,6 +473,14 @@ func (r *reconciler) run(ctx context.Context) {
 	for range n {
 		wg.Go(func() {
 			r.runWorker(ctx)
+		})
+	}
+	// A trigger is not a driver — it services a feed the app owns — but its
+	// lifetime is this loop's: counted here, the queue is stopped below only
+	// once no trigger is left to poke it.
+	for _, trig := range r.triggers {
+		wg.Go(func() {
+			trig.run(ctx)
 		})
 	}
 	r.logger.Info("reconciler started", "workers", n,
