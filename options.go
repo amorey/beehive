@@ -289,6 +289,31 @@ func WithFullPassInterval(d time.Duration) Option {
 	}
 }
 
+// WithIndividualPassInterval gives every object of the kind a pass roughly
+// every d, measured from the end of each object's own last pass. Default 0
+// (disabled).
+//
+// It schedules a pass that returned settled without asking to be requeued;
+// every other result keeps its own schedule, so d is a default cadence rather
+// than a ceiling. Armings are jittered upward, and a scan at startup spreads
+// the first pass of each object across d — pair it with WithStartupFullPass for
+// a kind that needs that first pass promptly.
+// See docs/adr/2026-08-19-an-individual-pass-interval.md.
+//
+// Passed to New it sets the default for all controllers; passed to Register it
+// overrides that default for one.
+func WithIndividualPassInterval(d time.Duration) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.individualPassInterval = d
+		case *reconciler:
+			t.individualPassInterval = d
+		}
+		return nil
+	}
+}
+
 // WithGCInterval sets how often the global GC sweeper runs: collecting
 // deletion-pending objects of every kind, applying event-log retention, and
 // releasing freed space. Meaningful only at New.

@@ -118,13 +118,14 @@ Every driver is one of these. They run on separate intervals because they are se
 |---|---|---|---|
 | owed pass | work the store *records* as owed — unconverged specs (`observed_generation < generation`) and owed dependency wakes | what is actually outstanding | `WithOwedPassInterval`, default 30s |
 | full pass | **every** object of the kind, converged or not | the object count | `WithFullPassInterval`, default 0 (off) |
+| individual pass | one object, re-armed by its own last pass; a startup scan admits the rest | nothing per tick — there is no tick | `WithIndividualPassInterval`, default 0 (off) |
 | GC sweep | deletion-pending rows, event-log retention, then the free space those two leave behind | rows being deleted | `WithGCInterval`, default 30s |
 | dependency wake | the write log above a watermark, waking dependents of what moved | what has **changed** since the last scan | none: a commit wakes it |
 | stale dependents | dependents whose targets moved past the watermark their last pass recorded | the dependency graph | `WithStaleDependentsInterval`, default 60s |
 | watch tail | the write log of each watched kind, once per kind however many watches it has | one cheap read per watched kind per tick, and a commit wakes it before the tick | `WithWatchFloorInterval`, default 30s |
 | event watch | one object's event log above a cursor, for each live `WatchEvents` | what the log has grown by, and a commit wakes it before the tick | `WithWatchFloorInterval`, default 30s |
 
-**Every cadence here is configurable, and only the full pass can be switched off.** That is deliberate on both counts. A tick is no longer how work is found — every trigger for a registered kind pushes at commit, and both watch families read on a commit wake — so lengthening one buys a mostly-idle process a much quieter store while costing recovery time on a *lost* push, which is a trade an embedder is entitled to make. Turning one off is not, because each is the only thing that re-derives its own class of work. → [ADR: the driver cadences are configurable](docs/adr/2026-08-06-driver-cadences-are-configurable.md)
+**Every cadence here is configurable, and only the two opt-in passes — the full pass and the individual pass — can be switched off.** That is deliberate on both counts. A tick is no longer how work is found — every trigger for a registered kind pushes at commit, and both watch families read on a commit wake — so lengthening one buys a mostly-idle process a much quieter store while costing recovery time on a *lost* push, which is a trade an embedder is entitled to make. Turning one off is not, because each is the only thing that re-derives its own class of work. → [ADR: the driver cadences are configurable](docs/adr/2026-08-06-driver-cadences-are-configurable.md)
 
 The full pass is opt-in because it is the only driver whose cost is unbounded by outstanding work. It is also the only one that reaches an object the store records nothing about: state that belongs to a process and a restart invalidated — a liveness condition that reads as "verifying" until a controller in *this* process rewrites it, but equally a live connection, a running worker, an open watch. Set it well above the owed pass, which it subsumes.
 
@@ -139,9 +140,11 @@ Both cadences are off by default — `WithFullPassInterval` for the periodic one
 
 For the second class the startup pass is the convergence mechanism, and what it guarantees is exactly that: **every object of a kind that enables it is reconciled at least once per process.** Declare it at `Register`, per kind, so the kinds that own in-process state say so and the rest don't pay. → [ADR: the startup full pass may be depended on](docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md)
 
+**The individual pass is the per-object shape of the same idea.** `WithIndividualPassInterval(d)` gives each object a pass roughly every `d`, measured from the end of its own last pass, so objects spread themselves out instead of arriving as a whole-kind burst; a scan at startup admits the objects no pass would otherwise reach. Reach for it over `WithFullPassInterval` when a kind must re-poll something the store cannot see, and over a `RequeueAfter` chain when forgetting to re-arm on one return path would be silent. It is a default cadence rather than a ceiling: a pass that returns `RequeueAfter` keeps its own schedule, longer or shorter. → [ADR: a per-object cadence is armed by a pass](docs/adr/2026-08-19-an-individual-pass-interval.md)
+
 To reconcile something sooner than the next pass, use `Client.Requeue` rather than shortening a cadence: it is a latency hint aimed at one object, where an interval is a cost paid by every object forever. The examples under `examples/` all do this — it is what lets them run on production defaults. `examples/lowpower` is the exception, and shows the other side: every cadence at minutes, with the pushes alone carrying the demo.
 
-**Four of the five cadences cannot be disabled**: `WithGCInterval`, `WithOwedPassInterval`, `WithStaleDependentsInterval` and `WithWatchFloorInterval` each reject a non-positive interval with `ErrInvalidOption`. A long interval means "rarely"; there is no way to say "never". `WithFullPassInterval` can be set to 0, and startup logs when it is off, so a value left at 0 by accident is visible rather than silent.
+**Four of the six cadences cannot be disabled**: `WithGCInterval`, `WithOwedPassInterval`, `WithStaleDependentsInterval` and `WithWatchFloorInterval` each reject a non-positive interval with `ErrInvalidOption`. A long interval means "rarely"; there is no way to say "never". `WithFullPassInterval` and `WithIndividualPassInterval` can be set to 0, being opt-in; startup logs when the owed pass is off, so a value left at 0 by accident is visible rather than silent.
 
 → [ADR: every driver is a periodic scan of the store](docs/adr/2026-07-28-periodic-scan-drivers.md), for why the cadences are separate, why GC alone is mandatory, and what each driver's cost is bounded by.
 
@@ -850,6 +853,7 @@ func WithFinalizers(f ...string) Option            // declare finalizers before 
 func WithOwner(id ObjectID) Option                 // declare owned_by edge; owner cannot be deleted while this object exists
 func WithOnCreate(fn func(ctx context.Context)) Option // run fn after the create commits (Create always; GetOrCreate only when it inserts)
 func WithFullPassInterval(d time.Duration) Option  // how often to re-dispatch EVERY object (default: 0, off)
+func WithIndividualPassInterval(d time.Duration) Option // how often to re-dispatch EACH object, from the end of its own pass (default: 0, off)
 func WithOwedPassInterval(d time.Duration) Option  // how often to drain work the store records as owed (default: 30s; must be > 0)
 func WithStaleDependentsInterval(d time.Duration) Option // how often to re-derive which dependents a target moved past (default: 60s; New only; must be > 0)
 func WithWatchFloorInterval(d time.Duration) Option // how often a watch reads without a commit wake (default: 30s; New only; must be > 0)

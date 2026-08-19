@@ -71,11 +71,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   **cannot be disabled**), the dependency waker (write log, **wake-driven, no
   tick**), the stale-dependents pass (60s, **cannot be disabled**), the object
   watch tail and the event watch (both `WithWatchFloorInterval`, 30s, each with
-  a commit wake in front). **Five cadences are public** — `WithGCInterval`,
-  `WithFullPassInterval`, `WithOwedPassInterval`, `WithStaleDependentsInterval`,
-  `WithWatchFloorInterval` — because every trigger pushes at commit, so what a
+  a commit wake in front). **Six cadences are public** — `WithGCInterval`,
+  `WithFullPassInterval`, `WithIndividualPassInterval`, `WithOwedPassInterval`,
+  `WithStaleDependentsInterval`, `WithWatchFloorInterval` — because every trigger pushes at commit, so what a
   tick paces is recovery of a *lost* push rather than latency; only the full pass
-  may be disabled, and the defaults are unchanged. The floors on active work
+  and the individual pass may be disabled, and the defaults are unchanged. The floors on active work
   (`minRequeueInterval`, the two scan floors, `wakePersistInterval`) stay
   unexported, every retry ladder is capped on a constant of its own rather than
   on one of these, and the GC sweeper's per-sweep budgets scale with its
@@ -111,6 +111,22 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
+- **The individual pass is a per-object cadence with no tick behind it**
+  (`WithIndividualPassInterval`, off by default). A settled pass that scheduled
+  nothing arms the object's own next pass; a one-shot admission scan at `Start`
+  arms the objects no pass would reach, spread across the whole interval, and
+  with the individual pass on that scan *is* the startup full pass — same
+  listing, zero offset, plus the retry `enqueueAll` lacks. Both armings jitter
+  upward through one `spread` helper and neither is configurable; a test sets
+  `individualPassRand` directly so its schedule is exact. The re-arm reuses `alarmRequeueAfter`, since it runs
+  only where the result scheduled nothing; the scan gets `alarmAdmit`, which
+  **loses every arbitration in both directions and is dropped if it fires
+  mid-pass**, because it runs beside the workers and must neither displace a
+  schedule a pass set, pre-empt one it is about to set, nor hold the slot a
+  floor keeps a wake in. `d` is a **default cadence, not a ceiling**: a
+  `RequeueAfter` wins either way, a failure keeps its ladder, and `!gone` guards
+  the arm or a collected id is resurrected into `ErrNotFound`.
+  → [ADR](docs/adr/2026-08-19-an-individual-pass-interval.md)
 - **The work queue floors how often one object is dispatched**, and a pending
   backoff or floor alarm absorbs an arriving wake rather than jumping it. The
   floor is per id (`internal/rategate`), so N distinct objects cost nothing and

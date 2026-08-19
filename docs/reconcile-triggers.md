@@ -43,6 +43,11 @@ This rule is the centre of the design. A push lives in memory only. A crash betw
 the commit and the dispatch discards it. Thus a lost push must cost time, and must
 never cost correctness. The durable record and its driver are what make that true.
 
+One trigger qualifies the word *timer* rather than the rule: the individual pass
+(case 16) has no tick, and the pull behind it — the admission scan — runs once per
+process instead of on a cadence. That is enough because what it recovers cannot
+outlive the process that held it. Nothing else on this map is recovered by it.
+
 ### The push paths
 
 There are exactly nine push paths that cause a reconcile. All use
@@ -698,7 +703,7 @@ Tests: `TestCreateUnderADeletingOwnerQueuesTheOwner`,
 
 ## D. In-memory only
 
-Cases 13, 14 and 15 leave no record. `workQueue.stop` cancels every pending timer at
+Cases 13 through 16 leave no record. `workQueue.stop` cancels every pending timer at
 shutdown.
 
 **Restart: lost.** An object is recovered only if it also carries a durable record.
@@ -782,6 +787,33 @@ This is the public way to beat a cadence.
 
 Tests: `TestClientRequeue`, `TestClientRequeueNoController`,
 `TestWorkQueueRequeueNow`.
+
+### 16. The individual pass
+
+`scheduleNext` calls `workQueue.addAfter` after a pass that settled and scheduled
+nothing, when the kind set `WithIndividualPassInterval(d)`. Each object's next
+pass is armed by its own last one, jittered upward by a tenth. It is section 13's
+chain made unforgettable: a return path cannot drop it, because no return path
+declares it.
+
+**Restart: re-derived, once.** `admit` lists the kind at `Start` and arms every
+object it finds, spread across one interval — the only pull behind this trigger,
+and the only one on this map that runs per process rather than per tick. It is
+sound because the alarm it rebuilds is itself in-memory: nothing can be owed
+across a restart that the scan does not re-arm. An object created after the scan
+is admitted by its create's push (case 1), and one collected in between is
+dropped by `forget`.
+
+A pass that returns anything else — a `RequeueAfter`, a failure, a bare
+`Unsettled` — keeps that schedule instead, and so does an object the scan meets
+mid-pass: the scan's `alarmAdmit` loses to every pending alarm. `d` bounds the
+idle case only.
+
+Tests: `TestReconcilerIndividualPassRearmsASettledObject`,
+`TestReconcilerIndividualPassYieldsToTheResult`,
+`TestReconcilerIndividualPassAdmitsColdObjects`,
+`TestReconcilerIndividualPassAdmissionRetries`,
+`TestReconcilerIndividualPassSubsumesTheStartupPass`.
 
 ## E. Not triggers
 

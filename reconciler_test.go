@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -97,16 +98,40 @@ func (s *tickOnlyReconcileOwedStore) listIDs(context.Context, GroupKind) ([]Obje
 type allIDsStore struct {
 	fakeStore
 	ids []ObjectID
+	// failures fails that many ListIDs calls before serving ids, for a listing
+	// whose only recovery is its own retry.
+	failures int
+	// listed, when set, is closed on the first call, so a test can wait for the
+	// listing rather than for a delay.
+	listed chan struct{}
+
+	mu    sync.Mutex
+	calls int
 }
 
 func (s *allIDsStore) Objects() storeapi.Objects {
 	return objectsOverride{Objects: s.fakeStore.Objects(), listUnsettledIDs: s.listUnsettledIDsObjects, listIDs: s.listIDsObjects}
 }
 
+func (s *allIDsStore) listCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
 func (s *allIDsStore) listUnsettledIDsObjects(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
 func (s *allIDsStore) listIDsObjects(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls == 1 && s.listed != nil {
+		close(s.listed)
+	}
+	if s.calls <= s.failures {
+		return nil, errors.New("list failed")
+	}
 	return s.ids, nil
 }
 
@@ -118,6 +143,14 @@ func runInBackground(r *reconciler, ctx context.Context) <-chan struct{} {
 		r.run(ctx)
 	}()
 	return done
+}
+
+// alarmFor reads an id's pending alarm under the queue's lock: a timer firing
+// concurrently writes the same map.
+func alarmFor(q *workQueue, id ObjectID) *alarm {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.gauge.alarmFor(id)
 }
 
 func TestRunExitsOnCancelWithFullPassDisabled(t *testing.T) {
@@ -3964,4 +3997,372 @@ func TestReconcileWritesTheWatermarkBeforeTheStamp(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"watermark", "stamp"}, order)
+}
+
+// The point of the option: a return path that declares nothing still comes
+// back. Each pass arms the next, so N passes follow one enqueue.
+func TestReconcilerIndividualPassRearmsASettledObject(t *testing.T) {
+	calls := 0
+	doneCh := make(chan struct{})
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			calls++
+			if calls == 3 {
+				close(doneCh)
+			}
+			return Settled()
+		},
+	}
+
+	r := &reconciler{
+		adapter:                adapter,
+		work:                   newWorkQueue(),
+		individualPassInterval: 5 * time.Millisecond,
+		maxRetryInterval:       time.Second,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(1)
+	waitClosed(t, doneCh, "third reconcile from the individual pass")
+	cancel()
+	waitClosed(t, done, "run to exit")
+}
+
+// Off by default: a settled pass with the option unset arms nothing.
+func TestReconcilerNoIndividualPassArmsNothing(t *testing.T) {
+	adapter := &fakeAdapter{reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult { return Settled() }}
+	r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
+
+	t.Cleanup(r.work.stop)
+
+	r.scheduleNext(1, Settled())
+
+	assert.Nil(t, alarmFor(r.work, 1))
+}
+
+// A collected object comes back Settled, which is the branch that arms. Arming
+// it would resurrect an id forget just dropped, into a dispatch that can only
+// read ErrNotFound. Id 2 is the barrier: one worker dispatches in order, so 1's
+// pass is over by the time 2's runs.
+func TestReconcilerIndividualPassArmsNothingForACollectedObject(t *testing.T) {
+	reached2 := make(chan struct{})
+	adapter := &fakeAdapter{gone: true}
+	r := &reconciler{
+		adapter:                adapter,
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Minute,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	adapter.reconcileFn = func(_ context.Context, id ObjectID) ReconcileResult {
+		if id == 2 {
+			close(reached2)
+		}
+		return Settled()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(1)
+	r.enqueue(2)
+	waitClosed(t, reached2, "the barrier object reconciled")
+	cancel()
+	waitClosed(t, done, "run to exit")
+
+	assert.Nil(t, alarmFor(r.work, 1))
+}
+
+// What the individual pass must not override. It is a default cadence, not a
+// ceiling: a controller that scheduled its own pass — sooner or later — keeps
+// it, and a failure keeps its ladder.
+func TestReconcilerIndividualPassYieldsToTheResult(t *testing.T) {
+	const d = time.Minute
+
+	tests := []struct {
+		name   string
+		result ReconcileResult
+		want   time.Duration
+		kind   alarmKind
+	}{
+		{"a sooner RequeueAfter wins", Settled().RequeueAfter(time.Second), time.Second, alarmRequeueAfter},
+		{"a later RequeueAfter wins too", Settled().RequeueAfter(time.Hour), time.Hour, alarmRequeueAfter},
+		{"a failure keeps its ladder", Fail(errors.New("boom")), time.Minute, alarmBackoff},
+		{"unsettled keeps the owed cadence", Unsettled(), defaultOwedPassInterval, alarmRequeueAfter},
+		{"settled with nothing owed takes the individual pass", Settled(), d, alarmRequeueAfter},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &reconciler{
+				work:                   newWorkQueue(),
+				individualPassInterval: d,
+				owedPassInterval:       defaultOwedPassInterval,
+				maxRetryInterval:       time.Hour,
+				baseRetryInterval:      time.Minute,
+				backoffFor:             make(map[ObjectID]time.Duration),
+			}
+			// Every delay here is minutes out, and stop cancels what is left:
+			// an alarm firing after its test lands in whichever test is running.
+			t.Cleanup(r.work.stop)
+
+			r.scheduleNext(1, tc.result)
+
+			a := alarmFor(r.work, 1)
+			require.NotNil(t, a)
+			assert.Equal(t, tc.kind, a.kind)
+			assert.InDelta(t, tc.want, time.Until(a.fireAt), float64(time.Second))
+		})
+	}
+}
+
+// The jitter only ever lengthens: a pass never fires early, and two objects
+// that settled in the same moment drift apart.
+func TestReconcilerIndividualPassJitters(t *testing.T) {
+	const d = time.Hour
+
+	tests := []struct {
+		name string
+		frac float64
+		want time.Duration
+	}{
+		{"no source is exact", 0, d},
+		{"the top of the range adds a tenth", 1, d + d/10},
+		{"half the range adds a twentieth", 0.5, d + d/20},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &reconciler{
+				individualPassInterval: d,
+				individualPassRand:     func() float64 { return tc.frac },
+			}
+
+			assert.Equal(t, tc.want, d+r.spread(d, individualPassJitterFrac))
+		})
+	}
+}
+
+// The case the option exists for: objects settled by a previous process, owing
+// nothing, that no other trigger would ever wake.
+func TestReconcilerIndividualPassAdmitsColdObjects(t *testing.T) {
+	seen := make(chan ObjectID, 3)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) ReconcileResult {
+			seen <- id
+			return Settled()
+		},
+	}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                adapter,
+		store:                  &allIDsStore{ids: []ObjectID{1, 2, 3}},
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { return 0 }, // no offset, so the scan dispatches at once
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	got := map[ObjectID]bool{}
+	for range 3 {
+		select {
+		case id := <-seen:
+			got[id] = true
+		case <-time.After(testTimeout):
+			t.Fatalf("timed out waiting for the admission scan; saw %v", got)
+		}
+	}
+	assert.Equal(t, map[ObjectID]bool{1: true, 2: true, 3: true}, got)
+
+	cancel()
+	waitClosed(t, done, "run to exit")
+}
+
+// The scan spreads its armings across the whole first interval, so a restart
+// does not dispatch the kind at once.
+func TestReconcilerIndividualPassAdmissionSpreads(t *testing.T) {
+	var n int
+	fracs := []float64{0, 0.25, 0.5}
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                &fakeAdapter{reconcileFn: func(context.Context, ObjectID) ReconcileResult { return Settled() }},
+		store:                  &allIDsStore{ids: []ObjectID{1, 2, 3}},
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { f := fracs[n]; n++; return f },
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+
+	t.Cleanup(r.work.stop)
+
+	require.NoError(t, r.admitAll(context.Background(), time.Hour))
+
+	// Id 1 drew 0 and is due now; the rest are spread over the interval.
+	assert.Nil(t, alarmFor(r.work, 1), "a zero offset dispatches rather than arming")
+	for id, want := range map[ObjectID]time.Duration{2: time.Hour / 4, 3: time.Hour / 2} {
+		a := alarmFor(r.work, id)
+		require.NotNil(t, a, "id %d", id)
+		assert.InDelta(t, want, time.Until(a.fireAt), float64(time.Second), "id %d", id)
+	}
+}
+
+// The scan's only recovery is its own retry.
+func TestReconcilerIndividualPassAdmissionRetries(t *testing.T) {
+	seen := make(chan ObjectID, 1)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) ReconcileResult {
+			seen <- id
+			return Settled()
+		},
+	}
+	store := &allIDsStore{ids: []ObjectID{7}, failures: 2}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                adapter,
+		store:                  store,
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { return 0 },
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	select {
+	case id := <-seen:
+		assert.Equal(t, ObjectID(7), id)
+	case <-time.After(testTimeout):
+		t.Fatal("timed out waiting for the admission scan to succeed")
+	}
+	assert.Equal(t, 3, store.listCalls(), "two failures then the success")
+
+	cancel()
+	waitClosed(t, done, "run to exit")
+}
+
+// The startup pass and the admission scan list the same kind for the same
+// reason. With both on, the scan drops its offset and does the work once.
+func TestReconcilerIndividualPassSubsumesTheStartupPass(t *testing.T) {
+	seen := make(chan ObjectID, 2)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) ReconcileResult {
+			seen <- id
+			return Settled()
+		},
+	}
+	store := &allIDsStore{ids: []ObjectID{1, 2}}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                adapter,
+		store:                  store,
+		work:                   newWorkQueue(),
+		startupFullPass:        true,
+		individualPassInterval: time.Hour,
+		// A source that would spread the armings; the startup pass overrides it.
+		individualPassRand: func() float64 { return 0.5 },
+		backoffFor:         make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	for range 2 {
+		select {
+		case <-seen:
+		case <-time.After(testTimeout):
+			t.Fatal("timed out waiting for the startup dispatch")
+		}
+	}
+	cancel()
+	waitClosed(t, done, "run to exit")
+
+	// Counted after the loop exits, so the scan goroutine has finished either
+	// way and the count is not a race.
+	assert.Equal(t, 1, store.listCalls(), "the scan is the startup pass, not a second listing")
+}
+
+// The scan retries until it succeeds or the reconciler stops. run waits on it,
+// so a scan that ignored the cancel would hold a stopped beehive open.
+func TestReconcilerIndividualPassAdmissionStopsWithTheReconciler(t *testing.T) {
+	const alwaysFails = math.MaxInt
+	store := &allIDsStore{ids: []ObjectID{1}, failures: alwaysFails, listed: make(chan struct{})}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                &fakeAdapter{reconcileFn: func(context.Context, ObjectID) ReconcileResult { return Settled() }},
+		store:                  store,
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	waitClosed(t, store.listed, "the first admission attempt")
+	cancel()
+	waitClosed(t, done, "run to exit while the scan is still retrying")
+}
+
+// The scan runs beside the workers, so it can reach an id whose startup pass
+// already scheduled itself. A boot-time offset must not displace what that pass
+// asked for.
+func TestReconcilerIndividualPassAdmissionYieldsToALivePass(t *testing.T) {
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		store:                  &allIDsStore{ids: []ObjectID{1, 2, 3}},
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { return 0.5 },
+		maxRetryInterval:       time.Hour,
+		baseRetryInterval:      time.Minute,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	t.Cleanup(r.work.stop)
+	// 1 asked to come back soon, 2 failed and is on its ladder; 3 never ran.
+	r.scheduleNext(1, Settled().RequeueAfter(time.Second))
+	r.scheduleNext(2, Fail(errors.New("boom")))
+
+	require.NoError(t, r.admitAll(context.Background(), time.Hour))
+
+	one := alarmFor(r.work, 1)
+	require.NotNil(t, one)
+	assert.InDelta(t, time.Second, time.Until(one.fireAt), float64(time.Second), "the controller's own schedule survives")
+	two := alarmFor(r.work, 2)
+	require.NotNil(t, two)
+	assert.Equal(t, alarmBackoff, two.kind, "the failure keeps its ladder")
+	three := alarmFor(r.work, 3)
+	require.NotNil(t, three)
+	assert.InDelta(t, time.Hour/2, time.Until(three.fireAt), float64(time.Second), "an unscheduled id is admitted")
+}
+
+// RequeueAfter(0) means "call me as soon as the floor allows", so it dispatches
+// rather than arming — the individual pass must not turn that into a delay.
+func TestReconcilerIndividualPassYieldsToRequeueAfterZero(t *testing.T) {
+	r := &reconciler{
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	t.Cleanup(r.work.stop)
+
+	r.scheduleNext(1, Settled().RequeueAfter(0))
+
+	assert.Nil(t, alarmFor(r.work, 1), "no alarm: the id is dispatchable now")
+	id, ok := r.work.get()
+	require.True(t, ok)
+	assert.Equal(t, ObjectID(1), id)
+}
+
+// A reconciler with a store and no work queue is the shape log()'s guard exists
+// for. Listing for it enqueues nothing rather than panicking.
+func TestReconcilerEnqueueWithoutAWorkQueue(t *testing.T) {
+	r := &reconciler{gk: GroupKind{Kind: "Widget"}, store: &allIDsStore{ids: []ObjectID{1}}}
+
+	assert.NotPanics(t, func() { r.enqueueAll(context.Background()) })
+	assert.NotPanics(t, func() {
+		require.NoError(t, r.admitAll(context.Background(), time.Hour))
+	})
 }

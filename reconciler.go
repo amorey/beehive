@@ -184,15 +184,20 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 // reconciler drives the reconcile loop for a single registered controller.
 // It owns the work queue, exponential backoff, and the periodic pass timers.
 type reconciler struct {
-	gk                GroupKind
-	adapter           controllerAdapter
-	store             Store
-	work              *workQueue
-	owedPassInterval  time.Duration
-	fullPassInterval  time.Duration
-	maxRetryInterval  time.Duration
-	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
-	concurrency       int           // worker goroutines; 0/1 = single-threaded
+	gk               GroupKind
+	adapter          controllerAdapter
+	store            Store
+	work             *workQueue
+	owedPassInterval time.Duration
+	fullPassInterval time.Duration
+	// individualPassInterval re-arms each object's own next pass; 0 disables it.
+	individualPassInterval time.Duration
+	// individualPassRand sources that schedule's jitter; nil means no jitter,
+	// which is what a reconciler built outside Register wants.
+	individualPassRand func() float64
+	maxRetryInterval   time.Duration
+	baseRetryInterval  time.Duration // zero falls back to defaultBaseRetryInterval
+	concurrency        int           // worker goroutines; 0/1 = single-threaded
 	// startupFullPass selects whether run also re-dispatches settled objects at
 	// startup; owed work is drained regardless.
 	startupFullPass bool
@@ -250,6 +255,79 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 	r.enqueueFrom(ctx, "all", r.store.Objects().ListIDs)
 }
 
+// scheduleNext arms the pass after this one. Every branch schedules something,
+// or the cadence chain breaks. Never called for a collected object.
+func (r *reconciler) scheduleNext(id ObjectID, result ReconcileResult) {
+	switch {
+	case !result.succeeded():
+		if errors.Is(result.err, ErrInvalidResult) {
+			r.log().Error("controller returned an unusable result", "id", id, "err", result.err)
+		}
+		delay := r.backoffNext(id)
+		r.work.addAfter(id, delay, alarmBackoff)
+		r.log().Debug("requeued after failure", "id", id, "backoff", delay)
+	case result.requeueSet && result.requeueAfter > 0:
+		r.backoffClear(id)
+		r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
+		r.log().Debug("requeued", "id", id, "after", result.requeueAfter)
+	case result.requeueSet:
+		// RequeueAfter(0): the queue's per-object floor paces it.
+		r.backoffClear(id)
+		r.work.add(id)
+		r.log().Debug("requeued", "id", id, "after", 0)
+	case result.unsettled():
+		r.backoffClear(id)
+		after := r.unsettledRequeue()
+		r.work.addAfter(id, after, alarmRequeueAfter)
+		r.log().Debug("requeued unsettled", "id", id, "after", after)
+	default:
+		r.backoffClear(id)
+		if d := r.individualPassInterval; d > 0 {
+			after := d + r.spread(d, individualPassJitterFrac)
+			r.work.addAfter(id, after, alarmRequeueAfter)
+			r.log().Debug("requeued for the individual pass", "id", id, "after", after)
+		}
+	}
+}
+
+// spread returns a random part of frac of d, for staggering an arming. Zero
+// without a source, which makes every schedule exact.
+func (r *reconciler) spread(d time.Duration, frac float64) time.Duration {
+	if r.individualPassRand == nil {
+		return 0
+	}
+	return time.Duration(r.individualPassRand() * frac * float64(d))
+}
+
+// admitAll arms every object of the kind, spreading the armings across one
+// interval. A per-object alarm is armed by a pass, so an object no pass reaches
+// — settled by a previous process, owing nothing — needs this to enter the
+// cadence at all. Runs once per process, not per tick.
+func (r *reconciler) admitAll(ctx context.Context, window time.Duration) error {
+	if r.store == nil {
+		return nil
+	}
+	return r.enqueueSpread(ctx, r.store.Objects().ListIDs, window)
+}
+
+// admit runs the admission scan, retrying until it succeeds or ctx ends. With
+// no periodic tick behind it, one failed listing would otherwise leave the kind
+// polling nothing for the life of the process.
+func (r *reconciler) admit(ctx context.Context, window time.Duration) {
+	backoff := driver.Backoff{Base: admitRetryBase, Max: admitRetryMax}
+	for {
+		err := r.admitAll(ctx, window)
+		if err == nil {
+			return
+		}
+		r.log().WarnContext(ctx, "failed to admit objects to the individual pass; retrying",
+			"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
+		if !backoff.Wait(ctx) {
+			return
+		}
+	}
+}
+
 // log guards reconcilers built outside Register (e.g. minimal ones in tests).
 func (r *reconciler) log() *slog.Logger {
 	if r.logger == nil {
@@ -263,15 +341,29 @@ func (r *reconciler) log() *slog.Logger {
 // source — which backstop lost its pass matters — and retried on that pass's
 // own next tick.
 func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(context.Context, GroupKind) ([]ObjectID, error)) {
-	ids, err := list(ctx, r.gk)
-	if err != nil {
+	if err := r.enqueueSpread(ctx, list, 0); err != nil {
 		r.log().WarnContext(ctx, "failed to list objects to enqueue; this pass is skipped",
 			"source", source, "group", r.gk.Group, "kind", r.gk.Kind, "err", err)
-		return
+	}
+}
+
+// enqueueSpread enqueues the IDs returned by list, each after a random part of
+// window — zero enqueues them all at once. It hands the listing error back
+// rather than logging it, since a caller with no tick behind it must retry.
+func (r *reconciler) enqueueSpread(ctx context.Context, list func(context.Context, GroupKind) ([]ObjectID, error), window time.Duration) error {
+	if r.work == nil {
+		return nil
+	}
+	ids, err := list(ctx, r.gk)
+	if err != nil {
+		return err
 	}
 	for _, id := range ids {
-		r.enqueue(id)
+		// alarmAdmit yields to a schedule already pending; a zero window
+		// enqueues outright, which is the startup pass and arms nothing.
+		r.work.addAfter(id, r.spread(window, 1), alarmAdmit)
 	}
+	return nil
 }
 
 // backoffNext returns the next retry delay for id and doubles it for next time,
@@ -356,12 +448,21 @@ func (r *reconciler) run(ctx context.Context) {
 	// enables it may depend on it — see
 	// docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md. The work queue
 	// collapses the overlap with the owed pass.
-	if r.startupFullPass {
-		r.enqueueAll(ctx)
-	}
-
+	// One startup listing, whatever asked for it: the startup pass wants every
+	// object dispatched at once, the individual pass wants them spread over one
+	// interval, and a kind that asked for both takes the sooner window.
 	n := max(r.concurrency, 1)
 	var wg sync.WaitGroup
+	switch {
+	case r.individualPassInterval > 0:
+		window := r.individualPassInterval
+		if r.startupFullPass {
+			window = 0
+		}
+		wg.Go(func() { r.admit(ctx, window) })
+	case r.startupFullPass:
+		r.enqueueAll(ctx)
+	}
 	for range n {
 		wg.Go(func() {
 			r.runWorker(ctx)
@@ -436,37 +537,14 @@ func (r *reconciler) runWorker(ctx context.Context) {
 				result, gone := r.adapter.reconcile(ctx, id)
 				// done releases the processing hold so a re-add that arrived
 				// mid-reconcile becomes dispatchable; a collected row has nothing
-				// left to dispatch, so drop what is queued for it instead.
+				// left to dispatch, so drop what is queued for it instead — and
+				// schedule nothing, or the next alarm resurrects the id.
 				if gone {
 					r.work.forget(id)
-				} else {
-					r.work.done(id)
+					continue
 				}
-				switch {
-				case !result.succeeded():
-					if errors.Is(result.err, ErrInvalidResult) {
-						r.logger.Error("controller returned an unusable result", "id", id, "err", result.err)
-					}
-					delay := r.backoffNext(id)
-					r.work.addAfter(id, delay, alarmBackoff)
-					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
-				case result.requeueSet && result.requeueAfter > 0:
-					r.backoffClear(id)
-					r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
-					r.logger.Debug("requeued", "id", id, "after", result.requeueAfter)
-				case result.requeueSet:
-					// RequeueAfter(0): the queue's per-object floor paces it.
-					r.backoffClear(id)
-					r.work.add(id)
-					r.logger.Debug("requeued", "id", id, "after", 0)
-				case result.unsettled():
-					r.backoffClear(id)
-					after := r.unsettledRequeue()
-					r.work.addAfter(id, after, alarmRequeueAfter)
-					r.logger.Debug("requeued unsettled", "id", id, "after", after)
-				default:
-					r.backoffClear(id)
-				}
+				r.work.done(id)
+				r.scheduleNext(id, result)
 			}
 		}
 	}

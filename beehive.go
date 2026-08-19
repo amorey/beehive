@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -36,8 +37,21 @@ const (
 	// in-process state may depend on the startup one. See
 	// docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md.
 	defaultFullPassInterval time.Duration = 0
-	defaultStartupFullPass                = false
-	defaultGCInterval                     = 30 * time.Second
+
+	// defaultIndividualPassInterval is off: a kind opts in to a per-object
+	// cadence, as it does to a full pass.
+	defaultIndividualPassInterval time.Duration = 0
+
+	// individualPassJitterFrac is the fraction of the interval added to each
+	// arming. Not configurable: no caller wants a synchronized herd.
+	individualPassJitterFrac = 0.1
+
+	// admitRetryBase and admitRetryMax pace a retried admission scan: its own
+	// ladder, not one of the public cadences.
+	admitRetryBase         = 100 * time.Millisecond
+	admitRetryMax          = 30 * time.Second
+	defaultStartupFullPass = false
+	defaultGCInterval      = 30 * time.Second
 	// The default resume window: how long a subscriber may be disconnected and
 	// still resume without a full resync. A day covers a restart, a deploy, and a
 	// night of maintenance.
@@ -111,6 +125,7 @@ type Beehive struct {
 	owedPassInterval        time.Duration
 	minRequeueInterval      time.Duration
 	fullPassInterval        time.Duration
+	individualPassInterval  time.Duration
 	gcInterval              time.Duration
 	wakeScanMinInterval     time.Duration
 	wakePersistInterval     time.Duration
@@ -417,6 +432,7 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		startupFullPass:         defaultStartupFullPass,
 		owedPassInterval:        defaultOwedPassInterval,
 		fullPassInterval:        defaultFullPassInterval,
+		individualPassInterval:  defaultIndividualPassInterval,
 		gcInterval:              defaultGCInterval,
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeScanMinInterval:     defaultWakeScanMinInterval,
@@ -455,17 +471,19 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 	}
 
 	r := &reconciler{
-		gk:               gk,
-		store:            bh.store,
-		work:             newWorkQueue(),
-		owedPassInterval: bh.owedPassInterval,
-		fullPassInterval: bh.fullPassInterval,
-		maxRetryInterval: defaultMaxRetryInterval,
-		concurrency:      bh.concurrency,
-		startupFullPass:  bh.startupFullPass,
-		backoffFor:       make(map[ObjectID]time.Duration),
-		logger:           bh.logger,
-		logLevel:         bh.logLevel,
+		gk:                     gk,
+		store:                  bh.store,
+		work:                   newWorkQueue(),
+		owedPassInterval:       bh.owedPassInterval,
+		fullPassInterval:       bh.fullPassInterval,
+		individualPassInterval: bh.individualPassInterval,
+		individualPassRand:     rand.Float64,
+		maxRetryInterval:       defaultMaxRetryInterval,
+		concurrency:            bh.concurrency,
+		startupFullPass:        bh.startupFullPass,
+		backoffFor:             make(map[ObjectID]time.Duration),
+		logger:                 bh.logger,
+		logLevel:               bh.logLevel,
 	}
 	r.work.setFloor(bh.minRequeueInterval) // withMinRequeueInterval may override below
 
