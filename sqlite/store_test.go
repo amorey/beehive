@@ -20,9 +20,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"math"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -8549,6 +8556,55 @@ func TestObservedGenerationIsMonotonic(t *testing.T) {
 	got, err = s.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	assert.Equal(t, int64(4), *got.ObservedGeneration, "clamped, never rolled back")
+}
+
+// A pass compares a status write against the bytes it was loaded with, which is
+// sound only while nothing else can move the column under it. "No statement
+// writes it" is a claim over an open set, so this asserts the structure that
+// makes it true.
+//
+// It scans SQL text rather than the Go AST — the column is named inside string
+// literals, which a call walk cannot see. What it therefore cannot catch: a
+// statement assembled by concatenation, and an INSERT ... SELECT that names no
+// column list. See docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md.
+func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
+	// Word-bounded, so schema_version_status is not mistaken for the column.
+	status := regexp.MustCompile(`\bstatus\b`)
+	writesObjects := regexp.MustCompile(`(?is)(INSERT\s+INTO\s+objects|UPDATE\s+objects)`)
+
+	var sites []string
+	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		var fn string
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				fn = node.Name.Name
+			case *ast.BasicLit:
+				if node.Kind != token.STRING {
+					return true
+				}
+				sql := node.Value
+				if writesObjects.MatchString(sql) && status.MatchString(sql) {
+					sites = append(sites, fn)
+				}
+			}
+			return true
+		})
+		return nil
+	}))
+
+	assert.ElementsMatch(t, []string{"objectsCreate", "UpdateStatus"}, sites,
+		"objects.status is written by the create (as NULL) and UpdateStatus, and nowhere else")
 }
 
 // The changed report is what the layer above gates its wake on, so it tracks the
