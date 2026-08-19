@@ -97,16 +97,34 @@ func (s *tickOnlyReconcileOwedStore) listIDs(context.Context, GroupKind) ([]Obje
 type allIDsStore struct {
 	fakeStore
 	ids []ObjectID
+	// failures fails that many ListIDs calls before serving ids, for a listing
+	// whose only recovery is its own retry.
+	failures int
+
+	mu    sync.Mutex
+	calls int
 }
 
 func (s *allIDsStore) Objects() storeapi.Objects {
 	return objectsOverride{Objects: s.fakeStore.Objects(), listUnsettledIDs: s.listUnsettledIDsObjects, listIDs: s.listIDsObjects}
 }
 
+func (s *allIDsStore) listCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
 func (s *allIDsStore) listUnsettledIDsObjects(_ context.Context, _ GroupKind) ([]ObjectID, error) {
 	return nil, nil
 }
 func (s *allIDsStore) listIDsObjects(_ context.Context, _ GroupKind) ([]ObjectID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls <= s.failures {
+		return nil, errors.New("list failed")
+	}
 	return s.ids, nil
 }
 
@@ -4002,22 +4020,39 @@ func TestReconcilerNoIndividualPassArmsNothing(t *testing.T) {
 	adapter := &fakeAdapter{reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult { return Settled() }}
 	r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
 
-	r.scheduleNext(1, Settled(), false)
+	r.scheduleNext(1, Settled())
 
 	assert.Nil(t, r.work.gauge.alarmFor(1))
 }
 
 // A collected object comes back Settled, which is the branch that arms. Arming
 // it would resurrect an id forget just dropped, into a dispatch that can only
-// read ErrNotFound.
+// read ErrNotFound. Id 2 is the barrier: one worker dispatches in order, so 1's
+// pass is over by the time 2's runs.
 func TestReconcilerIndividualPassArmsNothingForACollectedObject(t *testing.T) {
+	reached2 := make(chan struct{})
+	adapter := &fakeAdapter{gone: true}
 	r := &reconciler{
+		adapter:                adapter,
 		work:                   newWorkQueue(),
 		individualPassInterval: time.Minute,
 		backoffFor:             make(map[ObjectID]time.Duration),
 	}
+	adapter.reconcileFn = func(_ context.Context, id ObjectID) ReconcileResult {
+		if id == 2 {
+			close(reached2)
+		}
+		return Settled()
+	}
 
-	r.scheduleNext(1, Settled(), true)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(1)
+	r.enqueue(2)
+	waitClosed(t, reached2, "the barrier object reconciled")
+	cancel()
+	waitClosed(t, done, "run to exit")
 
 	assert.Nil(t, r.work.gauge.alarmFor(1))
 }
@@ -4051,7 +4086,7 @@ func TestReconcilerIndividualPassYieldsToTheResult(t *testing.T) {
 				backoffFor:             make(map[ObjectID]time.Duration),
 			}
 
-			r.scheduleNext(1, tc.result, false)
+			r.scheduleNext(1, tc.result)
 
 			a := r.work.gauge.alarmFor(1)
 			require.NotNil(t, a)
@@ -4077,52 +4112,14 @@ func TestReconcilerIndividualPassJitters(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &reconciler{individualPassInterval: d}
-			require.NoError(t, withIndividualPassRand(func() float64 { return tc.frac })(r))
+			r := &reconciler{
+				individualPassInterval: d,
+				individualPassRand:     func() float64 { return tc.frac },
+			}
 
-			assert.Equal(t, tc.want, r.jittered(d))
+			assert.Equal(t, tc.want, d+r.spread(d, individualPassJitterFrac))
 		})
 	}
-}
-
-// The seam is set at New, since newTestBeehive passes its options there.
-func TestWithIndividualPassRandDispatch(t *testing.T) {
-	bh := &Beehive{}
-	require.NoError(t, withIndividualPassRand(func() float64 { return 0.25 })(bh))
-	require.NotNil(t, bh.individualPassRand)
-	assert.InDelta(t, 0.25, bh.individualPassRand(), 0)
-
-	require.NoError(t, withIndividualPassRand(func() float64 { return 0 })("unrelated"))
-}
-
-// listIDsStore serves a fixed set of ids from Objects().ListIDs, failing the
-// first failures calls, and counts the calls that reached it.
-type listIDsStore struct {
-	fakeStore
-	ids      []ObjectID
-	mu       sync.Mutex
-	calls    int
-	failures int
-}
-
-func (s *listIDsStore) Objects() storeapi.Objects {
-	return objectsOverride{Objects: s.fakeStore.Objects(), listIDs: s.listIDs}
-}
-
-func (s *listIDsStore) listIDs(context.Context, GroupKind) ([]ObjectID, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.calls++
-	if s.calls <= s.failures {
-		return nil, errors.New("list failed")
-	}
-	return s.ids, nil
-}
-
-func (s *listIDsStore) listCalls() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls
 }
 
 // The case the option exists for: objects settled by a previous process, owing
@@ -4139,7 +4136,7 @@ func TestReconcilerIndividualPassAdmitsColdObjects(t *testing.T) {
 	r := &reconciler{
 		gk:                     GroupKind{Kind: "Widget"},
 		adapter:                adapter,
-		store:                  &listIDsStore{ids: []ObjectID{1, 2, 3}},
+		store:                  &allIDsStore{ids: []ObjectID{1, 2, 3}},
 		work:                   newWorkQueue(),
 		individualPassInterval: time.Hour,
 		individualPassRand:     func() float64 { return 0 }, // no offset, so the scan dispatches at once
@@ -4171,14 +4168,14 @@ func TestReconcilerIndividualPassAdmissionSpreads(t *testing.T) {
 	r := &reconciler{
 		gk:                     GroupKind{Kind: "Widget"},
 		adapter:                &fakeAdapter{reconcileFn: func(context.Context, ObjectID) ReconcileResult { return Settled() }},
-		store:                  &listIDsStore{ids: []ObjectID{1, 2, 3}},
+		store:                  &allIDsStore{ids: []ObjectID{1, 2, 3}},
 		work:                   newWorkQueue(),
 		individualPassInterval: time.Hour,
 		individualPassRand:     func() float64 { f := fracs[n]; n++; return f },
 		backoffFor:             make(map[ObjectID]time.Duration),
 	}
 
-	require.NoError(t, r.admitAll(context.Background()))
+	require.NoError(t, r.admitAll(context.Background(), time.Hour))
 
 	// Id 1 drew 0 and is due now; the rest are spread over the interval.
 	assert.Nil(t, r.work.gauge.alarmFor(1), "a zero offset dispatches rather than arming")
@@ -4189,8 +4186,7 @@ func TestReconcilerIndividualPassAdmissionSpreads(t *testing.T) {
 	}
 }
 
-// With no periodic tick behind it, a failed scan that was not retried would
-// leave the kind polling nothing for the life of the process.
+// The scan's only recovery is its own retry.
 func TestReconcilerIndividualPassAdmissionRetries(t *testing.T) {
 	seen := make(chan ObjectID, 1)
 	adapter := &fakeAdapter{
@@ -4199,7 +4195,7 @@ func TestReconcilerIndividualPassAdmissionRetries(t *testing.T) {
 			return Settled()
 		},
 	}
-	store := &listIDsStore{ids: []ObjectID{7}, failures: 2}
+	store := &allIDsStore{ids: []ObjectID{7}, failures: 2}
 
 	r := &reconciler{
 		gk:                     GroupKind{Kind: "Widget"},
@@ -4235,7 +4231,7 @@ func TestReconcilerIndividualPassSubsumesTheStartupPass(t *testing.T) {
 			return Settled()
 		},
 	}
-	store := &listIDsStore{ids: []ObjectID{1, 2}}
+	store := &allIDsStore{ids: []ObjectID{1, 2}}
 
 	r := &reconciler{
 		gk:                     GroupKind{Kind: "Widget"},

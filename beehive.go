@@ -46,9 +46,8 @@ const (
 	// arming. Not configurable: no caller wants a synchronized herd.
 	individualPassJitterFrac = 0.1
 
-	// admitRetryBase and admitRetryMax pace a retried admission scan. Its own
-	// ladder, not one of the public cadences: with no periodic tick behind it, a
-	// scan that failed and was not retried leaves the kind polling nothing.
+	// admitRetryBase and admitRetryMax pace a retried admission scan: its own
+	// ladder, not one of the public cadences.
 	admitRetryBase         = 100 * time.Millisecond
 	admitRetryMax          = 30 * time.Second
 	defaultStartupFullPass = false
@@ -146,9 +145,6 @@ type Beehive struct {
 	// startupFullPass is the default copied into each reconciler; off unless
 	// asked for (see WithStartupFullPass).
 	startupFullPass bool
-	// individualPassRand sources the jitter on an individual pass's schedule;
-	// seeded by New, replaced only by a test.
-	individualPassRand func() float64
 	// logger/logLevel stay raw until Start resolves them (nil logger = disabled);
 	// each reconciler inherits them as its default.
 	logger   *slog.Logger
@@ -437,7 +433,6 @@ func New(s Store, opts ...Option) (*Beehive, error) {
 		owedPassInterval:        defaultOwedPassInterval,
 		fullPassInterval:        defaultFullPassInterval,
 		individualPassInterval:  defaultIndividualPassInterval,
-		individualPassRand:      rand.Float64,
 		gcInterval:              defaultGCInterval,
 		writeLogRetentionMaxAge: defaultWriteLogMaxAge,
 		wakeScanMinInterval:     defaultWakeScanMinInterval,
@@ -482,7 +477,7 @@ func Register[Spec, Status any](bh *Beehive, gk GroupKind, c Controller[Spec, St
 		owedPassInterval:       bh.owedPassInterval,
 		fullPassInterval:       bh.fullPassInterval,
 		individualPassInterval: bh.individualPassInterval,
-		individualPassRand:     bh.individualPassRand,
+		individualPassRand:     rand.Float64,
 		maxRetryInterval:       defaultMaxRetryInterval,
 		concurrency:            bh.concurrency,
 		startupFullPass:        bh.startupFullPass,

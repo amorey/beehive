@@ -192,7 +192,7 @@ type reconciler struct {
 	fullPassInterval time.Duration
 	// individualPassInterval re-arms each object's own next pass; 0 disables it.
 	individualPassInterval time.Duration
-	// individualPassRand sources that schedule's jitter. Nil means no jitter,
+	// individualPassRand sources that schedule's jitter; nil means no jitter,
 	// which is what a reconciler built outside Register wants.
 	individualPassRand func() float64
 	maxRetryInterval   time.Duration
@@ -256,10 +256,8 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 }
 
 // scheduleNext arms the pass after this one. Every branch schedules something,
-// or the cadence chain breaks: a failure keeps its ladder, a controller's own
-// RequeueAfter wins over the individual pass, and a settled pass that asked for
-// nothing falls back to that pass when the kind configured one.
-func (r *reconciler) scheduleNext(id ObjectID, result ReconcileResult, gone bool) {
+// or the cadence chain breaks. Never called for a collected object.
+func (r *reconciler) scheduleNext(id ObjectID, result ReconcileResult) {
 	switch {
 	case !result.succeeded():
 		if errors.Is(result.err, ErrInvalidResult) {
@@ -284,58 +282,41 @@ func (r *reconciler) scheduleNext(id ObjectID, result ReconcileResult, gone bool
 		r.log().Debug("requeued unsettled", "id", id, "after", after)
 	default:
 		r.backoffClear(id)
-		// A collected object stays collected: forget just dropped its queue
-		// state, and an alarm here dispatches into ErrNotFound forever.
-		if d := r.individualPassInterval; d > 0 && !gone {
-			r.work.addAfter(id, r.jittered(d), alarmRequeueAfter)
-			r.log().Debug("requeued for the individual pass", "id", id, "after", d)
+		if d := r.individualPassInterval; d > 0 {
+			after := d + r.spread(d, individualPassJitterFrac)
+			r.work.addAfter(id, after, alarmRequeueAfter)
+			r.log().Debug("requeued for the individual pass", "id", id, "after", after)
 		}
 	}
 }
 
-// jittered spreads an arming by up to individualPassJitterFrac of d, so two
-// objects that settled together do not stay together. Never shortens d.
-func (r *reconciler) jittered(d time.Duration) time.Duration {
-	return d + time.Duration(r.randFrac()*individualPassJitterFrac*float64(d))
-}
-
-// randFrac returns the next jitter fraction, in [0,1). Zero without a source,
-// which makes every schedule exact — what a reconciler built outside Register
-// wants.
-func (r *reconciler) randFrac() float64 {
+// spread returns a random part of frac of d, for staggering an arming. Zero
+// without a source, which makes every schedule exact.
+func (r *reconciler) spread(d time.Duration, frac float64) time.Duration {
 	if r.individualPassRand == nil {
 		return 0
 	}
-	return r.individualPassRand()
+	return time.Duration(r.individualPassRand() * frac * float64(d))
 }
 
 // admitAll arms every object of the kind, spreading the armings across one
 // interval. A per-object alarm is armed by a pass, so an object no pass reaches
 // — settled by a previous process, owing nothing — needs this to enter the
 // cadence at all. Runs once per process, not per tick.
-func (r *reconciler) admitAll(ctx context.Context) error {
+func (r *reconciler) admitAll(ctx context.Context, window time.Duration) error {
 	if r.store == nil {
 		return nil
 	}
-	ids, err := r.store.Objects().ListIDs(ctx, r.gk)
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		r.work.addAfter(id, r.admitOffset(), alarmRequeueAfter)
-	}
-	r.log().InfoContext(ctx, "admitted objects to the individual pass",
-		"group", r.gk.Group, "kind", r.gk.Kind, "count", len(ids), "interval", r.individualPassInterval)
-	return nil
+	return r.enqueueSpread(ctx, r.store.Objects().ListIDs, window)
 }
 
-// admit runs the admission scan, retrying until it succeeds or ctx ends. The
-// retry is not optional: with no periodic tick behind it, one failed listing
-// would leave the kind polling nothing for the life of the process.
-func (r *reconciler) admit(ctx context.Context) {
+// admit runs the admission scan, retrying until it succeeds or ctx ends. With
+// no periodic tick behind it, one failed listing would otherwise leave the kind
+// polling nothing for the life of the process.
+func (r *reconciler) admit(ctx context.Context, window time.Duration) {
 	backoff := driver.Backoff{Base: admitRetryBase, Max: admitRetryMax}
 	for {
-		err := r.admitAll(ctx)
+		err := r.admitAll(ctx, window)
 		if err == nil {
 			return
 		}
@@ -345,17 +326,6 @@ func (r *reconciler) admit(ctx context.Context) {
 			return
 		}
 	}
-}
-
-// admitOffset spreads one admission across the whole interval, unlike the
-// arming jitter's tenth: what it prevents is a restart dispatching the kind at
-// once. A kind that asked for the startup pass wants its first pass promptly
-// instead, and takes no offset.
-func (r *reconciler) admitOffset() time.Duration {
-	if r.startupFullPass {
-		return 0
-	}
-	return time.Duration(r.randFrac() * float64(r.individualPassInterval))
 }
 
 // log guards reconcilers built outside Register (e.g. minimal ones in tests).
@@ -371,15 +341,24 @@ func (r *reconciler) log() *slog.Logger {
 // source — which backstop lost its pass matters — and retried on that pass's
 // own next tick.
 func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(context.Context, GroupKind) ([]ObjectID, error)) {
-	ids, err := list(ctx, r.gk)
-	if err != nil {
+	if err := r.enqueueSpread(ctx, list, 0); err != nil {
 		r.log().WarnContext(ctx, "failed to list objects to enqueue; this pass is skipped",
 			"source", source, "group", r.gk.Group, "kind", r.gk.Kind, "err", err)
-		return
+	}
+}
+
+// enqueueSpread enqueues the IDs returned by list, each after a random part of
+// window — zero enqueues them all at once. It hands the listing error back
+// rather than logging it, since a caller with no tick behind it must retry.
+func (r *reconciler) enqueueSpread(ctx context.Context, list func(context.Context, GroupKind) ([]ObjectID, error), window time.Duration) error {
+	ids, err := list(ctx, r.gk)
+	if err != nil {
+		return err
 	}
 	for _, id := range ids {
-		r.enqueue(id)
+		r.work.addAfter(id, r.spread(window, 1), alarmRequeueAfter)
 	}
+	return nil
 }
 
 // backoffNext returns the next retry delay for id and doubles it for next time,
@@ -464,17 +443,20 @@ func (r *reconciler) run(ctx context.Context) {
 	// enables it may depend on it — see
 	// docs/adr/2026-08-07-the-startup-pass-may-be-depended-on.md. The work queue
 	// collapses the overlap with the owed pass.
-	// The admission scan lists the same kind for the same reason, so with the
-	// individual pass on it is the startup pass — at a zero offset, and with the
-	// retry ladder enqueueAll does not have.
-	if r.startupFullPass && r.individualPassInterval <= 0 {
-		r.enqueueAll(ctx)
-	}
-
+	// One startup listing, whatever asked for it: the startup pass wants every
+	// object dispatched at once, the individual pass wants them spread over one
+	// interval, and a kind that asked for both takes the sooner window.
 	n := max(r.concurrency, 1)
 	var wg sync.WaitGroup
-	if r.individualPassInterval > 0 {
-		wg.Go(func() { r.admit(ctx) })
+	switch {
+	case r.individualPassInterval > 0:
+		window := r.individualPassInterval
+		if r.startupFullPass {
+			window = 0
+		}
+		wg.Go(func() { r.admit(ctx, window) })
+	case r.startupFullPass:
+		r.enqueueAll(ctx)
 	}
 	for range n {
 		wg.Go(func() {
@@ -550,13 +532,14 @@ func (r *reconciler) runWorker(ctx context.Context) {
 				result, gone := r.adapter.reconcile(ctx, id)
 				// done releases the processing hold so a re-add that arrived
 				// mid-reconcile becomes dispatchable; a collected row has nothing
-				// left to dispatch, so drop what is queued for it instead.
+				// left to dispatch, so drop what is queued for it instead — and
+				// schedule nothing, or the next alarm resurrects the id.
 				if gone {
 					r.work.forget(id)
-				} else {
-					r.work.done(id)
+					continue
 				}
-				r.scheduleNext(id, result, gone)
+				r.work.done(id)
+				r.scheduleNext(id, result)
 			}
 		}
 	}

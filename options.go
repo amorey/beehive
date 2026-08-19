@@ -293,24 +293,12 @@ func WithFullPassInterval(d time.Duration) Option {
 // every d, measured from the end of each object's own last pass. Default 0
 // (disabled).
 //
-// Use it for a kind that must re-poll something the store cannot see — a remote
-// dialled by the reconcile, a probe with no notifier behind it. Unlike a
-// RequeueAfter the controller has to re-declare on every return path, this is
-// declared once and cannot be dropped by a branch that forgot it; unlike
-// WithFullPassInterval it costs no listing per tick and dispatches no
-// whole-kind burst.
-//
-// What it schedules: a pass that returns settled without asking to be requeued.
-// A pass that returns RequeueAfter sets its own schedule and is not clamped, a
-// failed pass keeps its backoff ladder, and an unsettled one keeps the owed
-// pass's cadence. So d is a default cadence, not a ceiling.
-//
-// Each arming carries jitter, so the interval is a floor plus up to a tenth: a
-// pass never fires early, and objects that settled together drift apart. At
-// startup the spread is the whole interval — an object's first pass after a
-// restart lands within d, which is what keeps a restart from dispatching the
-// whole kind at once. Pair it with WithStartupFullPass for a kind that needs
-// that first pass promptly instead.
+// It schedules a pass that returned settled without asking to be requeued;
+// every other result keeps its own schedule, so d is a default cadence rather
+// than a ceiling. Armings are jittered upward, and a scan at startup spreads
+// the first pass of each object across d — pair it with WithStartupFullPass for
+// a kind that needs that first pass promptly.
+// See docs/adr/2026-08-19-an-individual-pass-interval.md.
 //
 // Passed to New it sets the default for all controllers; passed to Register it
 // overrides that default for one.
@@ -321,22 +309,6 @@ func WithIndividualPassInterval(d time.Duration) Option {
 			t.individualPassInterval = d
 		case *reconciler:
 			t.individualPassInterval = d
-		}
-		return nil
-	}
-}
-
-// withIndividualPassRand replaces the source of the jitter fraction, which
-// returns a value in [0,1). Unexported: a test passes a constant or a counter
-// so the schedule is exact, and nothing in production wants a synchronized
-// herd.
-func withIndividualPassRand(f func() float64) Option {
-	return func(target any) error {
-		switch t := target.(type) {
-		case *Beehive:
-			t.individualPassRand = f
-		case *reconciler:
-			t.individualPassRand = f
 		}
 		return nil
 	}
