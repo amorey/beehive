@@ -159,8 +159,9 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, status 
 	if err != nil {
 		return err
 	}
-	return c.wakeAfter(ctx, c.bh.store.Objects().UpdateStatus(
-		ctx, c.gk, c.id, b, migratorStatusVersion(c.bh.migratorFor(c.gk))))
+	_, err = c.bh.store.Objects().UpdateStatus(
+		ctx, c.gk, c.id, b, migratorStatusVersion(c.bh.migratorFor(c.gk)))
+	return c.wakeAfter(ctx, err)
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, condition Condition) error {

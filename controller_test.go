@@ -1123,8 +1123,8 @@ func (s *failUpdateStatusStore) Objects() storeapi.Objects {
 	return objectsOverride{Objects: s.kindTStore.Objects(), updateStatus: s.updateStatus}
 }
 
-func (s *failUpdateStatusStore) updateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) error {
-	return errBoom
+func (s *failUpdateStatusStore) updateStatus(_ context.Context, _ GroupKind, _ ObjectID, _ []byte, _ int) (bool, error) {
+	return false, errBoom
 }
 
 // errStatusMarshaler is a Status type whose JSON marshaling always fails.
