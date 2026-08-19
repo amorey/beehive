@@ -3839,3 +3839,59 @@ func TestClientCreateOrUpdateIgnoresOptsOnUpdate(t *testing.T) {
 	require.Len(t, owned, 1)
 	assert.Equal(t, child.ID, owned[0].ID)
 }
+
+// Inherited from the spec write's refusal: a deleting row still holds its name,
+// so there is nothing to create and nothing that may be written.
+func TestClientCreateOrUpdateRefusesADeletingRow(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	orig := mustCreate(t, ctx, client, "w1", cSpec{Val: "a"}, WithFinalizers("test/hold"))
+	require.NoError(t, client.Delete(ctx, orig.ID))
+
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "b"})
+	require.ErrorIs(t, err, ErrDeletionPending)
+	assert.Nil(t, obj)
+	assert.False(t, created, "the name is held, so nothing was created")
+
+	// The spec is untouched and the row is still the original incarnation.
+	got, err := client.GetByName(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, orig.ID, got.ID)
+	assert.Equal(t, "a", got.Spec.Val)
+}
+
+// The store rejects "" too, so the sentinel alone proves nothing about where
+// the check ran. Refusing the transaction is what pins checkName to the front,
+// which is the point of it: a bad name must not take the write lock.
+func TestClientCreateOrUpdateRejectsAnEmptyNameBeforeTheTransaction(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, &noWithinStore{Store: newClientTestStore(t)})
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.CreateOrUpdate(ctx, "", cSpec{Val: "a"})
+	require.ErrorIs(t, err, ErrInvalidName)
+	assert.False(t, created)
+}
+
+// The resolve is kind-scoped, so another kind holding the name is not found and
+// this creates its own row under the same name.
+func TestClientCreateOrUpdateIsKindScoped(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	other := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Other"})
+	theirs := mustCreate(t, ctx, other, "shared", cSpec{Val: "theirs"})
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mine, created, err := client.CreateOrUpdate(ctx, "shared", cSpec{Val: "mine"})
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.NotEqual(t, theirs.ID, mine.ID)
+
+	untouched, err := other.GetByName(ctx, "shared")
+	require.NoError(t, err)
+	assert.Equal(t, "theirs", untouched.Spec.Val)
+}
