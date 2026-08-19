@@ -14,7 +14,10 @@
 
 package beehive
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // trigger is one feed declared by WithTriggerByID or WithTriggerByName: a
 // channel of addresses the app resolves within the kind and requeues. Exactly
@@ -54,10 +57,19 @@ func (t *trigger) run(ctx context.Context) {
 	}
 }
 
-// poke resolves a within the kind and queues what it found.
+// poke resolves a within the kind and queues what it found. An address that
+// resolves to nothing is the app's business; a failed read is dropped rather
+// than retried, since the kind's own cadence is what a poke is a hint against.
 func (t *trigger) poke(ctx context.Context, a addr) {
 	obj, err := t.resolve(ctx, a)
+	if errors.Is(err, ErrNotFound) {
+		t.r.log().DebugContext(ctx, "trigger address matched no object; skipping",
+			"id", a.id, "name", a.name)
+		return
+	}
 	if err != nil {
+		t.r.log().WarnContext(ctx, "trigger failed to resolve an address; this poke is dropped",
+			"id", a.id, "name", a.name, "err", err)
 		return
 	}
 	t.r.requeueNow(obj.ID)

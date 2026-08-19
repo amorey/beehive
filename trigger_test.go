@@ -16,6 +16,8 @@ package beehive
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -130,6 +132,53 @@ func TestTriggerByNameRequeuesTheObject(t *testing.T) {
 
 	ch <- "one"
 	assert.Equal(t, obj.ID, waitQueued(t, r.work))
+
+	cancel()
+	waitClosed(t, done, "the trigger loop to return")
+}
+
+// The app owns the subscription, so a closed channel is how it says it is done.
+// Beehive never closes one, and an unhandled close would spin the select.
+func TestTriggerStopsOnAClosedChannel(t *testing.T) {
+	r := newTriggerReconciler(t)
+
+	ch := make(chan ObjectID)
+	done := runTrigger(context.Background(), &trigger{r: r, ids: ch})
+
+	close(ch)
+	waitClosed(t, done, "the trigger loop to return on a closed channel")
+}
+
+// A failed read says so and drops the poke: a retry ladder here would compete
+// with the kind's own cadence, which is the correctness behind every poke.
+func TestTriggerLogsAFailedReadAndKeepsServing(t *testing.T) {
+	r := newTriggerReconciler(t)
+	obj := triggerObject(t, r, "one")
+
+	logger, logs := captureLogger(slog.LevelWarn)
+	r.logger = logger
+
+	fail := true
+	real := r.store
+	r.store = &objectsOverrideStore{Store: real, override: objectsOverride{
+		getMeta: func(ctx context.Context, id ObjectID) (*RawObject, error) {
+			if fail {
+				fail = false
+				return nil, errors.New("boom")
+			}
+			return real.Objects().GetMeta(ctx, id)
+		},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan ObjectID)
+	done := runTrigger(ctx, &trigger{r: r, ids: ch})
+
+	ch <- obj.ID
+	ch <- obj.ID
+	assert.Equal(t, obj.ID, waitQueued(t, r.work), "the loop serves the poke after the failure")
+	assert.Contains(t, logs.String(), "trigger", "a failed read must name itself")
 
 	cancel()
 	waitClosed(t, done, "the trigger loop to return")
