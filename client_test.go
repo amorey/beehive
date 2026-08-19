@@ -3706,3 +3706,20 @@ func TestClientCreateOrUpdateCreates(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, obj.ID, got.ID)
 }
+
+// The difference from GetOrCreate, which returns a found row untouched.
+func TestClientCreateOrUpdateUpdatesExisting(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first, _, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	second, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first.ID, second.ID)
+	assert.Equal(t, "b", second.Spec.Val)
+	assert.Equal(t, first.Generation+1, second.Generation)
+}
