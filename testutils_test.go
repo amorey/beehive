@@ -751,6 +751,10 @@ func (fakeObjects) GetMeta(context.Context, ObjectID) (*RawObject, error) {
 	panic("not implemented: fakeStore.Objects().GetMeta")
 }
 
+func (fakeObjects) GetMetaByName(context.Context, GroupKind, string) (*RawObject, error) {
+	panic("not implemented: fakeStore.Objects().GetMetaByName")
+}
+
 func (fakeObjects) ListByIDs(context.Context, GroupKind, []ObjectID) ([]*RawObject, error) {
 	panic("not implemented: fakeStore.Objects().ListByIDs")
 }
@@ -799,6 +803,7 @@ type objectsOverride struct {
 	get                func(context.Context, ObjectID) (*RawObject, error)
 	getForReconcile    func(context.Context, ObjectID) (storeapi.ReconcileLoad, error)
 	getMeta            func(context.Context, ObjectID) (*RawObject, error)
+	getMetaByName      func(context.Context, GroupKind, string) (*RawObject, error)
 	list               func(context.Context, GroupKind) ([]*RawObject, error)
 	listByIDs          func(context.Context, GroupKind, []ObjectID) ([]*RawObject, error)
 	listByIncomingEdge func(context.Context, GroupKind, ObjectID, Relation) ([]*RawObject, error)
@@ -851,6 +856,13 @@ func (o objectsOverride) GetMeta(ctx context.Context, id ObjectID) (*RawObject, 
 		return o.getMeta(ctx, id)
 	}
 	return o.Objects.GetMeta(ctx, id)
+}
+
+func (o objectsOverride) GetMetaByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error) {
+	if o.getMetaByName != nil {
+		return o.getMetaByName(ctx, gk, name)
+	}
+	return o.Objects.GetMetaByName(ctx, gk, name)
 }
 
 func (o objectsOverride) List(ctx context.Context, gk GroupKind) ([]*RawObject, error) {

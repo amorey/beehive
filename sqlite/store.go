@@ -852,6 +852,12 @@ func (s sqliteObjects) GetMeta(ctx context.Context, id storeapi.ObjectID) (*stor
 	return s.getObjectRow(ctx, id)
 }
 
+// Objects().GetMetaByName is getObjectRowByName across the store boundary: no
+// conditions assembled, for metadata-only callers.
+func (s sqliteObjects) GetMetaByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
+	return s.getObjectRowByName(ctx, gk, name)
+}
+
 // getObjectRowByName is getObjectRow keyed by name within gk. No ErrWrongKind:
 // the kind is in the WHERE.
 func (s *sqliteStore) getObjectRowByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
