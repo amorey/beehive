@@ -4060,3 +4060,37 @@ func TestReconcilerIndividualPassYieldsToTheResult(t *testing.T) {
 		})
 	}
 }
+
+// The jitter only ever lengthens: a pass never fires early, and two objects
+// that settled in the same moment drift apart.
+func TestReconcilerIndividualPassJitters(t *testing.T) {
+	const d = time.Hour
+
+	tests := []struct {
+		name string
+		frac float64
+		want time.Duration
+	}{
+		{"no source is exact", 0, d},
+		{"the top of the range adds a tenth", 1, d + d/10},
+		{"half the range adds a twentieth", 0.5, d + d/20},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &reconciler{individualPassInterval: d}
+			require.NoError(t, withIndividualPassRand(func() float64 { return tc.frac })(r))
+
+			assert.Equal(t, tc.want, r.jittered(d))
+		})
+	}
+}
+
+// The seam is set at New, since newTestBeehive passes its options there.
+func TestWithIndividualPassRandDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, withIndividualPassRand(func() float64 { return 0.25 })(bh))
+	require.NotNil(t, bh.individualPassRand)
+	assert.InDelta(t, 0.25, bh.individualPassRand(), 0)
+
+	require.NoError(t, withIndividualPassRand(func() float64 { return 0 })("unrelated"))
+}

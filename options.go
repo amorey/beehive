@@ -326,6 +326,22 @@ func WithIndividualPassInterval(d time.Duration) Option {
 	}
 }
 
+// withIndividualPassRand replaces the source of the jitter fraction, which
+// returns a value in [0,1). Unexported: a test passes a constant or a counter
+// so the schedule is exact, and nothing in production wants a synchronized
+// herd.
+func withIndividualPassRand(f func() float64) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.individualPassRand = f
+		case *reconciler:
+			t.individualPassRand = f
+		}
+		return nil
+	}
+}
+
 // WithGCInterval sets how often the global GC sweeper runs: collecting
 // deletion-pending objects of every kind, applying event-log retention, and
 // releasing freed space. Meaningful only at New.
