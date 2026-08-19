@@ -3965,3 +3965,44 @@ func TestReconcileWritesTheWatermarkBeforeTheStamp(t *testing.T) {
 
 	assert.Equal(t, []string{"watermark", "stamp"}, order)
 }
+
+// The point of the option: a return path that declares nothing still comes
+// back. Each pass arms the next, so N passes follow one enqueue.
+func TestReconcilerIndividualPassRearmsASettledObject(t *testing.T) {
+	calls := 0
+	doneCh := make(chan struct{})
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult {
+			calls++
+			if calls == 3 {
+				close(doneCh)
+			}
+			return Settled()
+		},
+	}
+
+	r := &reconciler{
+		adapter:                adapter,
+		work:                   newWorkQueue(),
+		individualPassInterval: 5 * time.Millisecond,
+		maxRetryInterval:       time.Second,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	r.enqueue(1)
+	waitClosed(t, doneCh, "third reconcile from the individual pass")
+	cancel()
+	waitClosed(t, done, "run to exit")
+}
+
+// Off by default: a settled pass with the option unset arms nothing.
+func TestReconcilerNoIndividualPassArmsNothing(t *testing.T) {
+	adapter := &fakeAdapter{reconcileFn: func(_ context.Context, _ ObjectID) ReconcileResult { return Settled() }}
+	r := &reconciler{adapter: adapter, work: newWorkQueue(), backoffFor: make(map[ObjectID]time.Duration)}
+
+	r.scheduleNext(1, Settled(), false)
+
+	assert.Nil(t, r.work.gauge.alarmFor(1))
+}

@@ -255,6 +255,58 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 	r.enqueueFrom(ctx, "all", r.store.Objects().ListIDs)
 }
 
+// scheduleNext arms the pass after this one. Every branch schedules something,
+// or the cadence chain breaks: a failure keeps its ladder, a controller's own
+// RequeueAfter wins over the individual pass, and a settled pass that asked for
+// nothing falls back to that pass when the kind configured one.
+func (r *reconciler) scheduleNext(id ObjectID, result ReconcileResult, gone bool) {
+	switch {
+	case !result.succeeded():
+		if errors.Is(result.err, ErrInvalidResult) {
+			r.log().Error("controller returned an unusable result", "id", id, "err", result.err)
+		}
+		delay := r.backoffNext(id)
+		r.work.addAfter(id, delay, alarmBackoff)
+		r.log().Debug("requeued after failure", "id", id, "backoff", delay)
+	case result.requeueSet && result.requeueAfter > 0:
+		r.backoffClear(id)
+		r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
+		r.log().Debug("requeued", "id", id, "after", result.requeueAfter)
+	case result.requeueSet:
+		// RequeueAfter(0): the queue's per-object floor paces it.
+		r.backoffClear(id)
+		r.work.add(id)
+		r.log().Debug("requeued", "id", id, "after", 0)
+	case result.unsettled():
+		r.backoffClear(id)
+		after := r.unsettledRequeue()
+		r.work.addAfter(id, after, alarmRequeueAfter)
+		r.log().Debug("requeued unsettled", "id", id, "after", after)
+	default:
+		r.backoffClear(id)
+		if d := r.individualPassInterval; d > 0 {
+			r.work.addAfter(id, r.jittered(d), alarmRequeueAfter)
+			r.log().Debug("requeued for the individual pass", "id", id, "after", d)
+		}
+	}
+}
+
+// jittered spreads an arming by up to individualPassJitterFrac of d, so two
+// objects that settled together do not stay together. Never shortens d.
+func (r *reconciler) jittered(d time.Duration) time.Duration {
+	return d + time.Duration(r.randFrac()*individualPassJitterFrac*float64(d))
+}
+
+// randFrac returns the next jitter fraction, in [0,1). Zero without a source,
+// which makes every schedule exact — what a reconciler built outside Register
+// wants.
+func (r *reconciler) randFrac() float64 {
+	if r.individualPassRand == nil {
+		return 0
+	}
+	return r.individualPassRand()
+}
+
 // log guards reconcilers built outside Register (e.g. minimal ones in tests).
 func (r *reconciler) log() *slog.Logger {
 	if r.logger == nil {
@@ -447,31 +499,7 @@ func (r *reconciler) runWorker(ctx context.Context) {
 				} else {
 					r.work.done(id)
 				}
-				switch {
-				case !result.succeeded():
-					if errors.Is(result.err, ErrInvalidResult) {
-						r.logger.Error("controller returned an unusable result", "id", id, "err", result.err)
-					}
-					delay := r.backoffNext(id)
-					r.work.addAfter(id, delay, alarmBackoff)
-					r.logger.Debug("requeued after failure", "id", id, "backoff", delay)
-				case result.requeueSet && result.requeueAfter > 0:
-					r.backoffClear(id)
-					r.work.addAfter(id, result.requeueAfter, alarmRequeueAfter)
-					r.logger.Debug("requeued", "id", id, "after", result.requeueAfter)
-				case result.requeueSet:
-					// RequeueAfter(0): the queue's per-object floor paces it.
-					r.backoffClear(id)
-					r.work.add(id)
-					r.logger.Debug("requeued", "id", id, "after", 0)
-				case result.unsettled():
-					r.backoffClear(id)
-					after := r.unsettledRequeue()
-					r.work.addAfter(id, after, alarmRequeueAfter)
-					r.logger.Debug("requeued unsettled", "id", id, "after", after)
-				default:
-					r.backoffClear(id)
-				}
+				r.scheduleNext(id, result, gone)
 			}
 		}
 	}
