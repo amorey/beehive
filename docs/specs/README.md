@@ -14,7 +14,9 @@ A spec is also not [`TODO.md`](../TODO.md). `TODO.md` holds gaps we have
 decided *not* to close yet, and says what would make them worth doing. A spec is
 work we have decided to do.
 
-No spec is in flight.
+In flight:
+
+- [A trigger channel requeues a kind's objects, by id or by name](2026-08-19-a-trigger-channel-requeues-by-id-or-name.md)
 
 The last spec shipped as
 [A pass skips a status write it can see is a no-op](../adr/2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md).
