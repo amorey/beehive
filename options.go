@@ -289,6 +289,43 @@ func WithFullPassInterval(d time.Duration) Option {
 	}
 }
 
+// WithIndividualPassInterval gives every object of the kind a pass roughly
+// every d, measured from the end of each object's own last pass. Default 0
+// (disabled).
+//
+// Use it for a kind that must re-poll something the store cannot see — a remote
+// dialled by the reconcile, a probe with no notifier behind it. Unlike a
+// RequeueAfter the controller has to re-declare on every return path, this is
+// declared once and cannot be dropped by a branch that forgot it; unlike
+// WithFullPassInterval it costs no listing per tick and dispatches no
+// whole-kind burst.
+//
+// What it schedules: a pass that returns settled without asking to be requeued.
+// A pass that returns RequeueAfter sets its own schedule and is not clamped, a
+// failed pass keeps its backoff ladder, and an unsettled one keeps the owed
+// pass's cadence. So d is a default cadence, not a ceiling.
+//
+// Each arming carries jitter, so the interval is a floor plus up to a tenth: a
+// pass never fires early, and objects that settled together drift apart. At
+// startup the spread is the whole interval — an object's first pass after a
+// restart lands within d, which is what keeps a restart from dispatching the
+// whole kind at once. Pair it with WithStartupFullPass for a kind that needs
+// that first pass promptly instead.
+//
+// Passed to New it sets the default for all controllers; passed to Register it
+// overrides that default for one.
+func WithIndividualPassInterval(d time.Duration) Option {
+	return func(target any) error {
+		switch t := target.(type) {
+		case *Beehive:
+			t.individualPassInterval = d
+		case *reconciler:
+			t.individualPassInterval = d
+		}
+		return nil
+	}
+}
+
 // WithGCInterval sets how often the global GC sweeper runs: collecting
 // deletion-pending objects of every kind, applying event-log retention, and
 // releasing freed space. Meaningful only at New.

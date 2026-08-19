@@ -184,15 +184,20 @@ func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id Object
 // reconciler drives the reconcile loop for a single registered controller.
 // It owns the work queue, exponential backoff, and the periodic pass timers.
 type reconciler struct {
-	gk                GroupKind
-	adapter           controllerAdapter
-	store             Store
-	work              *workQueue
-	owedPassInterval  time.Duration
-	fullPassInterval  time.Duration
-	maxRetryInterval  time.Duration
-	baseRetryInterval time.Duration // zero falls back to defaultBaseRetryInterval
-	concurrency       int           // worker goroutines; 0/1 = single-threaded
+	gk               GroupKind
+	adapter          controllerAdapter
+	store            Store
+	work             *workQueue
+	owedPassInterval time.Duration
+	fullPassInterval time.Duration
+	// individualPassInterval re-arms each object's own next pass; 0 disables it.
+	individualPassInterval time.Duration
+	// individualPassRand sources that schedule's jitter. Nil means no jitter,
+	// which is what a reconciler built outside Register wants.
+	individualPassRand func() float64
+	maxRetryInterval   time.Duration
+	baseRetryInterval  time.Duration // zero falls back to defaultBaseRetryInterval
+	concurrency        int           // worker goroutines; 0/1 = single-threaded
 	// startupFullPass selects whether run also re-dispatches settled objects at
 	// startup; owed work is drained regardless.
 	startupFullPass bool

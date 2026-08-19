@@ -310,6 +310,7 @@ func TestRegisterStoresReconciler(t *testing.T) {
 	assert.Equal(t, gk, r.gk)
 	assert.Equal(t, defaultOwedPassInterval, r.owedPassInterval, "inherits the Beehive default")
 	assert.Equal(t, defaultFullPassInterval, r.fullPassInterval, "inherits the Beehive default")
+	assert.Equal(t, defaultIndividualPassInterval, r.individualPassInterval, "inherits the Beehive default")
 	assert.Equal(t, defaultMaxRetryInterval, r.maxRetryInterval)
 }
 
@@ -696,4 +697,28 @@ func (c *blockingController[Spec, Status]) Reconcile(context.Context, Controller
 	c.once.Do(func() { close(c.entered) })
 	<-c.release
 	return Settled()
+}
+
+// The New form of the option reaches a controller only if Register copies it
+// out of the Beehive: a field missing from that literal compiles and does
+// nothing.
+func TestRegisterInheritsIndividualPassInterval(t *testing.T) {
+	bh := newTestBeehive(t, &fakeStore{}, WithIndividualPassInterval(90*time.Second))
+
+	gk := GroupKind{Kind: "Widget"}
+	require.NoError(t, Register(bh, gk, &noopController[tSpec, tStatus]{}))
+
+	r := bh.reconcilers[gk]
+	assert.Equal(t, 90*time.Second, r.individualPassInterval)
+	assert.NotNil(t, r.individualPassRand, "the jitter source is inherited too")
+}
+
+// Register wins over New, as every other inherited cadence does.
+func TestRegisterOverridesIndividualPassInterval(t *testing.T) {
+	bh := newTestBeehive(t, &fakeStore{}, WithIndividualPassInterval(90*time.Second))
+
+	gk := GroupKind{Kind: "Widget"}
+	require.NoError(t, Register(bh, gk, &noopController[tSpec, tStatus]{}, WithIndividualPassInterval(time.Second)))
+
+	assert.Equal(t, time.Second, bh.reconcilers[gk].individualPassInterval)
 }

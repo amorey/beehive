@@ -36,6 +36,19 @@ func TestWithFullPassIntervalDispatch(t *testing.T) {
 	require.NoError(t, WithFullPassInterval(time.Second)("unrelated"))
 }
 
+func TestWithIndividualPassIntervalDispatch(t *testing.T) {
+	bh := &Beehive{}
+	require.NoError(t, WithIndividualPassInterval(5*time.Second)(bh))
+	assert.Equal(t, 5*time.Second, bh.individualPassInterval)
+
+	r := &reconciler{}
+	require.NoError(t, WithIndividualPassInterval(3*time.Second)(r))
+	assert.Equal(t, 3*time.Second, r.individualPassInterval)
+
+	// A target the option doesn't recognize is silently ignored.
+	require.NoError(t, WithIndividualPassInterval(time.Second)("unrelated"))
+}
+
 // resolveEvents folds the per-call EventOptions into one EventQuery; the empty
 // set is the zero query (every run for the object).
 func TestResolveEvents(t *testing.T) {
