@@ -15,10 +15,8 @@
 package beehive
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"sync"
 	"sync/atomic"
 
 	"github.com/amorey/beehive/internal/storeapi"
@@ -109,66 +107,8 @@ type controllerClientImpl[Status any] struct {
 
 // newPassClient is the only constructor. The pass ends its client; AdminClient
 // builds one per call and ends none, so live() always passes there.
-func newPassClient[Status any](bh *Beehive, gk GroupKind, id ObjectID, baseline *statusBaseline) *controllerClientImpl[Status] {
-	return &controllerClientImpl[Status]{bh: bh, gk: gk, id: id, baseline: baseline}
-}
-
-// statusBaseline is what the store holds for the pass's object, as far as this
-// client knows: the bytes it was loaded with, advanced by its own committed
-// writes. UpdateStatus compares against it to skip a write the store would
-// decline. Sound because objects.status has one writer — see
-// docs/adr/2026-08-05-one-process-one-beehive-sole-writer.md.
-type statusBaseline struct {
-	mu      sync.Mutex
-	bytes   []byte
-	version int
-
-	// outstanding counts writes issued but not known to have committed. While it
-	// is non-zero the stored bytes are unknown to us, so matches reports false and
-	// every write reaches the store. A write that fails or rolls back never
-	// promotes, leaving the pass on the slow path for good — today's cost, and
-	// what lets this work without a rollback hook.
-	outstanding int
-}
-
-func newStatusBaseline(status []byte, version int) *statusBaseline {
-	return &statusBaseline{bytes: status, version: version}
-}
-
-// matches reports whether writing status at version would change nothing. It
-// must stay a strict subset of the store's own skip: a false negative costs a
-// transaction, a false positive loses a write.
-func (b *statusBaseline) matches(status []byte, version int) bool {
-	if b == nil {
-		return false
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.outstanding == 0 && b.version == version && bytes.Equal(b.bytes, status)
-}
-
-// arm marks a write in flight. Every arm must be answered by a promote or the
-// fast path stays off.
-func (b *statusBaseline) arm() {
-	if b == nil {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.outstanding++
-}
-
-// promote records a committed write. It takes the bytes it is promoting rather
-// than reading a shared slot: hooks run at the outermost commit, by which time a
-// later write may have been issued and failed.
-func (b *statusBaseline) promote(status []byte, version int) {
-	if b == nil {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.bytes, b.version = status, version
-	b.outstanding--
+func newPassClient[Status any](bh *Beehive, gk GroupKind, id ObjectID) *controllerClientImpl[Status] {
+	return &controllerClientImpl[Status]{bh: bh, gk: gk, id: id}
 }
 
 // passClients builds pass clients for one kind, binding an object per call, for
@@ -179,7 +119,7 @@ type passClients[Status any] struct {
 }
 
 func (p passClients[Status]) at(id ObjectID) *controllerClientImpl[Status] {
-	return newPassClient[Status](p.bh, p.gk, id, nil)
+	return newPassClient[Status](p.bh, p.gk, id)
 }
 
 // Called once, after Reconcile returns and before beehive's own writes.
@@ -204,8 +144,10 @@ func (c *controllerClientImpl[Status]) live() error {
 // else would catch it — up to the watch floor for a subscriber, and up to the
 // stale-dependents pass for a dependent, since the waker has no tick behind it.
 //
-// AddEvent is the one that does not, and must not: an event bumps no
-// resource_version, so it appends no entry for a watch to read.
+// Two do not. AddEvent must not: an event bumps no resource_version, so it
+// appends no entry for a watch to read. UpdateStatus signals inline instead,
+// because it wakes on what the store reported writing rather than on a nil
+// error — the two part company when identical bytes are re-reported.
 func (c *controllerClientImpl[Status]) wakeAfter(ctx context.Context, err error) error {
 	if err != nil {
 		return err
@@ -222,20 +164,31 @@ func (c *controllerClientImpl[Status]) UpdateStatus(ctx context.Context, status 
 	if err != nil {
 		return err
 	}
-	version := migratorStatusVersion(c.bh.migratorFor(c.gk))
-	if c.baseline.matches(b, version) {
+	version := c.statusVersion()
+	if !c.baseline.claim(b, version) {
 		return nil // the store would compare these and write nothing
 	}
-	c.baseline.arm()
 	changed, err := c.bh.store.Objects().UpdateStatus(ctx, c.gk, c.id, b, version)
 	if err != nil || !changed {
-		// Neither promotes: the arm stands and this pass keeps reaching the store.
-		return err // no write, no resource_version bump, nothing to wake
+		// Neither promotes, so this pass keeps reaching the store.
+		return err // nothing written, so no resource_version bump and nothing to wake
 	}
-	// At commit, carrying b: a write rolled back inside the caller's Within never
-	// landed, and a baseline ahead of the store would skip the rewrite.
-	c.bh.store.AfterCommit(ctx, func(context.Context) { c.baseline.promote(b, version) })
-	return c.wakeAfter(ctx, nil)
+	// Promote only at commit: a write rolled back inside the caller's Within
+	// never landed.
+	bl := c.baseline
+	c.bh.store.AfterCommit(ctx, func(context.Context) { bl.promote(b, version) })
+	c.bh.signalKindWritten(ctx, c.gk)
+	return nil
+}
+
+// statusVersion is the status schema version this build writes. A pass resolves
+// it once, when its baseline is built: migratorFor takes the beehive-wide lock,
+// which the skip path must not.
+func (c *controllerClientImpl[Status]) statusVersion() int {
+	if c.baseline != nil {
+		return c.baseline.writeVersion
+	}
+	return migratorStatusVersion(c.bh.migratorFor(c.gk))
 }
 
 func (c *controllerClientImpl[Status]) SetCondition(ctx context.Context, condition Condition) error {

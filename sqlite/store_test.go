@@ -1450,8 +1450,7 @@ func TestUpdateStatusRecordsStatusAlone(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	_, err := store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 0)
 	updated, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
@@ -1668,8 +1667,7 @@ func TestUpdateStatusReUseAcrossAStatusVersionBumpLeavesTheHandshake(t *testing.
 
 	created := newRefObject(t, store)
 	status := []byte(`{"msg":"hi"}`)
-	_, err := store.Objects().UpdateStatus(ctx, testGK, created.ID, status, 1)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, status, 1)
 
 	bumped, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"x":1}`), 0)
 	require.NoError(t, err)
@@ -1678,8 +1676,7 @@ func TestUpdateStatusReUseAcrossAStatusVersionBumpLeavesTheHandshake(t *testing.
 	require.NoError(t, err)
 
 	// The same bytes, re-passed under a raised status version.
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, status, 2)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, status, 2)
 
 	reread, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
@@ -1719,8 +1716,7 @@ func TestSchemaVersionColumnsRoundTrip(t *testing.T) {
 	assert.Zero(t, reread.StatusVersion)
 
 	// UpdateStatus stamps only the status version, leaving spec untouched.
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{}`), 7)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{}`), 7)
 	withStatus, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 3, withStatus.SpecVersion, "status write must not touch spec version")
@@ -1739,15 +1735,13 @@ func TestUpdateStatusIdenticalStatusIsNoOp(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	_, err := store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 0)
 	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 0)
 	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
@@ -1763,15 +1757,13 @@ func TestUpdateStatusChangedStatusWrites(t *testing.T) {
 
 	created := newRefObject(t, store)
 
-	_, err := store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 0)
 	first, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"bye"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"bye"}`), 0)
 	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
@@ -1787,17 +1779,17 @@ func TestUpdateStatusScopedOnBothBranches(t *testing.T) {
 	ctx := context.Background()
 
 	created := newRefObject(t, store)
-	_, err := store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 0)
 
 	for _, status := range [][]byte{[]byte(`{"msg":"hi"}`), []byte(`{"msg":"bye"}`)} {
-		_, err = store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, status, 0)
+		_, err := store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, created.ID, status, 0)
 		assert.ErrorIs(t, err, beehive.ErrWrongKind)
 
 		_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID+9999, status, 0)
 		assert.ErrorIs(t, err, beehive.ErrNotFound)
 	}
 }
+
 func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -1808,16 +1800,14 @@ func TestCrossVersionWriteIsNotANoOp(t *testing.T) {
 		SpecVersion: 1,
 	})
 	require.NoError(t, err)
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 1)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 1)
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
 	// Same status bytes, newer status schema version: a real write, announced.
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 2)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 2)
 	statusStamped, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 2, statusStamped.StatusVersion, "the newer status version lands")
@@ -1856,15 +1846,13 @@ func TestSameVersionNoOpWritesNothing(t *testing.T) {
 		SpecVersion: 1,
 	})
 	require.NoError(t, err)
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 1)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 1)
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 
 	probe := newWriteProbe(t, store)
 
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 1)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 1)
 	again, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, settled.ResourceVersion, again.ResourceVersion, "no resource_version bump")
@@ -1894,8 +1882,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 3)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 3)
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	require.Equal(t, 3, settled.StatusVersion)
@@ -1904,8 +1891,7 @@ func TestNoOpWritesNeverStampSchemaVersionDownward(t *testing.T) {
 
 	// A build that lost the kind's migrator (reporting 0) has no version opinion:
 	// the write goes through and leaves the tag alone.
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 0)
 	stale, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, stale.StatusVersion, "a no-op status write never stamps backwards")
@@ -1932,8 +1918,7 @@ func TestWriteRejectsSchemaVersionDowngrade(t *testing.T) {
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 3)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 3)
 
 	// Content no-op and real content change, spec and status alike.
 	_, _, err = store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":3}`), 1)
@@ -1969,16 +1954,14 @@ func TestContentWriteWithNoMigratorKeepsSchemaVersion(t *testing.T) {
 		SpecVersion: 3,
 	})
 	require.NoError(t, err)
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"hi"}`), 3)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"hi"}`), 3)
 
 	updated, _, err := store.Objects().UpdateSpec(ctx, testGK, created.ID, []byte(`{"v":4}`), 0)
 	require.NoError(t, err)
 	require.Greater(t, updated.Generation, created.Generation, "precondition: a real content write")
 	assert.Equal(t, 3, updated.SpecVersion, "a content write with no migrator keeps the stored version")
 
-	_, err = store.Objects().UpdateStatus(ctx, testGK, created.ID, []byte(`{"msg":"bye"}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, created.ID, []byte(`{"msg":"bye"}`), 0)
 	settled, err := store.Objects().Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, 3, settled.StatusVersion, "same on the status half")
@@ -4040,12 +4023,8 @@ func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 	hideObjectColumn(t, store, "spec")
 
 	status := []byte(`{"msg":"hi"}`)
-	changed, err := store.Objects().UpdateStatus(ctx, testGK, id, status, 0)
-	require.NoError(t, err, "the content branch")
-	assert.True(t, changed)
-	changed, err = store.Objects().UpdateStatus(ctx, testGK, id, status, 0)
-	require.NoError(t, err, "identical bytes: nothing written")
-	assert.False(t, changed)
+	mustUpdateStatus(t, ctx, store, id, status, 0) // the content branch
+	mustUpdateStatus(t, ctx, store, id, status, 0) // identical bytes: nothing written
 
 	var obs sql.NullInt64
 	var stored string
@@ -4055,7 +4034,7 @@ func TestUpdateStatusReadsNeitherSpecNorFinalizers(t *testing.T) {
 	assert.JSONEq(t, `{"msg":"hi"}`, stored)
 
 	// The kind gate still answers from the columns it does read.
-	_, err = store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, status, 0)
+	_, err := store.Objects().UpdateStatus(ctx, beehive.GroupKind{Kind: "Other"}, id, status, 0)
 	assert.ErrorIs(t, err, beehive.ErrWrongKind)
 }
 
@@ -4219,6 +4198,14 @@ func TestWithinNestedCommitError(t *testing.T) {
 func newRefObject(t *testing.T, store beehive.Store) *beehive.RawObject {
 	t.Helper()
 	return newKindObject(t, store, testGK)
+}
+
+// mustUpdateStatus writes a status that is expected to succeed, for the tests
+// that assert on the row rather than on what the write reported.
+func mustUpdateStatus(t *testing.T, ctx context.Context, store beehive.Store, id beehive.ObjectID, status []byte, version int) {
+	t.Helper()
+	_, err := store.Objects().UpdateStatus(ctx, testGK, id, status, version)
+	require.NoError(t, err)
 }
 
 // refIDs projects an ObjectRef slice to its ids for order-sensitive assertions.
@@ -5308,8 +5295,7 @@ func TestNonConditionWritesPreserveConditions(t *testing.T) {
 
 	// UpdateStatus returns no row, so there is nothing here to assemble; it must
 	// still leave the condition alone, and still emit.
-	_, err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"v":1}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, obj.ID, []byte(`{"v":1}`), 0)
 	updated, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
 	require.NotNil(t, findCondition(updated.Conditions, "Ready"), "a status write must not disturb conditions")
@@ -5773,13 +5759,12 @@ func TestUpdateStatusCrossVersionUpdateError(t *testing.T) {
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 	status := []byte(`{"ok":true}`)
-	_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, status, 1)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, obj.ID, status, 1)
 	blockObjectUpdates(t, store)
 
 	// obj.Generation is the generation the call above settled at, so re-reading the
 	// row to recover it would only echo the argument.
-	_, err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, status, 2)
+	_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, status, 2)
 	require.Error(t, err)
 }
 
@@ -7723,8 +7708,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 		{
 			name: "status update",
 			write: func(t *testing.T, store beehive.Store, obj *beehive.RawObject) {
-				_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"b":2}`), 0)
-				require.NoError(t, err)
+				mustUpdateStatus(t, ctx, store, obj.ID, []byte(`{"b":2}`), 0)
 			},
 			logs: true,
 		},
@@ -7828,8 +7812,7 @@ func TestObjectsDeleteAppendsARowImage(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"b":2}`), 0)
-	require.NoError(t, err)
+	mustUpdateStatus(t, ctx, store, obj.ID, []byte(`{"b":2}`), 0)
 	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
 		storeapi.Condition{Type: "Ready", Status: "True"}))
 	before, err := store.Objects().Get(ctx, obj.ID)
@@ -8560,13 +8543,10 @@ func TestObservedGenerationIsMonotonic(t *testing.T) {
 
 // A pass compares a status write against the bytes it was loaded with, which is
 // sound only while nothing else can move the column under it. "No statement
-// writes it" is a claim over an open set, so this asserts the structure that
-// makes it true.
-//
-// It scans SQL text rather than the Go AST — the column is named inside string
-// literals, which a call walk cannot see. What it therefore cannot catch: a
-// statement assembled by concatenation, and an INSERT ... SELECT that names no
-// column list. See docs/adr/2026-08-18-a-controller-client-exists-only-for-a-pass.md.
+// writes it" is a claim over an open set, so this asserts the structure instead.
+// Blind to a statement built by concatenation, and to an INSERT ... SELECT that
+// names no columns.
+// See docs/adr/2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md.
 func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 	// Word-bounded, so schema_version_status is not mistaken for the column.
 	status := regexp.MustCompile(`\bstatus\b`)

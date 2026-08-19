@@ -1509,6 +1509,9 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		if err != nil {
 			return err
 		}
+		// A pass shadows this compare in memory to skip the transaction entirely
+		// (statusBaseline.claim). Loosening this one widens that one: keep the
+		// in-memory skip a subset, or it starts dropping writes this would make.
 		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
 			return nil // no version bump, so no watch diff and no wake
 		}
@@ -1518,17 +1521,18 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		}
 		// Keyed on id alone: the kind boundary came from the scoped read in this
 		// transaction — keep the read if you move this statement.
-		if _, err = c.ExecContext(ctx, `
+		_, err = c.ExecContext(ctx, `
 			UPDATE objects
 			SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
 			WHERE id = ?`,
-			jsonText(status), stamp, rv, now, id); err != nil {
-			return err
-		}
-		changed = true
-		return nil
+			jsonText(status), stamp, rv, now, id)
+		changed = err == nil
+		return err
 	})
-	return changed && err == nil, err
+	if err != nil {
+		return false, err // a failed commit wrote nothing, whatever the closure saw
+	}
+	return changed, nil
 }
 
 // conditionColumns is the canonical select list for a condition row;
