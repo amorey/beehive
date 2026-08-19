@@ -298,8 +298,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `Controller`/`ControllerClient` writes status.
 - **Reconcile is not transactional.** Each `ControllerClient` write commits on
   its own; `Within` groups writes that must land together. Id-keyed writes are
-  scoped to the caller's `GroupKind` (`ErrWrongKind`). There is no name-keyed
-  upsert — none of `Create`/`GetOrCreate`/`Delete` writes to a row it found. **A
+  scoped to the caller's `GroupKind` (`ErrWrongKind`). `CreateOrUpdate` is the one
+  name-keyed upsert, and it exists because the two-call composition has a right
+  order and a wrong one: start with `GetOrCreate` and the loser of a concurrent
+  create writes its spec onto the winner's row, start with `UpdateByName` and it
+  silently does not. `Create`, `GetOrCreate` and `Delete` still never write to a
+  row they found.
+  → [ADR](docs/adr/2026-08-19-a-name-keyed-create-or-update.md) **A
   write's durable record is what a driver lists**: a spec write bumps the
   generation, a delete sets `deletion_requested_at`. **A spec write to a
   deletion-pending row is refused** with `ErrDeletionPending` and appends nothing

@@ -69,6 +69,7 @@ for the mapping.
 - [Store write shapes: narrow in, narrow out](2026-07-30-store-write-shapes.md)
 - [The id is the Client API's key; the name resolves through ByName siblings](2026-08-02-id-primary-key-with-byname-siblings.md)
 - [Name-keyed writes](2026-07-27-name-keyed-writes.md)
+- [A name-keyed CreateOrUpdate](2026-08-19-a-name-keyed-create-or-update.md)
 - [Beehive owns the generation handshake](2026-08-18-beehive-owns-the-generation-handshake.md)
 - [A ControllerClient exists only for the pass it is handed to, and writes only that pass's object](2026-08-18-a-controller-client-exists-only-for-a-pass.md)
 - [An AdminClient writes outside a pass, for fixtures and for maintenance](2026-08-18-an-admin-client-writes-outside-a-pass.md)

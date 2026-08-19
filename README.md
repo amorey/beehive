@@ -539,7 +539,11 @@ The bottom row is one state read three ways, and the differences are the point. 
 
 That sentinel is deliberately not `ErrNotFound`, because the two ask for opposite responses: absent means create it, pending means you cannot until GC releases the name. A caller whose object is owned answers it by doing nothing — [a physical delete pushes its owner](docs/adr/2026-08-05-a-physical-delete-pushes-its-owner.md), so the owner's next pass creates the replacement. Left unhandled inside a `Reconcile` it surfaces as a failure and enters the retry ladder, against a condition that retrying does not clear.
 
-**There is no name-keyed upsert.** Neither create branch ever writes to a row it found, so changing an existing object is always a separate `Update`. A caller that wants ensure-then-set composes `GetOrCreate` with `Update` — on the id it just got back — inside its own `Within`.
+**`CreateOrUpdate` is the name-keyed upsert.** Neither create branch ever writes to a row it found, so `GetOrCreate` alone never changes an existing object. `CreateOrUpdate` does: it makes whatever holds the name hold the spec, creating it if absent, and `created` says which happened. The resolve and the write are one transaction.
+
+Composing it by hand works, but only in one order. `GetOrCreate` then `Update` on the id it returned is correct — `GetOrCreate` is atomic, so the loser of a concurrent create gets the winner's row and writes its spec onto that. `UpdateByName` first, falling back to `GetOrCreate` on `ErrNotFound`, is not: the loser gets `created=false`, no error, and its spec is never applied. `CreateOrUpdate` removes the choice.
+
+Its options follow `GetOrCreate`'s: honoured on create, ignored on update, so it never re-parents. A deletion-pending row is refused with `ErrDeletionPending` rather than rewritten.
 
 Re-applying the spec a row already holds does nothing at all: no generation bump, no `resource_version` bump, and so nothing for a scan to find — no watch delivery, no reconcile. That matters when a controller re-applies a spec of its own kind on every pass, because the object stays settled instead of owing itself another pass forever.
 

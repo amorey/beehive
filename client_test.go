@@ -828,6 +828,10 @@ func TestClientWithOnCreateFiresOnlyAfterOuterCommit(t *testing.T) {
 			_, _, err := c.GetOrCreate(ctx, "new", cSpec{Val: "b"}, onCreate)
 			return err
 		}},
+		{"CreateOrUpdate", func(ctx context.Context, c Client[cSpec, cStatus], onCreate Option) error {
+			_, _, err := c.CreateOrUpdate(ctx, "upserted", cSpec{Val: "b"}, onCreate)
+			return err
+		}},
 	}
 
 	for _, w := range writes {
