@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -100,6 +101,9 @@ type allIDsStore struct {
 	// failures fails that many ListIDs calls before serving ids, for a listing
 	// whose only recovery is its own retry.
 	failures int
+	// listed, when set, is closed on the first call, so a test can wait for the
+	// listing rather than for a delay.
+	listed chan struct{}
 
 	mu    sync.Mutex
 	calls int
@@ -122,6 +126,9 @@ func (s *allIDsStore) listIDsObjects(_ context.Context, _ GroupKind) ([]ObjectID
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
+	if s.calls == 1 && s.listed != nil {
+		close(s.listed)
+	}
 	if s.calls <= s.failures {
 		return nil, errors.New("list failed")
 	}
@@ -4260,4 +4267,26 @@ func TestReconcilerIndividualPassSubsumesTheStartupPass(t *testing.T) {
 	// Counted after the loop exits, so the scan goroutine has finished either
 	// way and the count is not a race.
 	assert.Equal(t, 1, store.listCalls(), "the scan is the startup pass, not a second listing")
+}
+
+// The scan retries until it succeeds or the reconciler stops. run waits on it,
+// so a scan that ignored the cancel would hold a stopped beehive open.
+func TestReconcilerIndividualPassAdmissionStopsWithTheReconciler(t *testing.T) {
+	const alwaysFails = math.MaxInt
+	store := &allIDsStore{ids: []ObjectID{1}, failures: alwaysFails, listed: make(chan struct{})}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                &fakeAdapter{reconcileFn: func(context.Context, ObjectID) ReconcileResult { return Settled() }},
+		store:                  store,
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	waitClosed(t, store.listed, "the first admission attempt")
+	cancel()
+	waitClosed(t, done, "run to exit while the scan is still retrying")
 }
