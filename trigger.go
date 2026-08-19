@@ -64,10 +64,19 @@ func (t *trigger) poke(ctx context.Context, a addr) {
 }
 
 // resolve reads existence and kind, and nothing else: a trigger never looks at
-// an object's conditions.
+// an object's conditions. The name form takes its kind from the WHERE; the id
+// form must gate it here, or a foreign id would reach GetForReconcile, which
+// takes a bare id and would hand the row to this kind's controller.
 func (t *trigger) resolve(ctx context.Context, a addr) (*RawObject, error) {
 	if t.names != nil {
 		return t.r.store.Objects().GetMetaByName(ctx, t.r.gk, a.name)
 	}
-	return t.r.store.Objects().GetMeta(ctx, a.id)
+	obj, err := t.r.store.Objects().GetMeta(ctx, a.id)
+	if err != nil {
+		return nil, err
+	}
+	if obj.Group != t.r.gk.Group || obj.Kind != t.r.gk.Kind {
+		return nil, ErrNotFound
+	}
+	return obj, nil
 }

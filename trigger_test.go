@@ -92,6 +92,33 @@ func TestTriggerByIDRequeuesTheObject(t *testing.T) {
 	waitClosed(t, done, "the trigger loop to return")
 }
 
+// Objects().GetForReconcile takes a bare id, so a foreign id reaching the queue
+// would hand one kind's row to another kind's controller. Every other enqueue
+// path is kind-routed by construction; a trigger is the first that takes an
+// address from outside, so it gates the kind itself.
+func TestTriggerByIDIgnoresAForeignKind(t *testing.T) {
+	r := newTriggerReconciler(t)
+	mine := triggerObject(t, r, "mine")
+	foreign, err := r.store.Objects().Create(context.Background(), GroupKind{Kind: "Other"},
+		ObjectsCreateInput{Name: "theirs", Spec: []byte(`{}`)})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan ObjectID)
+	done := runTrigger(ctx, &trigger{r: r, ids: ch})
+
+	ch <- foreign.ID
+	ch <- ObjectID(9999) // and one that names nothing at all
+	ch <- mine.ID
+	assert.Equal(t, mine.ID, waitQueued(t, r.work))
+	_, ok := r.work.get()
+	assert.False(t, ok, "only this kind's id may be queued")
+
+	cancel()
+	waitClosed(t, done, "the trigger loop to return")
+}
+
 func TestTriggerByNameRequeuesTheObject(t *testing.T) {
 	r := newTriggerReconciler(t)
 	obj := triggerObject(t, r, "one")
