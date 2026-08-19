@@ -309,6 +309,51 @@ func (r *reconciler) randFrac() float64 {
 	return r.individualPassRand()
 }
 
+// admitAll arms every object of the kind, spreading the armings across one
+// interval. A per-object alarm is armed by a pass, so an object no pass reaches
+// — settled by a previous process, owing nothing — needs this to enter the
+// cadence at all. Runs once per process, not per tick.
+func (r *reconciler) admitAll(ctx context.Context) error {
+	if r.store == nil {
+		return nil
+	}
+	ids, err := r.store.Objects().ListIDs(ctx, r.gk)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		r.work.addAfter(id, r.admitOffset(), alarmRequeueAfter)
+	}
+	r.log().InfoContext(ctx, "admitted objects to the individual pass",
+		"group", r.gk.Group, "kind", r.gk.Kind, "count", len(ids), "interval", r.individualPassInterval)
+	return nil
+}
+
+// admit runs the admission scan, retrying until it succeeds or ctx ends. The
+// retry is not optional: with no periodic tick behind it, one failed listing
+// would leave the kind polling nothing for the life of the process.
+func (r *reconciler) admit(ctx context.Context) {
+	backoff := driver.Backoff{Base: admitRetryBase, Max: admitRetryMax}
+	for {
+		err := r.admitAll(ctx)
+		if err == nil {
+			return
+		}
+		r.log().WarnContext(ctx, "failed to admit objects to the individual pass; retrying",
+			"group", r.gk.Group, "kind", r.gk.Kind, "err", err)
+		if !backoff.Wait(ctx) {
+			return
+		}
+	}
+}
+
+// admitOffset spreads one admission across the whole interval, unlike the
+// arming jitter's tenth: what it prevents is a restart dispatching the kind at
+// once.
+func (r *reconciler) admitOffset() time.Duration {
+	return time.Duration(r.randFrac() * float64(r.individualPassInterval))
+}
+
 // log guards reconcilers built outside Register (e.g. minimal ones in tests).
 func (r *reconciler) log() *slog.Logger {
 	if r.logger == nil {
@@ -421,6 +466,9 @@ func (r *reconciler) run(ctx context.Context) {
 
 	n := max(r.concurrency, 1)
 	var wg sync.WaitGroup
+	if r.individualPassInterval > 0 {
+		wg.Go(func() { r.admit(ctx) })
+	}
 	for range n {
 		wg.Go(func() {
 			r.runWorker(ctx)

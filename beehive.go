@@ -45,8 +45,14 @@ const (
 	// individualPassJitterFrac is the fraction of the interval added to each
 	// arming. Not configurable: no caller wants a synchronized herd.
 	individualPassJitterFrac = 0.1
-	defaultStartupFullPass   = false
-	defaultGCInterval        = 30 * time.Second
+
+	// admitRetryBase and admitRetryMax pace a retried admission scan. Its own
+	// ladder, not one of the public cadences: with no periodic tick behind it, a
+	// scan that failed and was not retried leaves the kind polling nothing.
+	admitRetryBase         = 100 * time.Millisecond
+	admitRetryMax          = 30 * time.Second
+	defaultStartupFullPass = false
+	defaultGCInterval      = 30 * time.Second
 	// The default resume window: how long a subscriber may be disconnected and
 	// still resume without a full resync. A day covers a restart, a deploy, and a
 	// night of maintenance.

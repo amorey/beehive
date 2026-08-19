@@ -4094,3 +4094,97 @@ func TestWithIndividualPassRandDispatch(t *testing.T) {
 
 	require.NoError(t, withIndividualPassRand(func() float64 { return 0 })("unrelated"))
 }
+
+// listIDsStore serves a fixed set of ids from Objects().ListIDs, failing the
+// first failures calls, and counts the calls that reached it.
+type listIDsStore struct {
+	fakeStore
+	ids      []ObjectID
+	mu       sync.Mutex
+	calls    int
+	failures int
+}
+
+func (s *listIDsStore) Objects() storeapi.Objects {
+	return objectsOverride{Objects: s.fakeStore.Objects(), listIDs: s.listIDs}
+}
+
+func (s *listIDsStore) listIDs(context.Context, GroupKind) ([]ObjectID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls <= s.failures {
+		return nil, errors.New("list failed")
+	}
+	return s.ids, nil
+}
+
+func (s *listIDsStore) listCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// The case the option exists for: objects settled by a previous process, owing
+// nothing, that no other trigger would ever wake.
+func TestReconcilerIndividualPassAdmitsColdObjects(t *testing.T) {
+	seen := make(chan ObjectID, 3)
+	adapter := &fakeAdapter{
+		reconcileFn: func(_ context.Context, id ObjectID) ReconcileResult {
+			seen <- id
+			return Settled()
+		},
+	}
+
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                adapter,
+		store:                  &listIDsStore{ids: []ObjectID{1, 2, 3}},
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { return 0 }, // no offset, so the scan dispatches at once
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runInBackground(r, ctx)
+
+	got := map[ObjectID]bool{}
+	for range 3 {
+		select {
+		case id := <-seen:
+			got[id] = true
+		case <-time.After(testTimeout):
+			t.Fatalf("timed out waiting for the admission scan; saw %v", got)
+		}
+	}
+	assert.Equal(t, map[ObjectID]bool{1: true, 2: true, 3: true}, got)
+
+	cancel()
+	waitClosed(t, done, "run to exit")
+}
+
+// The scan spreads its armings across the whole first interval, so a restart
+// does not dispatch the kind at once.
+func TestReconcilerIndividualPassAdmissionSpreads(t *testing.T) {
+	var n int
+	fracs := []float64{0, 0.25, 0.5}
+	r := &reconciler{
+		gk:                     GroupKind{Kind: "Widget"},
+		adapter:                &fakeAdapter{reconcileFn: func(context.Context, ObjectID) ReconcileResult { return Settled() }},
+		store:                  &listIDsStore{ids: []ObjectID{1, 2, 3}},
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Hour,
+		individualPassRand:     func() float64 { f := fracs[n]; n++; return f },
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+
+	require.NoError(t, r.admitAll(context.Background()))
+
+	// Id 1 drew 0 and is due now; the rest are spread over the interval.
+	assert.Nil(t, r.work.gauge.alarmFor(1), "a zero offset dispatches rather than arming")
+	for id, want := range map[ObjectID]time.Duration{2: time.Hour / 4, 3: time.Hour / 2} {
+		a := r.work.gauge.alarmFor(id)
+		require.NotNil(t, a, "id %d", id)
+		assert.InDelta(t, want, time.Until(a.fireAt), float64(time.Second), "id %d", id)
+	}
+}
