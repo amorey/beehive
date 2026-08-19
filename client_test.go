@@ -2995,6 +2995,44 @@ func TestClientUpdateIsIDKeyedWithByNameSibling(t *testing.T) {
 	assert.Equal(t, "v3", byID.Spec.Val)
 }
 
+// Both spec writes refuse a row being torn down, rather than writing a spec
+// that collection would discard.
+func TestClientUpdateRefusesADeletingRow(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
+	require.NoError(t, client.Delete(ctx, created.ID))
+
+	_, err := client.Update(ctx, created.ID, cSpec{Val: "v2"})
+	require.ErrorIs(t, err, ErrDeletionPending)
+
+	_, err = client.UpdateByName(ctx, "prod", cSpec{Val: "v2"})
+	require.ErrorIs(t, err, ErrDeletionPending)
+
+	unchanged, err := client.Get(ctx, created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "v1", unchanged.Spec.Val)
+}
+
+// The pair a caller reads the sentinel against, and the shape of the bug in
+// #126: the write is refused *and* the replacement cannot be made yet, because
+// a deletion-pending row goes on holding its name until GC releases it.
+func TestClientUpdateRefusalAndTheNameItStillHolds(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	created := mustCreate(t, ctx, client, "prod", cSpec{Val: "v1"})
+	require.NoError(t, client.Delete(ctx, created.ID))
+
+	_, err := client.Update(ctx, created.ID, cSpec{Val: "v2"})
+	require.ErrorIs(t, err, ErrDeletionPending)
+	assert.NotErrorIs(t, err, ErrNotFound, "the row is still there — the answers differ")
+
+	_, err = client.Create(ctx, "prod", cSpec{Val: "v2"})
+	require.ErrorIs(t, err, ErrNameTaken, "so the caller waits for GC rather than replacing it")
+}
+
 // Unlike Delete, a missing row is not "already in the desired state" — there is
 // nothing to write the spec onto — so Update reports absence both ways.
 func TestClientUpdateAbsentNameIsNotFound(t *testing.T) {

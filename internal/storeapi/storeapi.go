@@ -43,6 +43,11 @@ var ErrNotFound = errors.New("beehive: object not found")
 // the client, must refuse it: Store is a public extension point.
 var ErrInvalidName = errors.New("beehive: name must not be empty")
 
+// ErrDeletionPending is returned by a spec write to an object whose deletion has
+// been requested. Distinct from ErrNotFound: the row is still there and still
+// holds its name, so a create answers ErrNameTaken until GC releases it.
+var ErrDeletionPending = errors.New("beehive: object is deletion-pending")
+
 // ErrNameTaken is returned by a create whose name is already held within the
 // GroupKind, tombstones included. Implementations MUST report this sentinel,
 // not the driver's raw constraint error.
@@ -770,11 +775,17 @@ type Objects interface {
 	// changed reports false (bytes at a different schema version always take
 	// the write path). changed=true is what callers enqueue a reconcile on.
 	// Scoped to gk: wrong kind → ErrWrongKind, missing id → ErrNotFound.
+	//
+	// An implementation MUST refuse a deletion-pending row with
+	// ErrDeletionPending, before it stamps the schema version and before the byte
+	// compare, and MUST append nothing to the write log when it does. The order
+	// is part of the contract: a caller that answers this check ahead of the
+	// write must reach the same verdict the write would.
 	UpdateSpec(ctx context.Context, gk GroupKind, id ObjectID, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
 
 	// UpdateSpecByName is UpdateSpec keyed by name within gk, ErrNotFound if
-	// the name is not held (no ErrWrongKind). Same no-op and changed
-	// semantics. An implementation MUST resolve and write in one transaction:
+	// the name is not held (no ErrWrongKind). Same no-op, changed and
+	// deletion-pending semantics. An implementation MUST resolve and write in one transaction:
 	// the no-op comparison needs the stored bytes, and a split would let a
 	// concurrent collect hand the name to a replacement in between.
 	UpdateSpecByName(ctx context.Context, gk GroupKind, name string, spec []byte, specVersion int) (obj *RawObject, changed bool, err error)
