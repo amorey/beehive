@@ -351,6 +351,9 @@ func (r *reconciler) enqueueFrom(ctx context.Context, source string, list func(c
 // window — zero enqueues them all at once. It hands the listing error back
 // rather than logging it, since a caller with no tick behind it must retry.
 func (r *reconciler) enqueueSpread(ctx context.Context, list func(context.Context, GroupKind) ([]ObjectID, error), window time.Duration) error {
+	if r.work == nil {
+		return nil
+	}
 	ids, err := list(ctx, r.gk)
 	if err != nil {
 		return err

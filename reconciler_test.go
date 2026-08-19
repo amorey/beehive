@@ -4355,3 +4355,14 @@ func TestReconcilerIndividualPassYieldsToRequeueAfterZero(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, ObjectID(1), id)
 }
+
+// A reconciler with a store and no work queue is the shape log()'s guard exists
+// for. Listing for it enqueues nothing rather than panicking.
+func TestReconcilerEnqueueWithoutAWorkQueue(t *testing.T) {
+	r := &reconciler{gk: GroupKind{Kind: "Widget"}, store: &allIDsStore{ids: []ObjectID{1}}}
+
+	assert.NotPanics(t, func() { r.enqueueAll(context.Background()) })
+	assert.NotPanics(t, func() {
+		require.NoError(t, r.admitAll(context.Background(), time.Hour))
+	})
+}
