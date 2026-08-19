@@ -3723,3 +3723,47 @@ func TestClientCreateOrUpdateUpdatesExisting(t *testing.T) {
 	assert.Equal(t, "b", second.Spec.Val)
 	assert.Equal(t, first.Generation+1, second.Generation)
 }
+
+// The update branch owes the same two wakes client.update sends, on the same
+// changed gate: without them a real spec write reaches no watch tailer and no
+// dependency waker.
+func TestClientCreateOrUpdateEnqueuesOnlyAChangedUpdate(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	_, created, err := client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.False(t, created)
+	assert.Empty(t, queuedIDs(r.work), "byte-identical bytes write nothing, so nothing is owed")
+
+	_, _, err = client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
+}
+
+func TestClientCreateOrUpdateWakesTheKindOnUpdate(t *testing.T) {
+	// The watch floor is pushed past the test's own timeout, so a delivery here
+	// can only have come from the commit wake, never from the tailer's tick.
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithWatchFloorInterval(time.Minute))...)
+	require.NoError(t, Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	stream, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
+	recv(t, stream.Changes) // the Added from Create
+
+	_, created, err := client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "v2"})
+	require.NoError(t, err)
+	require.False(t, created)
+
+	evt := recv(t, stream.Changes)
+	assert.Equal(t, Modified, evt.Type)
+	assert.Equal(t, obj.ID, evt.Object.ID)
+	assert.Equal(t, "v2", evt.Object.Spec.Val)
+}
