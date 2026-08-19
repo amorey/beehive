@@ -3786,3 +3786,56 @@ func TestClientCreateOrUpdateRollsBackOnDecodeError(t *testing.T) {
 	_, err = store.Objects().GetByName(ctx, gk, "w1")
 	require.ErrorIs(t, err, ErrNotFound, "the insert must roll back with the decode")
 }
+
+func TestClientCreateOrUpdateHonoursOptsOnCreate(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+
+	calls := 0
+	child, created, err := client.CreateOrUpdate(ctx, "child-1", cSpec{Val: "child"},
+		WithOwner(owner.ID), WithOnCreate(func(context.Context) { calls++ }))
+	require.NoError(t, err)
+	require.True(t, created)
+	assert.Equal(t, 1, calls)
+
+	owned, err := client.ListOwned(ctx, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, owned, 1)
+	assert.Equal(t, child.ID, owned[0].ID)
+}
+
+// Opts are ignored on the update branch, as GetOrCreate ignores them on its
+// found branch: this verb writes the spec, never the ownership.
+func TestClientCreateOrUpdateIgnoresOptsOnUpdate(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner-1"})
+	second := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner-2"})
+
+	child, _, err := client.CreateOrUpdate(ctx, "child-1", cSpec{Val: "a"}, WithOwner(first.ID))
+	require.NoError(t, err)
+
+	calls := 0
+	_, created, err := client.CreateOrUpdate(ctx, "child-1", cSpec{Val: "b"},
+		WithOwner(second.ID), WithOnCreate(func(context.Context) { calls++ }))
+	require.NoError(t, err)
+	require.False(t, created)
+	assert.Zero(t, calls, "WithOnCreate must not fire for a row that was found")
+
+	// Asserted from the owner's end: nothing stops a child carrying two owner
+	// edges (the PK is from_id, to_id, relation), and GetOwner would still
+	// report the lower id, so a second edge is invisible from the child.
+	owned, err := client.ListOwned(ctx, second.ID)
+	require.NoError(t, err)
+	assert.Empty(t, owned, "the update branch must not re-parent")
+
+	owned, err = client.ListOwned(ctx, first.ID)
+	require.NoError(t, err)
+	require.Len(t, owned, 1)
+	assert.Equal(t, child.ID, owned[0].ID)
+}
