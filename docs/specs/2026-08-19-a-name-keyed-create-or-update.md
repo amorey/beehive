@@ -46,13 +46,17 @@ lines it saves, but making the correct ordering the only ordering.**
 CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 ```
 
-One `Within`: `resolveCreate` up front, then resolve by name and
+One `Within`: `resolveCreate` up front, then `UpdateSpecByName` and
 
-- absent → `insertObject` + `signalCreated`, `created=true`;
-- deletion-pending → `ErrDeletionPending`;
-- present → `UpdateSpec` on the resolved id, opts ignored.
+- it wrote → `created=false`, plus `signalSpecWritten` and `signalKindWritten`
+  gated on `changed`, exactly as `client.update` does;
+- `ErrNotFound` → `insertObject` + `signalCreated`, `created=true`;
+- `ErrDeletionPending` → returned.
 
-It introduces no store call and costs what the composition costs.
+Leading with `UpdateSpecByName` rather than resolving first keeps the common
+path to one row read, and it is already the atomic resolve-and-write the
+composition needs. It introduces no store call and costs what the composition
+costs.
 
 ### Not `Apply`
 
@@ -113,6 +117,19 @@ CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Ob
 - **The decode stays inside the transaction**, so a spec that does not round-trip
   rolls the write back and `created` is false. Same rule as `Create`.
 
+- **The update branch owes both wakes.** `signalCreated` fires them for a
+  create; the update branch must call `signalSpecWritten` and
+  `signalKindWritten` itself, gated on `changed`. Miss the gate and a
+  byte-identical write wakes the kind for nothing; miss the calls and a real one
+  reaches no watch tailer and no dependency waker.
+
+- **It repairs a poison spec, and `GetOrCreate` cannot.** The update branch
+  decodes the row `UpdateSpecByName` hands back, which carries the new bytes, so
+  a row whose stored spec no longer decodes comes back healthy. `GetOrCreate`'s
+  found branch decodes what it read and surfaces the error instead
+  (`client.go:457`). A poison *status* still fails, since neither verb writes
+  status.
+
 ## Tests
 
 In `client_test.go`:
@@ -128,6 +145,10 @@ In `client_test.go`:
 - A create that fails to decode rolls back and reports `created=false`.
 - Inside a caller's `Within` that later fails: nothing is committed and
   `WithOnCreate` never fires.
+- A changed update enqueues the object and wakes the kind; a byte-identical one
+  wakes nobody. Nothing else pins the update branch's signals.
+- A row whose stored spec no longer decodes is repaired by the update branch,
+  where `GetOrCreate` returns the decode error.
 
 ## On ship
 
