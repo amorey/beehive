@@ -180,6 +180,26 @@ func TestTriggerDrainsWhatTheFloorHeldWhenTheChannelCloses(t *testing.T) {
 	}
 }
 
+// Shutdown is not a resolution failure. The close arm can win the select
+// against a done ctx, and a cancel can land mid-drain, so without a guard every
+// address left would read context.Canceled and warn its way through the log.
+func TestTriggerDrainStopsOnACancelledContext(t *testing.T) {
+	r := newTriggerReconciler(t)
+	obj := triggerObject(t, r, "one")
+
+	logger, logs := captureLogger(slog.LevelWarn)
+	r.logger = logger
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	trig := &trigger{r: r, ids: make(chan ObjectID)}
+	trig.drain(ctx, map[addr]struct{}{{id: obj.ID}: {}})
+
+	assert.Empty(t, logs.String(), "a cancelled context is not a failed read")
+	_, ok := r.work.get()
+	assert.False(t, ok, "a drain past the cancel queues nothing")
+}
+
 // A failed read says so and drops the poke: a retry ladder here would compete
 // with the kind's own cadence, which is the correctness behind every poke.
 func TestTriggerLogsAFailedReadAndKeepsServing(t *testing.T) {

@@ -91,18 +91,23 @@ func (t *trigger) run(ctx context.Context) {
 		timer.Stop()
 		armed = false
 		t.drain(ctx, pending)
+		// A fresh set rather than clear: a burst's buckets would otherwise be
+		// held for the life of the feed.
+		pending = make(map[addr]struct{})
 	}
 }
 
-// drain resolves everything accumulated since the last one and empties the set.
-// The close arms above call it past the floor deliberately: the floor paces a
-// stream of pokes, and this is the last one. A cancelled ctx gets no such drain
-// — the reads would fail on it anyway.
+// drain resolves everything accumulated since the last one. The close arms
+// above call it past the floor deliberately: the floor paces a stream of pokes,
+// and this is the last one. A ctx already done ends it instead — the reads
+// would fail on it, and shutdown is not a resolution failure to warn about.
 func (t *trigger) drain(ctx context.Context, pending map[addr]struct{}) {
 	for a := range pending {
+		if ctx.Err() != nil {
+			return
+		}
 		t.poke(ctx, a)
 	}
-	clear(pending)
 }
 
 // poke resolves a within the kind and queues what it found. An address that
