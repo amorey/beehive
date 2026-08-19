@@ -3919,3 +3919,32 @@ func TestClientCreateOrUpdateWritesNothingForIdenticalBytes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, before, after, "an identical spec must append nothing")
 }
+
+// The one behavioural difference from GetOrCreate: the update branch decodes
+// the row the write hands back, which carries the new bytes, so a row whose
+// stored spec no longer decodes comes back healthy. GetOrCreate's found branch
+// decodes what it read and surfaces the error instead.
+func TestClientCreateOrUpdateRepairsAPoisonSpec(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
+		Name: "w1",
+		Spec: []byte(`"not-an-object"`),
+	})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, _, err = client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.Error(t, err, "GetOrCreate decodes what it read, so the poison surfaces")
+
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, "a", obj.Spec.Val)
+
+	got, err := client.GetByName(ctx, "w1")
+	require.NoError(t, err, "the stored bytes decode now")
+	assert.Equal(t, "a", got.Spec.Val)
+}
