@@ -1566,3 +1566,25 @@ func TestPassClientGatesEveryMethod(t *testing.T) {
 		})
 	}
 }
+
+// A status write the store declined to make bumps no resource_version, so waking
+// the kind's tailers and the dependency waker for it is work with nothing behind
+// it. AdminClient is the way in: it holds no baseline, so both calls reach the
+// store and the second is a store-side no-op.
+func TestUpdateStatusNoOpWakesNothing(t *testing.T) {
+	ctx, _, admin, obj := newAdminClientFixture(t)
+
+	require.NoError(t, admin.UpdateStatus(ctx, obj.ID, tcStatus{Server: tcServerStatus{UID: "server-1"}}))
+
+	rx, _ := admin.bh.kindWriteHub.Watch(tcGK)
+	defer rx.Close()
+
+	require.NoError(t, admin.UpdateStatus(ctx, obj.ID, tcStatus{Server: tcServerStatus{UID: "server-1"}}))
+	_, err := rx.TryRecv()
+	assert.Error(t, err, "identical bytes wrote nothing, so nothing should be woken")
+
+	require.NoError(t, admin.UpdateStatus(ctx, obj.ID, tcStatus{Server: tcServerStatus{UID: "server-2"}}))
+	ev, err := rx.RecvContext(ctx)
+	require.NoError(t, err, "a real status change still wakes")
+	assert.Equal(t, tcGK, ev.Key)
+}
