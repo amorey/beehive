@@ -215,11 +215,21 @@ type Client[Spec, Status any] interface {
 	// "already in the desired state"). A spec whose bytes match what is stored
 	// writes nothing at all, so a controller re-applying its own spec does not
 	// wake itself forever. The write half of a read-modify-write.
+	//
+	// A row whose deletion has been requested is refused with
+	// ErrDeletionPending, not written: a pass on a deleting row runs collection,
+	// so the spec would be discarded. That is distinct from ErrNotFound, because
+	// the answers differ — absent means create it, pending means you cannot,
+	// since the name stays held until GC releases it. A caller whose object is
+	// owned can do nothing and wait: a physical delete pushes its owner, so the
+	// owner's next pass creates the replacement. Left unhandled inside a
+	// Reconcile the sentinel surfaces as a failure and enters the retry ladder,
+	// against a condition that clears on GC's schedule and not on retrying.
 	Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
 	// UpdateByName is Update keyed by name: it writes whatever holds name now,
 	// resolving and writing in one transaction. Not for a read-modify-write —
 	// a collect-and-recreate between the read and the write would land it on a
-	// different incarnation; use Update.
+	// different incarnation; use Update. Same ErrDeletionPending refusal.
 	UpdateByName(ctx context.Context, name string, spec Spec) (*Object[Spec, Status], error)
 	// Watch returns one object's current state plus a stream of the changes
 	// above it: Added/Modified/Deleted until ctx is cancelled. Kind-scoped, and
