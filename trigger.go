@@ -14,6 +14,8 @@
 
 package beehive
 
+import "context"
+
 // trigger is one feed declared by WithTriggerByID or WithTriggerByName: a
 // channel of addresses the app resolves within the kind and requeues. Exactly
 // one of the two channels is set, and which one also selects the resolution.
@@ -21,4 +23,51 @@ type trigger struct {
 	r     *reconciler
 	ids   <-chan ObjectID
 	names <-chan string
+}
+
+// addr is one address received on a trigger channel: an id, or a name when the
+// feed is name-keyed.
+type addr struct {
+	id   ObjectID
+	name string
+}
+
+// run services the feed until ctx ends or the app closes the channel. A nil
+// channel blocks forever, which is what leaves the unused half of the select
+// silent.
+func (t *trigger) run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case id, ok := <-t.ids:
+			if !ok {
+				return
+			}
+			t.poke(ctx, addr{id: id})
+		case name, ok := <-t.names:
+			if !ok {
+				return
+			}
+			t.poke(ctx, addr{name: name})
+		}
+	}
+}
+
+// poke resolves a within the kind and queues what it found.
+func (t *trigger) poke(ctx context.Context, a addr) {
+	obj, err := t.resolve(ctx, a)
+	if err != nil {
+		return
+	}
+	t.r.requeueNow(obj.ID)
+}
+
+// resolve reads existence and kind, and nothing else: a trigger never looks at
+// an object's conditions.
+func (t *trigger) resolve(ctx context.Context, a addr) (*RawObject, error) {
+	if t.names != nil {
+		return t.r.store.Objects().GetMetaByName(ctx, t.r.gk, a.name)
+	}
+	return t.r.store.Objects().GetMeta(ctx, a.id)
 }
