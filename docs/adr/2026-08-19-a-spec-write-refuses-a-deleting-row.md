@@ -46,10 +46,9 @@ it is what produced the reported bug.
 
 The ordering and the no-append are stated on the `Objects` interface, not only in
 `sqlite`. `Store` is a public extension point, so a guarantee held by one
-implementation is not a guarantee; and [the
-probe](../specs/2026-08-19-a-spec-write-probes-before-it-transacts.md) answers
-this check ahead of the transaction, which is sound only if it is also the
-transaction's leading check.
+implementation is not a guarantee — and the order is observable: it decides which
+sentinel a deleting row at a stale schema version answers with, and whether a
+byte-identical write to a deleting row is refused or quietly succeeds.
 
 ## Consequences
 
