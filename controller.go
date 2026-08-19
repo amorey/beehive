@@ -81,8 +81,10 @@ type ControllerClient[Status any] interface {
 	// stamping as SetCondition.
 	SetConditions(ctx context.Context, conditions []Condition) error
 	// UpdateStatus records status and nothing else — the handshake is beehive's,
-	// recorded by returning Settled. Status that marshals to the stored bytes
-	// writes nothing, so a controller can report on every poll.
+	// recorded by returning Settled. Status that marshals to the bytes this pass
+	// was loaded with writes nothing and reaches no store, so a controller can
+	// report on every poll. That skip reads nothing, so it cannot report an
+	// object collected mid-pass: it returns nil where a write returns ErrNotFound.
 	UpdateStatus(ctx context.Context, status Status) error
 	// Within runs fn inside a single transaction: writes made with fn's ctx all
 	// commit together or roll back on error. Pass fn's ctx to every store call

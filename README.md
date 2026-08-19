@@ -739,7 +739,9 @@ reads that object alone; the ids above are the other end of an edge. There is no
 way to write a sibling of your own kind, which would race that object's own pass
 and settle nothing.
 
-`UpdateStatus` **does nothing when the status marshals to the bytes already stored**. There is no `resource_version` bump, so a watch and the dependency waker both find nothing — the same way re-applying an unchanged spec does nothing on the `Client` side. So report observed state unconditionally; you don't need your own equality check, and a dependent riding on this kind's status won't be woken by a pass that found nothing new.
+`UpdateStatus` **does nothing when the status marshals to the bytes already stored**, and costs no store call to find that out: the client already holds the status your object was loaded with, so the comparison happens in memory. There is no `resource_version` bump, so a watch and the dependency waker both find nothing — the same way re-applying an unchanged spec does nothing on the `Client` side. So report observed state unconditionally; you don't need your own equality check, and a dependent riding on this kind's status won't be woken by a pass that found nothing new.
+
+One consequence of skipping the store: an unchanged report cannot notice that your object was collected mid-pass, so it returns `nil` where a real write would have returned `ErrNotFound`.
 
 **The generation handshake is beehive's, not yours.** `UpdateStatus` writes status and nothing else; returning `Settled` records `ObservedGeneration`, written after `Reconcile` returns. A pass reporting only conditions — or nothing at all — settles like any other, with no argument to get wrong.
 

@@ -92,7 +92,9 @@ func (a *AdminClient[Status]) SetConditions(ctx context.Context, id ObjectID, co
 
 // UpdateStatus records status for id. See ControllerClient.UpdateStatus. Never
 // stamps observed_generation: the handshake stays beehive's, so an object given
-// a status here is still unsettled and the owed pass reconciles it.
+// a status here is still unsettled and the owed pass reconciles it. Holding no
+// pass, it holds no loaded status either, so every call reaches the store and
+// the no-op is the store's own — ErrNotFound included.
 func (a *AdminClient[Status]) UpdateStatus(ctx context.Context, id ObjectID, status Status) error {
 	return a.at(id).UpdateStatus(ctx, status)
 }
