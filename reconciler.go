@@ -284,7 +284,9 @@ func (r *reconciler) scheduleNext(id ObjectID, result ReconcileResult, gone bool
 		r.log().Debug("requeued unsettled", "id", id, "after", after)
 	default:
 		r.backoffClear(id)
-		if d := r.individualPassInterval; d > 0 {
+		// A collected object stays collected: forget just dropped its queue
+		// state, and an alarm here dispatches into ErrNotFound forever.
+		if d := r.individualPassInterval; d > 0 && !gone {
 			r.work.addAfter(id, r.jittered(d), alarmRequeueAfter)
 			r.log().Debug("requeued for the individual pass", "id", id, "after", d)
 		}

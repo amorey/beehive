@@ -4006,3 +4006,18 @@ func TestReconcilerNoIndividualPassArmsNothing(t *testing.T) {
 
 	assert.Nil(t, r.work.gauge.alarmFor(1))
 }
+
+// A collected object comes back Settled, which is the branch that arms. Arming
+// it would resurrect an id forget just dropped, into a dispatch that can only
+// read ErrNotFound.
+func TestReconcilerIndividualPassArmsNothingForACollectedObject(t *testing.T) {
+	r := &reconciler{
+		work:                   newWorkQueue(),
+		individualPassInterval: time.Minute,
+		backoffFor:             make(map[ObjectID]time.Duration),
+	}
+
+	r.scheduleNext(1, Settled(), true)
+
+	assert.Nil(t, r.work.gauge.alarmFor(1))
+}
