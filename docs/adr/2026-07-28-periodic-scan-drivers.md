@@ -67,6 +67,11 @@ reasons. See
 | Client watch | the kind's write log, above one shared cursor | `withWatchFloorInterval` (global, unexported), plus a commit wake | 30s |
 | Event watch | one object's event log, diffed against last reported | `withWatchPollInterval` (global, unexported) | 1s |
 
+A trigger channel (`WithTriggerByID`, `WithTriggerByName`) is deliberately absent:
+it scans nothing, has no cadence, and carries an address handed in from outside the
+process rather than one a write recorded. It is not a driver. See
+[its ADR](2026-08-19-a-trigger-channel-requeues-by-id-or-name.md).
+
 They are separate cadences because they are separate jobs with sharply different
 cost curves, and one interval governing several would mean tuning any of them moves
 the rest. They share two loop shapes in `internal/driver`: `driver.Run` (one cadence with

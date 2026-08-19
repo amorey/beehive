@@ -20,9 +20,11 @@ demo with every tick minutes away. `cascade` alone sets `WithGCInterval`, since
 collection is what it demonstrates, and `lowpower` sets every public cadence.
 Leave the production defaults alone otherwise.
 
-Latency here is a configured interval, not a push path. If a push path is ever
-added it belongs *above* this core; the
+Latency for anything *store-backed* is a configured interval, not a push path; the
 [drivers ADR](docs/adr/2026-07-28-periodic-scan-drivers.md) lists the constraints.
+A trigger channel is the one address handed in from outside, and it is not an
+exception to that rule: it carries no state and records nothing, so no driver is
+owed one.
 
 ## Commands
 
@@ -111,6 +113,23 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-06-the-waker-seeds-before-start-returns.md). Every reconcile trigger
   is mapped in [docs/reconcile-triggers.md](docs/reconcile-triggers.md) — update
   it when you add one.
+- **A trigger channel is an address handed in from outside, and nothing pulls
+  behind it** (`trigger.go`). `WithTriggerByID`/`WithTriggerByName` at `Register`
+  take a feed the app owns; each value is resolved within the kind — one
+  metadata-only read (`Objects().GetMeta`, `Objects().GetMetaByName`), **kind-scoped
+  because `GetForReconcile` takes a bare id** — and queued as `Client.Requeue`
+  would, ladder preserved. It is neither a push nor a pull: not a write, no
+  `AfterCommit`, and what it reports never entered the store, so a lost poke is
+  recovered by nothing but the kind's own cadence. **The receive never reads the
+  store**: addresses join a set and a floored drain (`internal/rategate`, 100ms,
+  eager when idle) resolves them, so a producer is never held up by the single
+  connection and a hot feed on one address costs one read per window. The floor
+  **coalesces rather than drops**, which every other read loop is free to do
+  because a driver sits behind it. Options accumulate, a channel serves one kind,
+  a nil channel is `ErrInvalidOption`, and beehive never closes one. Shutdown needed
+  no new phase — the workers exit on `runCtx` and `workQueue.stop` runs later still,
+  so a poke in that gap reaches a live queue with nothing left to dispatch it.
+  → [ADR](docs/adr/2026-08-19-a-trigger-channel-requeues-by-id-or-name.md)
 - **The individual pass is a per-object cadence with no tick behind it**
   (`WithIndividualPassInterval`, off by default). A settled pass that scheduled
   nothing arms the object's own next pass; a one-shot admission scan at `Start`
