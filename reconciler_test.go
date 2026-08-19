@@ -4021,3 +4021,42 @@ func TestReconcilerIndividualPassArmsNothingForACollectedObject(t *testing.T) {
 
 	assert.Nil(t, r.work.gauge.alarmFor(1))
 }
+
+// What the individual pass must not override. It is a default cadence, not a
+// ceiling: a controller that scheduled its own pass — sooner or later — keeps
+// it, and a failure keeps its ladder.
+func TestReconcilerIndividualPassYieldsToTheResult(t *testing.T) {
+	const d = time.Minute
+
+	tests := []struct {
+		name   string
+		result ReconcileResult
+		want   time.Duration
+		kind   alarmKind
+	}{
+		{"a sooner RequeueAfter wins", Settled().RequeueAfter(time.Second), time.Second, alarmRequeueAfter},
+		{"a later RequeueAfter wins too", Settled().RequeueAfter(time.Hour), time.Hour, alarmRequeueAfter},
+		{"a failure keeps its ladder", Fail(errors.New("boom")), 5 * time.Millisecond, alarmBackoff},
+		{"unsettled keeps the owed cadence", Unsettled(), defaultOwedPassInterval, alarmRequeueAfter},
+		{"settled with nothing owed takes the individual pass", Settled(), d, alarmRequeueAfter},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &reconciler{
+				work:                   newWorkQueue(),
+				individualPassInterval: d,
+				owedPassInterval:       defaultOwedPassInterval,
+				maxRetryInterval:       time.Second,
+				baseRetryInterval:      5 * time.Millisecond,
+				backoffFor:             make(map[ObjectID]time.Duration),
+			}
+
+			r.scheduleNext(1, tc.result, false)
+
+			a := r.work.gauge.alarmFor(1)
+			require.NotNil(t, a)
+			assert.Equal(t, tc.kind, a.kind)
+			assert.InDelta(t, tc.want, time.Until(a.fireAt), float64(time.Second))
+		})
+	}
+}
