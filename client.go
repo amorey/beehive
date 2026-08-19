@@ -121,6 +121,18 @@ type Client[Spec, Status any] interface {
 	// when "already there" is acceptable. The new object is unsettled and owed
 	// its first reconcile.
 	Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
+	// CreateOrUpdate makes whatever holds name hold spec, creating it if
+	// absent; created says which. The resolve and the write are one
+	// transaction.
+	//
+	// opts are honoured on create and IGNORED on update, as in GetOrCreate: a
+	// created=false result says nothing about whether the row matches opts. A
+	// deletion-pending row is refused with ErrDeletionPending rather than
+	// rewritten, and its name stays held until GC releases it.
+	//
+	// Like GetOrCreate's, created is synchronous inside a caller's Within —
+	// route create-conditional side effects through WithOnCreate.
+	CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 	// Delete soft-deletes id by setting DeletionRequestedAt. A registered kind
 	// reaches its controller at commit; a client-only kind waits for the GC
 	// sweeper, which takes every deletion from there either way. Returns
@@ -316,20 +328,8 @@ func (c *clientImpl[Spec, Status]) Create(ctx context.Context, name string, spec
 	// Within keeps the insert and its owner ref atomic, so a crash between them
 	// can't leave an ownerless child GC would never collect.
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, err := c.insertObject(ctx, name, b, co)
-		if err != nil {
-			return err
-		}
-		// Decode inside the transaction so a row whose bytes don't round-trip
-		// never commits: the error rolls back the insert and its buffered wake.
-		// decode is pure over the in-memory raw, and the migrator never runs on
-		// a create, so the only failure here is an asymmetric caller codec.
-		obj, err = c.decode(raw)
-		if err != nil {
-			return err
-		}
-		c.signalCreated(ctx, raw, co)
-		return nil
+		obj, err = c.createLocked(ctx, name, b, co)
+		return err
 	})
 	if err != nil {
 		return nil, err
@@ -367,6 +367,25 @@ func (c *clientImpl[Spec, Status]) checkFinalizersClearable(co *createOptions) e
 	return fmt.Errorf("%w: WithFinalizers needs a controller registered for %s/%s in this process to clear them; "+
 		"a finalizer no controller here can remove would leave the row deletion-pending forever",
 		ErrInvalidOption, c.gk.Group, c.gk.Kind)
+}
+
+// createLocked is the create tail every create path shares: insert, then decode
+// before anything is signalled. Must run inside a Within — the decode is what
+// keeps a row whose bytes don't round-trip from committing, and it rolls back
+// the insert and its buffered wake with it. decode is pure over the in-memory
+// raw and the migrator never runs on a create, so the only failure here is an
+// asymmetric caller codec.
+func (c *clientImpl[Spec, Status]) createLocked(ctx context.Context, name string, b []byte, co *createOptions) (*Object[Spec, Status], error) {
+	raw, err := c.insertObject(ctx, name, b, co)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := c.decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	c.signalCreated(ctx, raw, co)
+	return obj, nil
 }
 
 // insertObject inserts one new row and wires its owner edge; every create path
@@ -408,7 +427,6 @@ func (c *clientImpl[Spec, Status]) signalCreated(ctx context.Context, raw *RawOb
 	}
 	// A create always changes the object: there was nothing before it.
 	c.signalSpecWritten(ctx, raw.ID)
-	c.bh.signalKindWritten(ctx, c.gk)
 }
 
 // signalSpecWritten enqueues id's own reconcile once the write that changed its
@@ -429,6 +447,9 @@ func (c *clientImpl[Spec, Status]) signalSpecWritten(ctx context.Context, id Obj
 	// Not throttled: a spec write carries new information. The changed gate is
 	// what stops a controller re-applying its own spec from riding this forever.
 	c.bh.signalRequeueNow(ctx, ObjectRef{ID: id, Group: c.gk.Group, Kind: c.gk.Kind})
+	// Paired here, not at the call sites: a spec write that woke its own object
+	// but no tailer would be silently half-signalled.
+	c.bh.signalKindWritten(ctx, c.gk)
 }
 
 // GetOrCreate returns the row holding name, creating it only when absent. The
@@ -460,20 +481,54 @@ func (c *clientImpl[Spec, Status]) GetOrCreate(ctx context.Context, name string,
 		if !errors.Is(err, ErrNotFound) {
 			return err
 		}
-		raw, err := c.insertObject(ctx, name, b, co)
-		if err != nil {
-			return err
-		}
-		// Decode inside the transaction (see Create); created is set only after
-		// it succeeds, so a rolled-back create reports created=false.
-		obj, err = c.decode(raw)
-		if err != nil {
+		// created is set only after the decode succeeds, so a rolled-back create
+		// reports created=false.
+		if obj, err = c.createLocked(ctx, name, b, co); err != nil {
 			return err
 		}
 		created = true
-		// Wake and WithOnCreate fire only for a row we just made; returning an
-		// existing object is a pure read.
-		c.signalCreated(ctx, raw, co)
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return obj, created, nil
+}
+
+// CreateOrUpdate leads with the spec write and falls back to an insert. See the
+// Client interface for the contract.
+func (c *clientImpl[Spec, Status]) CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error) {
+	if err := checkName(name); err != nil {
+		return nil, false, err
+	}
+	b, err := json.Marshal(spec)
+	if err != nil {
+		return nil, false, err
+	}
+	co, err := c.resolveCreate(opts)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var obj *Object[Spec, Status]
+	var created bool
+	// One Within over both branches: split them and a concurrent create lands
+	// between, leaving this caller's spec unapplied.
+	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
+		raw, changed, err := c.bh.store.Objects().UpdateSpecByName(ctx, c.gk, name, b, c.specVersion())
+		if err == nil {
+			obj, err = c.writeSpecLocked(ctx, raw, changed)
+			return err
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		// created is set only after the decode succeeds, so a rolled-back
+		// create reports created=false.
+		if obj, err = c.createLocked(ctx, name, b, co); err != nil {
+			return err
+		}
+		created = true
 		return nil
 	})
 	if err != nil {
@@ -516,23 +571,36 @@ func (c *clientImpl[Spec, Status]) update(
 	}
 	var obj *Object[Spec, Status]
 	err = c.bh.store.Within(ctx, func(ctx context.Context) error {
-		raw, changed, err := write(ctx, b, migratorSpecVersion(c.bh.migratorFor(c.gk)))
+		raw, changed, err := write(ctx, b, c.specVersion())
 		if err != nil {
 			return err
 		}
-		if obj, err = c.decode(raw); err != nil {
-			return err
-		}
-		if changed {
-			c.signalSpecWritten(ctx, raw.ID)
-			c.bh.signalKindWritten(ctx, c.gk)
-		}
-		return nil
+		obj, err = c.writeSpecLocked(ctx, raw, changed)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	return obj, nil
+}
+
+// writeSpecLocked is the spec-write tail both spec writers share: decode inside
+// the transaction, then wake only for a write the store actually made. Must run
+// inside the write's own Within.
+func (c *clientImpl[Spec, Status]) writeSpecLocked(ctx context.Context, raw *RawObject, changed bool) (*Object[Spec, Status], error) {
+	obj, err := c.decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	if changed {
+		c.signalSpecWritten(ctx, raw.ID)
+	}
+	return obj, nil
+}
+
+// specVersion is this kind's spec schema version, stamped on every spec write.
+func (c *clientImpl[Spec, Status]) specVersion() int {
+	return migratorSpecVersion(c.bh.migratorFor(c.gk))
 }
 
 func (c *clientImpl[Spec, Status]) Get(ctx context.Context, id ObjectID, loads ...LoadOption) (*Object[Spec, Status], error) {

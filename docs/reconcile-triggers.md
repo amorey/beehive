@@ -243,8 +243,8 @@ owed pass covers that case.
 
 ### 1. Create
 
-`Create` and `GetOrCreate` insert the row with `generation` 1 and
-`observed_generation` NULL, in `sqliteStore.objectsCreate`.
+`Create`, `GetOrCreate` and `CreateOrUpdate`'s create branch insert the row with
+`generation` 1 and `observed_generation` NULL, in `sqliteStore.objectsCreate`.
 
 Tests: `TestIntegrationCreateTriggersReconcile`,
 `TestClientGetOrCreateOwesAPassOnlyOnCreate`, `TestCreateEnqueuesItsFirstReconcile`.
@@ -687,8 +687,8 @@ Tests: `TestDependenciesDeletePushesTheBlockedTarget`,
 
 ### 12. A create under a deleting owner
 
-`Create` and `GetOrCreate` write the `owned_by` edge inside the insert's
-transaction, and `Edges().Add` reports whether the owner was deletion-pending when it
+`Create`, `GetOrCreate` and `CreateOrUpdate`'s create branch write the `owned_by`
+edge inside the insert's transaction, and `Edges().Add` reports whether the owner was deletion-pending when it
 landed. If it was, its cascade may already have run past this child — and nothing
 else would find it: an edge bumps no `resource_version`, the waker reads only
 `depends_on`, and the child's own collect returns at once because the child is not

@@ -343,6 +343,11 @@ func TestClientRejectsEmptyName(t *testing.T) {
 		_, err := client.UpdateByName(ctx, "", cSpec{Val: "a"})
 		require.ErrorIs(t, err, ErrInvalidName)
 	})
+	t.Run("CreateOrUpdate", func(t *testing.T) {
+		_, created, err := client.CreateOrUpdate(ctx, "", cSpec{Val: "a"})
+		require.ErrorIs(t, err, ErrInvalidName)
+		assert.False(t, created)
+	})
 	t.Run("Get", func(t *testing.T) {
 		// Not ErrNotFound: that would send the caller hunting for a missing row
 		// when what is missing is a config value.
@@ -369,6 +374,9 @@ func TestClientRejectsEmptyNameBeforeAnyStoreWork(t *testing.T) {
 	bad := NewClient[errMarshaler, cStatus](bh, clientTestGK)
 	_, err := bad.Create(ctx, "", errMarshaler{})
 	require.ErrorIs(t, err, ErrInvalidName)
+	_, created, err := bad.CreateOrUpdate(ctx, "", errMarshaler{})
+	require.ErrorIs(t, err, ErrInvalidName)
+	assert.False(t, created)
 
 	after, err := client.List(ctx)
 	require.NoError(t, err)
@@ -826,6 +834,10 @@ func TestClientWithOnCreateFiresOnlyAfterOuterCommit(t *testing.T) {
 		}},
 		{"GetOrCreate", func(ctx context.Context, c Client[cSpec, cStatus], onCreate Option) error {
 			_, _, err := c.GetOrCreate(ctx, "new", cSpec{Val: "b"}, onCreate)
+			return err
+		}},
+		{"CreateOrUpdate", func(ctx context.Context, c Client[cSpec, cStatus], onCreate Option) error {
+			_, _, err := c.CreateOrUpdate(ctx, "upserted", cSpec{Val: "b"}, onCreate)
 			return err
 		}},
 	}
@@ -3688,3 +3700,300 @@ func TestSendOrDoneReportsACancelledSend(t *testing.T) {
 // Every one of them runs with the poll turned off, so a value a test observes is
 // provably the hub's. Without that they would pass on the poll alone and say
 // nothing about push.
+
+func TestClientCreateOrUpdateCreates(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.NotZero(t, obj.ID)
+	assert.Equal(t, "w1", obj.Name)
+	assert.Equal(t, int64(1), obj.Generation)
+	assert.Equal(t, "a", obj.Spec.Val)
+
+	got, err := client.GetByName(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, obj.ID, got.ID)
+}
+
+// The difference from GetOrCreate, which returns a found row untouched.
+func TestClientCreateOrUpdateUpdatesExisting(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first, _, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+
+	second, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first.ID, second.ID)
+	assert.Equal(t, "b", second.Spec.Val)
+	assert.Equal(t, first.Generation+1, second.Generation)
+}
+
+// The update branch owes the same two wakes client.update sends, on the same
+// changed gate: without them a real spec write reaches no watch tailer and no
+// dependency waker.
+func TestClientCreateOrUpdateEnqueuesOnlyAChangedUpdate(t *testing.T) {
+	ctx := context.Background()
+	_, client, cc, r := specWriteFixture(t)
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "a"})
+	settle(t, ctx, cc, r, obj)
+
+	before, err := cc.bh.store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+
+	same, created, err := client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "a"})
+	require.NoError(t, err)
+	require.False(t, created)
+	assert.Empty(t, queuedIDs(r.work), "byte-identical bytes write nothing, so nothing is owed")
+	assert.Equal(t, obj.Generation, same.Generation)
+
+	after, err := cc.bh.store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "an identical spec must append nothing")
+
+	_, _, err = client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "b"})
+	require.NoError(t, err)
+	assert.Equal(t, []ObjectID{obj.ID}, queuedIDs(r.work))
+}
+
+func TestClientCreateOrUpdateWakesTheKindOnUpdate(t *testing.T) {
+	// The watch floor is pushed past the test's own timeout, so a delivery here
+	// can only have come from the commit wake, never from the tailer's tick.
+	bh := newTestBeehive(t, newClientTestStore(t), fast(WithWatchFloorInterval(time.Minute))...)
+	require.NoError(t, Register(bh, clientTestGK, &noopController[cSpec, cStatus]{}))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	stream, err := client.WatchList(ctx)
+	require.NoError(t, err)
+
+	obj := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "v1"})
+	recv(t, stream.Changes) // the Added from Create
+
+	_, created, err := client.CreateOrUpdate(ctx, obj.Name, cSpec{Val: "v2"})
+	require.NoError(t, err)
+	require.False(t, created)
+
+	evt := recv(t, stream.Changes)
+	assert.Equal(t, Modified, evt.Type)
+	assert.Equal(t, obj.ID, evt.Object.ID)
+	assert.Equal(t, "v2", evt.Object.Spec.Val)
+}
+
+// Both branches share one transaction, which is the verb's reason to exist.
+// The absent-row assertion is what pins it: hoist the insert into a transaction
+// of its own and it commits before the decode fails, leaving the row behind.
+func TestClientCreateOrUpdateRollsBackOnDecodeError(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	gk := GroupKind{Kind: "BadDecode"}
+	client := NewClient[badDecodeSpec, cStatus](bh, gk)
+
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", badDecodeSpec{Val: "a"})
+	require.Error(t, err, "the new row's bytes must fail to decode")
+	assert.Nil(t, obj)
+	assert.False(t, created, "a rolled-back create must report created=false")
+
+	_, err = store.Objects().GetByName(ctx, gk, "w1")
+	require.ErrorIs(t, err, ErrNotFound, "the insert must roll back with the decode")
+}
+
+func TestClientCreateOrUpdateHonoursOptsOnCreate(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	owner := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner"})
+
+	calls := 0
+	child, created, err := client.CreateOrUpdate(ctx, "child-1", cSpec{Val: "child"},
+		WithOwner(owner.ID), WithOnCreate(func(context.Context) { calls++ }))
+	require.NoError(t, err)
+	require.True(t, created)
+	assert.Equal(t, 1, calls)
+
+	owned, err := client.ListOwned(ctx, owner.ID)
+	require.NoError(t, err)
+	require.Len(t, owned, 1)
+	assert.Equal(t, child.ID, owned[0].ID)
+}
+
+// Opts are ignored on the update branch, as GetOrCreate ignores them on its
+// found branch: this verb writes the spec, never the ownership.
+func TestClientCreateOrUpdateIgnoresOptsOnUpdate(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	first := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner-1"})
+	second := mustCreate(t, ctx, client, uniqueName(), cSpec{Val: "owner-2"})
+
+	child, _, err := client.CreateOrUpdate(ctx, "child-1", cSpec{Val: "a"}, WithOwner(first.ID))
+	require.NoError(t, err)
+
+	calls := 0
+	_, created, err := client.CreateOrUpdate(ctx, "child-1", cSpec{Val: "b"},
+		WithOwner(second.ID), WithOnCreate(func(context.Context) { calls++ }))
+	require.NoError(t, err)
+	require.False(t, created)
+	assert.Zero(t, calls, "WithOnCreate must not fire for a row that was found")
+
+	// Asserted from the owner's end: nothing stops a child carrying two owner
+	// edges (the PK is from_id, to_id, relation), and GetOwner would still
+	// report the lower id, so a second edge is invisible from the child.
+	owned, err := client.ListOwned(ctx, second.ID)
+	require.NoError(t, err)
+	assert.Empty(t, owned, "the update branch must not re-parent")
+
+	owned, err = client.ListOwned(ctx, first.ID)
+	require.NoError(t, err)
+	require.Len(t, owned, 1)
+	assert.Equal(t, child.ID, owned[0].ID)
+}
+
+// Inherited from the spec write's refusal: a deleting row still holds its name,
+// so there is nothing to create and nothing that may be written.
+func TestClientCreateOrUpdateRefusesADeletingRow(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	registerNoop[cSpec, cStatus](t, bh, clientTestGK) // WithFinalizers below needs it
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	orig := mustCreate(t, ctx, client, "w1", cSpec{Val: "a"}, WithFinalizers("test/hold"))
+	require.NoError(t, client.Delete(ctx, orig.ID))
+
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "b"})
+	require.ErrorIs(t, err, ErrDeletionPending)
+	assert.Nil(t, obj)
+	assert.False(t, created, "the name is held, so nothing was created")
+
+	// The spec is untouched and the row is still the original incarnation.
+	got, err := client.GetByName(ctx, "w1")
+	require.NoError(t, err)
+	assert.Equal(t, orig.ID, got.ID)
+	assert.Equal(t, "a", got.Spec.Val)
+}
+
+// The resolve is kind-scoped, so another kind holding the name is not found and
+// this creates its own row under the same name.
+func TestClientCreateOrUpdateIsKindScoped(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	other := NewClient[cSpec, cStatus](bh, GroupKind{Kind: "Other"})
+	theirs := mustCreate(t, ctx, other, "shared", cSpec{Val: "theirs"})
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	mine, created, err := client.CreateOrUpdate(ctx, "shared", cSpec{Val: "mine"})
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.NotEqual(t, theirs.ID, mine.ID)
+
+	untouched, err := other.GetByName(ctx, "shared")
+	require.NoError(t, err)
+	assert.Equal(t, "theirs", untouched.Spec.Val)
+}
+
+// The one behavioural difference from GetOrCreate: the update branch decodes
+// the row the write hands back, which carries the new bytes, so a row whose
+// stored spec no longer decodes comes back healthy. GetOrCreate's found branch
+// decodes what it read and surfaces the error instead.
+func TestClientCreateOrUpdateRepairsAPoisonSpec(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+
+	_, err := store.Objects().Create(ctx, clientTestGK, ObjectsCreateInput{
+		Name: "w1",
+		Spec: []byte(`"not-an-object"`),
+	})
+	require.NoError(t, err)
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, _, err = client.GetOrCreate(ctx, "w1", cSpec{Val: "a"})
+	require.Error(t, err, "GetOrCreate decodes what it read, so the poison surfaces")
+
+	obj, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, "a", obj.Spec.Val)
+
+	got, err := client.GetByName(ctx, "w1")
+	require.NoError(t, err, "the stored bytes decode now")
+	assert.Equal(t, "a", got.Spec.Val)
+}
+
+func TestClientCreateOrUpdateMarshalError(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[errMarshaler, cStatus](bh, clientTestGK)
+	_, created, err := client.CreateOrUpdate(ctx, "w1", errMarshaler{})
+	require.Error(t, err)
+	assert.False(t, created)
+}
+
+// Options are validated up front, so the same call fails whether or not the row
+// exists — the eager-validation rule GetOrCreate documents.
+func TestClientCreateOrUpdateRejectsFinalizersOnUnregisteredKind(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+
+	_, created, err := client.CreateOrUpdate(ctx, "w1", cSpec{Val: "a"}, WithFinalizers("cleanup"))
+	require.ErrorIs(t, err, ErrInvalidOption)
+	assert.False(t, created)
+
+	mustCreate(t, ctx, client, "w2", cSpec{Val: "a"})
+	_, created, err = client.CreateOrUpdate(ctx, "w2", cSpec{Val: "b"}, WithFinalizers("cleanup"))
+	require.ErrorIs(t, err, ErrInvalidOption, "the found branch validates too")
+	assert.False(t, created)
+}
+
+func TestClientCreateOrUpdateOwnerRefError(t *testing.T) {
+	ctx := context.Background()
+	bh := newTestBeehive(t, newClientTestStore(t))
+
+	client := NewClient[cSpec, cStatus](bh, clientTestGK)
+	_, created, err := client.CreateOrUpdate(ctx, "orphan", cSpec{Val: "child"}, WithOwner(9999))
+	require.Error(t, err)
+	assert.False(t, created)
+
+	objs, err := client.List(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, objs, "the half-made child rolls back with its ref")
+}
+
+// The update branch decodes what it wrote, so bytes that do not round-trip roll
+// the write back and leave the stored spec alone.
+func TestClientCreateOrUpdateRollsBackAnUndecodableUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	gk := GroupKind{Kind: "BadDecode"}
+
+	orig, err := store.Objects().Create(ctx, gk, ObjectsCreateInput{
+		Name: "w1",
+		Spec: []byte(`{"Val":"a"}`),
+	})
+	require.NoError(t, err)
+
+	client := NewClient[badDecodeSpec, cStatus](bh, gk)
+	_, created, err := client.CreateOrUpdate(ctx, "w1", badDecodeSpec{Val: "b"})
+	require.Error(t, err)
+	assert.False(t, created)
+
+	got, err := store.Objects().GetByName(ctx, gk, "w1")
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"Val":"a"}`, string(got.Spec), "the write must roll back")
+	assert.Equal(t, orig.Generation, got.Generation)
+}
