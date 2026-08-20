@@ -61,18 +61,18 @@ func TestVersionBlockCoversWhatFits(t *testing.T) {
 	t.Run("record carries the fallback's draw", func(t *testing.T) {
 		v := versions{next: 1, end: 1}
 		v.record(40)
-		v.publish()
+		v.settle()
 		assert.Equal(t, int64(40), v.latest())
 	})
 
-	t.Run("publish reports only what a commit took", func(t *testing.T) {
+	t.Run("settle reports only what a commit took", func(t *testing.T) {
 		v := versions{next: 1, end: 5}
-		v.publish()
+		v.settle()
 		assert.Equal(t, int64(0), v.latest(), "nothing has been handed out")
 
 		_, _ = v.take(2)
 		assert.Equal(t, int64(0), v.latest(), "drawn, not committed")
-		v.publish()
+		v.settle()
 		assert.Equal(t, int64(2), v.latest())
 	})
 }
@@ -153,9 +153,8 @@ func TestReconcileCursorStaysAtWhatWasHandedOut(t *testing.T) {
 	assert.Greater(t, after.ResourceVersion, load.Cursor)
 }
 
-// markForDeletion used to assign its version in SQL, from the counter row. With a
-// block reserved that row is the block's end, so the mark took a version outside
-// the block and a later write handed the same one out again.
+// A mark takes its version from the allocator, so the row and its write log entry
+// carry one value.
 func TestDeletionMarkTakesItsVersionFromTheBlock(t *testing.T) {
 	withBlockSize(t, 64)
 	ctx := context.Background()

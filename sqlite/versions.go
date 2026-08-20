@@ -16,9 +16,11 @@ package sqlite
 
 import "sync"
 
-// blockSize is how many resource versions one reservation covers. A var so tests
+// blockSize is how many resource versions one reservation covers. Above
+// markChunkSize by enough that a full deletion chunk usually fits: a chunk the
+// block cannot cover takes the fallback and burns the remainder. A var so tests
 // can shrink it; 0 or less turns blocks off and sends every draw to the table.
-var blockSize = 256
+var blockSize = 1024
 
 // versions hands out resource versions from a block reserved by a committed
 // write. Versions must be unique and increasing; they are not required to be
@@ -33,9 +35,9 @@ type versions struct {
 }
 
 // take hands out n versions, reporting the highest. ok is false when the block
-// cannot cover n, and the block is spent either way: the table already holds the
-// block's end, so a version left behind the caller's fallback would be handed out
-// below one the fallback returned.
+// cannot cover n, and a refused take spends the block: the counter already holds
+// the block's end, so anything left behind the caller's fallback would be handed
+// out below what the fallback returned.
 func (v *versions) take(n int) (int64, bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -49,19 +51,16 @@ func (v *versions) take(n int) (int64, bool) {
 
 // record takes the highest version a fallback draw returned, so publish and the
 // next block both continue above it.
-func (v *versions) record(hi int64) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.next, v.end = hi+1, hi+1
-}
+func (v *versions) record(hi int64) { v.reserve(hi, 0) }
 
-// publish marks everything handed out so far as committed. Called after the
-// outermost commit and before the refill, or it names a version out of the new
-// block that no write has taken.
-func (v *versions) publish() {
+// settle publishes everything handed out and reports whether a refill is owed.
+// One call, because publishing must precede the reservation: after it, next-1
+// names a version out of the new block that no write has taken.
+func (v *versions) settle() bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.published = v.next - 1
+	return v.next >= v.end
 }
 
 // latest is the highest version a committed write took. It lags a write by the
@@ -73,16 +72,9 @@ func (v *versions) latest() int64 {
 	return v.published
 }
 
-// reserve claims a block, using hi as the highest version the draw returned.
+// reserve claims the block a draw of n ending at hi covers.
 func (v *versions) reserve(hi int64, n int) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.next, v.end = hi-int64(n)+1, hi+1
-}
-
-// spent reports whether the block has nothing left, which is what asks for a refill.
-func (v *versions) spent() bool {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return v.next >= v.end
 }

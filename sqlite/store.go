@@ -579,10 +579,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	for _, hook := range hooks {
 		hook.fn()
 	}
-	// Publish before refilling, or published names a version out of the new block
-	// that no write has taken. Both need the commit above and the connection back.
-	s.versions.publish()
-	s.refillVersions(ctx)
+	s.settleVersions(ctx)
 	return nil
 }
 
@@ -652,20 +649,39 @@ func drawResourceVersions(ctx context.Context, c dbtx, n int) (int64, error) {
 	return rv, err
 }
 
-// refillVersions reserves the next block. It must run where no transaction is
-// open: a reservation that rolls back leaves the allocator handing out versions
-// the counter no longer covers.
-func (s *sqliteStore) refillVersions(ctx context.Context) {
-	if blockSize <= 0 || !s.versions.spent() {
+// settleVersions publishes what the transaction took and reserves the next block.
+// It must run where no transaction is open: a reservation that rolls back leaves
+// the allocator handing out versions the counter no longer covers.
+//
+// The draw is outside the allocator's lock. It waits for the writer connection,
+// which a sibling transaction may hold while itself waiting to take a version.
+func (s *sqliteStore) settleVersions(ctx context.Context) {
+	if !s.versions.settle() || blockSize <= 0 {
 		return
 	}
-	hi, err := drawResourceVersions(ctx, s.db, blockSize)
+	// Detached from the caller's deadline: a cancelled refill leaves the block
+	// spent, putting every later write back on the fallback draw.
+	hi, err := drawResourceVersions(context.WithoutCancel(ctx), s.db, blockSize)
 	if err != nil {
 		// Swallowed: the commit already landed, so this cannot be reported. The
 		// block stays spent and the next draw raises it where a caller can act.
 		return
 	}
 	s.versions.reserve(hi, blockSize)
+}
+
+// seedVersions puts the allocator above every version the previous process used.
+// The reservation doubles as the read: the draw reports the block's end, and what
+// sits below it is where that process left the counter.
+func (s *sqliteStore) seedVersions(ctx context.Context) error {
+	n := max(blockSize, 0)
+	hi, err := drawResourceVersions(ctx, s.db, n)
+	if err != nil {
+		return err
+	}
+	s.versions.reserve(hi, n)
+	s.versions.settle()
+	return nil
 }
 
 // scanWritten scans a mutator's RETURNING row and attaches its conditions,
@@ -1097,8 +1113,7 @@ func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind)
 }
 
 // GetLatestResourceVersion reports the highest version a committed write took
-// (contract on storeapi.Store). From the allocator, not the counter row: the row
-// holds the reservation's end, and a cursor above what was handed out strands
+// (contract on storeapi.Store). A cursor above what was handed out would strand
 // every write in the gap.
 func (s *sqliteStore) GetLatestResourceVersion(ctx context.Context) (int64, error) {
 	return s.versions.latest(), nil
@@ -2374,9 +2389,7 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 // disambiguates a zero-row result (guard, scope or missing).
 //
 // The version is drawn before the stamp, so a mark blocked by the guard burns one.
-// Gaps are free — every cursor compares `>` — and reading the value back out of
-// the counter row is not: with a block reserved that row holds the reservation's
-// end rather than what was handed out.
+// Gaps are free: every cursor compares `>`.
 func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (storeapi.ObjectID, bool, error) {
 	c := s.conn(ctx)
 	rv, err := s.nextResourceVersion(ctx, c)
