@@ -23,20 +23,22 @@ they have in common, not by the order they must land in; the dependencies each
 spec names are the real constraint.
 
 **Store mechanics.** No caches, no new invariants. Each is independent of the
-others; the dependencies a spec names are the only ordering that binds.
+others; the dependencies a spec names are the only ordering that binds. Ordered
+by measured value now that some of them have been measured — the read-only
+transaction moved down after a prototype priced it.
 
-1. [Cache prepared statements](2026-08-20-cache-prepared-statements.md) — ~2–6 µs
-   off every statement. Turns on one question: how a statement inside a
-   transaction becomes safe to cache.
-2. [A read-only transaction](2026-08-20-a-read-only-transaction.md) — grouped
-   reads move to the reader, where `IMMEDIATE` cannot work. This is what wins
-   the watch path; the read pool alone left it flat.
-3. [Reserve resource versions in blocks](2026-08-20-reserve-resource-versions-in-blocks.md)
-   — ~16 µs off every write.
+1. [Reserve resource versions in blocks](2026-08-20-reserve-resource-versions-in-blocks.md)
+   — ~16 µs off every write, about 40% of a minimal one. No open questions.
+2. [A spec write writes before it reads](2026-08-20-a-spec-write-writes-before-it-reads.md)
+   — one statement instead of two whenever a spec write changes something.
+3. [Cache prepared statements](2026-08-20-cache-prepared-statements.md) — ~2–6 µs
+   off every statement, so the widest of these. Blocked on one question: how a
+   statement inside a transaction becomes safe to cache.
 4. [Conclude a pass in one transaction](2026-08-20-conclude-a-pass-in-one-transaction.md)
-   — proposed; changes three failure arguments.
-5. [A spec write writes before it reads](2026-08-20-a-spec-write-writes-before-it-reads.md)
-   — one statement instead of two on the changed path.
+   — proposed; ~20 µs a pass, and it changes three failure arguments.
+5. [A read-only transaction](2026-08-20-a-read-only-transaction.md) — proposed;
+   measured at 2–8% on watched writes and nothing on delivery latency, which is
+   floor-bound. Worth it for the shape and for unblocking 3, not for the number.
 
 **Idle drivers.** Six loops that query on a cadence whether or not anything
 changed. One shared mechanism, then five small gates.

@@ -1,11 +1,14 @@
 # A read-only transaction
 
-- **Status:** Planned, and measured — see *What it is worth*. The prototype it
-  was measured with is not kept; git holds it in this branch's history.
+- **Status:** Proposed, not decided. Measured twice — it is worth 2-8% on
+  writes that have a watch attached, and **nothing at all** on how fast a watch
+  delivers. See *What it is worth*, then decide whether that earns a place ahead
+  of the rest of the list. The prototype is not kept; git holds it.
 - **Date:** 2026-08-20
-- **Depends on:** the read pool, which shipped —
-  [ADR](../adr/2026-08-20-reads-get-their-own-connections.md). A grouped read belongs on that pool,
-  and it needs a transaction there to see one instant across its statements.
+- **Depends on:** the read pool, which shipped
+  ([ADR](../adr/2026-08-20-reads-get-their-own-connections.md)). A grouped read
+  belongs on that pool, and needs a transaction there to see one instant across
+  its statements.
 
 ## Why
 
@@ -35,6 +38,11 @@ already queues there.
 With the read pool it stops being merely wasteful. These five reads belong on the
 reader, and the reader is opened `query_only(true)`, which refuses a write lock —
 so `IMMEDIATE` there does not work at all. This is what lets those call sites move.
+
+`modernc.org/sqlite` gives us the deferred begin for free: `newTx` applies the
+DSN's `_txlock` only when `opts.ReadOnly` is false (`tx.go:22-25`). So
+`BeginTx(ctx, &sql.TxOptions{ReadOnly: true})` is a plain `BEGIN` with no DSN
+change.
 
 ## What it is worth, measured
 
@@ -69,10 +77,28 @@ what that regression was. And the light-watch rows still land 1–5% above
 pre-split, so it does not fully pay that back; only the 16-kind row, where
 sixteen tailers were contending, comes out clearly ahead.
 
-`modernc.org/sqlite` gives us the deferred begin for free: `newTx` applies the
-DSN's `_txlock` only when `opts.ReadOnly` is false (`tx.go:22-25`). So
-`BeginTx(ctx, &sql.TxOptions{ReadOnly: true})` is a plain `BEGIN` with no DSN
-change.
+### It does not make watches faster
+
+Both tables above are the *writer's* side: a tailer stops making writers wait.
+Delivery latency — commit to the watcher seeing it — is set by the tailer's scan
+floor and nothing else. Measured separately, 50 iterations, on disk:
+
+| throttle | kinds | before | + this |
+|---|---|---|---|
+| 100ms (default) | 1 | 98.9ms | 99.8ms |
+| 100ms (default) | 16 | 99.4ms | 99.8ms |
+| 0 | 1 | 0.33ms | 0.34ms |
+| 0 | 16 | 5.35ms | 3.90ms |
+
+At the default, sixteen concurrent tailers deliver as fast as one:
+`defaultWatchScanMinInterval` paces them long before the connection does, so
+there is no contention left here to remove.
+
+With the floor off there is — sixteen kinds cost sixteen times one, which is
+near-perfect serialisation on the writer. This change recovers about a quarter of
+that, and no more, because the read pool defaults to four connections and sixteen
+tailers still queue four at a time. Anyone who wants faster delivery should be
+looking at the floor, not at this.
 
 ## The change
 
@@ -126,6 +152,23 @@ needs nothing.
 read but the trim that follows is a write, in the same transaction. Moving the
 scan alone would split them across two connections and two snapshots, which is
 the one thing the grouping exists to prevent.
+
+## Is it worth building
+
+Against the rest of the list, this is the weakest measured case in its group:
+2-8% on watched writes, and nothing on delivery. What it also buys, and what
+may matter more:
+
+- It settles the export question that
+  [cache prepared statements](2026-08-20-cache-prepared-statements.md) turns on.
+- It is the right shape regardless. Four pure reads taking `BEGIN IMMEDIATE` on
+  the writer is wrong on its face, and stays wrong however little it costs
+  today — the cost grows with write pressure, where a read-pool read is flat.
+
+Neither is urgent. If the list is ranked by measured value this sits below
+[resource version blocks](2026-08-20-reserve-resource-versions-in-blocks.md) and
+[the spec write's read](2026-08-20-a-spec-write-writes-before-it-reads.md), and
+that is how the README now orders it.
 
 ## Exported, or not
 
