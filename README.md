@@ -630,7 +630,7 @@ for change := range list.Changes {
 if err := list.Err(); err != nil { /* the stream ended; see below */ }
 ```
 
-**Do not open a watch inside `Within`.** The read below happens on your goroutine and takes the writer, which your transaction is holding — so it waits, and the transaction cannot commit until it returns. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. A watch is the one call that has no right ctx to pass, since its stream must outlive the transaction. An ordinary read on the wrong ctx no longer waits — it runs on the read pool and quietly misses the transaction's own writes.)
+**Do not open a watch inside `Within`.** The snapshot below happens on your goroutine, and a watch is the one call with no right ctx to pass, since its stream must outlive the transaction — so it runs on the read pool and quietly misses your transaction's own writes, which the stream will not carry either. (This is the general rule for `Within`: pass the ctx you were given to every store call inside it. An ordinary read on the wrong ctx does the same thing, and neither waits.)
 
 **Subscribe, then act.** The snapshot is read *before either returns*, so a change you make after subscribing is always in the stream — delete an object on the next line and its `Deleted` will come. If that read fails you get the error rather than a stream, since a watch with no snapshot could not report that delete. The stream carries changes strictly above `ResourceVersion`: no overlap with the snapshot, no gap between them. That is also what makes "have I caught up?" a value rather than a guess — you hold the starting state before you read the first change.
 

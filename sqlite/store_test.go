@@ -9139,8 +9139,9 @@ func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
 
 	// OpenMemory aliases the reader to the writer, so that pragma is absent and the
 	// write lands — with a version withinRead never publishes. Almost the whole
-	// suite runs here, which is why the frame latches it too.
-	t.Run("by the frame, where there is no pragma", func(t *testing.T) {
+	// suite runs here, which is why the frame latches it too. Only a write that
+	// draws is caught: see the ADR for what that leaves.
+	t.Run("by the frame, when the write draws", func(t *testing.T) {
 		store := newRawStore(t)
 		obj := newKindObject(t, store, testGK)
 		err := store.withinRead(ctx, func(ctx context.Context) error {
@@ -9151,7 +9152,7 @@ func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
 
 		got, err := store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
-		assert.Empty(t, got.Status, "and the write must be discarded with the frame")
+		assert.Empty(t, got.Status, "a draw-bearing write is discarded with the frame")
 	})
 }
 

@@ -37,12 +37,21 @@ not a permission. This is invisible in our code and the whole change rests on it
 *commits*. Measured, same statement both ways: `attempt to write a readonly
 database (8)` on disk, `<nil>` in memory. Nine call sites in the sqlite suite open
 on disk against ~380 tests, so the pragma is absent almost everywhere the tests
-run. The frame therefore latches it too: `sealForCommit` refuses a read frame that drew
-a resource version, because only a write draws, and a version drawn onto a read
-frame is never published — `withinRead` settles nothing. **In `sealForCommit`, not
-beside it**: that is the one critical section holding the lock which admits nested
-frames, so outside it a sibling goroutine can draw between the check and the
-seal.
+run. The frame therefore latches what it can: `sealForCommit` refuses a read frame
+that drew a resource version, since a version drawn onto a read frame is never
+published — `withinRead` settles nothing. **In `sealForCommit`, not beside it**:
+that is the one critical section holding the lock which admits nested frames, so
+outside it a sibling goroutine can draw between the check and the seal.
+
+**The latch catches draw-bearing writes only, and that is the whole of it.** A
+write that draws nothing — `DriverCursors().Set` is the one in the store today —
+passes the seal, and under `OpenMemory` commits. Nothing reaches it now, because
+all four grouped reads are pure reads; a future one that also stamped a cursor
+would. A tighter guard was considered and declined: `conn` is shared with `Within`
+and cannot be made airtight anyway, since a `DELETE … RETURNING` writes through
+`QueryContext` — the same reason `read`'s own comment gives for why a runtime
+check cannot stand in for its read-only interface. A partial guard that reads as
+total is worse than a stated limit.
 
 **`Within` and `withinRead` share one frame protocol** (`runTx`). Begin, install
 the frame, seal, commit, settle, drain the hooks: that ordering is contractual,

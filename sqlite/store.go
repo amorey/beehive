@@ -230,10 +230,11 @@ type txState struct {
 	// transaction committed, so "over" and "over and durable" differ.
 	committed bool
 
-	// readOnly marks a frame opened by withinRead. conn refuses one: its tx is on
-	// the reader, where a write is a pragma error on disk and silently fine under
-	// OpenMemory — and where a version drawn onto the frame would never be
-	// published, since withinRead settles nothing.
+	// readOnly marks a frame opened by withinRead, so sealForCommit can refuse one
+	// that drew a resource version: withinRead settles nothing, so that version
+	// would never be published. It catches only draw-bearing writes — a write that
+	// draws nothing passes, and on the reader only query_only stops it, which
+	// OpenMemory has no reader pool to apply.
 	readOnly bool
 
 	// drawn is the highest resource version this transaction has taken, which is
@@ -3486,9 +3487,9 @@ func (s *sqliteStore) snapshot(
 }
 
 // Objects().ListByIDs reads one batch of ids in one query. The tail calls it once
-// per batch rather than Objects().Get per changed object: the pool is size 1, so
-// those would be serialized round trips and a churny kind would cost more than
-// the full listing this design replaced.
+// per batch rather than Objects().Get per changed object: a churny kind would
+// otherwise cost a round trip per object, more than the full listing this design
+// replaced.
 func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids []storeapi.ObjectID) ([]*storeapi.RawObject, error) {
 	if len(ids) == 0 {
 		return nil, nil

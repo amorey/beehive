@@ -248,8 +248,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   so a commit landing just after one waits out the rest of the window — and one
   drain is bounded by a page budget, so a write stream cannot make a tailer hold
   the writer away from the writers waking it — its page read self-wraps in
-  `Within`, so it takes the writer even though it is a read; the first drain
-  after a quiet period is still eager.
+  `withinRead`, on the reader, so it no longer takes the writer at all; the first
+  drain after a quiet period is still eager.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
 - **`WatchOwnedObjects` scopes a watch to one owner's children, and reads
