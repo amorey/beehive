@@ -25,12 +25,19 @@ Measured on an arm64 sandbox, on disk, medians of five runs of 300:
 | the same, plus the sequence draw | 40.5 µs |
 | **the draw** | **25.8 µs** |
 
-Against the real store, same machine, same method:
+Against the real store, measured rather than derived — the draw stubbed to an
+in-memory counter, baseline and stubbed runs alternated so sandbox drift cancels,
+medians of twelve each side:
 
-| | now | draw removed |
-|---|---|---|
-| `UpdateStatus` in a `Within` | 95.4 µs | ~69.6 µs (**−27%**) |
-| `UpdateSpec` that changes the spec | 175.3 µs | ~149.5 µs (**−15%**) |
+| | now | draw stubbed | |
+|---|---|---|---|
+| `UpdateStatus` in a `Within` | 100.7 µs | 78.7 µs | **−22%** |
+| `UpdateSpec` that changes the spec | 176.6 µs | 151.8 µs | **−14%** |
+
+Do not derive these by subtracting the 25.8 µs above: removing a dirty page from
+a transaction that already dirties several saves less than removing it from a
+minimal one. Run-to-run spread on this sandbox puts the status saving between 15
+and 22 µs, and the low end still carries the spec.
 
 Every write pays it exactly once: a spec write, a status write, a condition bump,
 an event, the observed-generation stamp. It is the largest single cost on the
@@ -117,6 +124,17 @@ Two steps, in this order, and the order is the whole point:
 Refill only when spent — no low-water mark. A transaction that empties the block
 mid-way falls back to SQL for its remaining draws, which is today's cost, and the
 next commit refills.
+
+**A failed refill is swallowed.** It runs after a successful commit, so returning
+its error would report failure for a transaction that landed. Leave the block
+spent and return nil: the next draw takes the fallback, which raises the same
+error where a caller can act on it.
+
+**`blockSize <= 0` skips the refill entirely**, rather than reserving nothing.
+Reserving zero would issue an `UPDATE ... value + 0` after every commit — pure
+waste in the ordinary case, and in the failure-injection tests, which drop the
+table, a statement that fails after every commit and is then swallowed by the
+rule above.
 
 Where in `Within` to put it: after the hook loop. A hook may re-enter `Within` and
 draw, and if it does it takes the fallback — correct, just slower, and it keeps the
@@ -223,6 +241,17 @@ In `sqlite/store_test.go`:
 - **Every draw holds the writer connection** — the invariant above. Cheapest
   structural form: a test that asserts each draw site is reached only with a live
   transaction on the ctx.
+
+**`seqValue` is a second test family the block breaks** (`sqlite/store_test.go:2147`).
+It reads the sequence row to tell "this write consumed a version" from "the row's
+version did not move", which the object row cannot distinguish — 16 call sites
+across nine tests, including the cascade's draw accounting. Most survive at
+`blockSize = 0`, but `TestDeletionMarkDrawsAVersionOnlyWhenItStamps` (`:2156`)
+does not, at any block size: it asserts that a guard-blocked mark draws nothing,
+which is exactly the property the `markForDeletion` change reverses. Rewrite it on
+the new rule — a blocked mark burns a version, and gaps are free — rather than
+re-plumbing it. `seqValue`'s own doc then measures the fallback, not every draw,
+and should say so.
 
 **The failure-injection suite needs a plan.** Five `dropSeq` calls, four inline
 `DROP TABLE resource_version_seq`, and three `blockResourceVersionDraws` isolate
