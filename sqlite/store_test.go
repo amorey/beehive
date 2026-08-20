@@ -8985,33 +8985,53 @@ func TestAReadTransactionRunsItsHooks(t *testing.T) {
 // The property the change exists for: a grouped read runs on the reader while a
 // write transaction holds the writer. On disk, since OpenMemory has one pool.
 func TestAGroupedReadRunsBesideAWriteTransaction(t *testing.T) {
-	ctx := context.Background()
-	store := newDiskStore(t)
-	obj := newKindObject(t, store, testGK)
-
-	holding, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(done)
-		assert.NoError(t, store.Within(ctx, func(ctx context.Context) error {
-			_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
-			close(holding)
-			<-release
+	reads := map[string]func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error{
+		"ObjectWrites().ListSince": func(ctx context.Context, store *sqliteStore, _ storeapi.ObjectID) error {
+			_, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 16)
 			return err
-		}))
-	}()
-	<-holding
-
-	read := make(chan error, 1)
-	go func() {
-		_, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 16)
-		read <- err
-	}()
-	select {
-	case err := <-read:
-		require.NoError(t, err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("the grouped read is queued behind the open write transaction")
+		},
+		"ObjectWrites().Snapshot": func(ctx context.Context, store *sqliteStore, _ storeapi.ObjectID) error {
+			_, _, err := store.ObjectWrites().Snapshot(ctx, testGK)
+			return err
+		},
+		"Events().ListSince": func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error {
+			_, _, err := store.Events().ListSince(ctx, id, nil, 0, 16)
+			return err
+		},
+		"Events().Snapshot": func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error {
+			_, _, err := store.Events().Snapshot(ctx, id, storeapi.EventQuery{})
+			return err
+		},
 	}
-	close(release)
-	<-done
+
+	for name, read := range reads {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newDiskStore(t)
+			obj := newKindObject(t, store, testGK)
+
+			holding, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(done)
+				assert.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+					_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
+					close(holding)
+					<-release
+					return err
+				}))
+			}()
+			<-holding
+
+			got := make(chan error, 1)
+			go func() { got <- read(ctx, store, obj.ID) }()
+			select {
+			case err := <-got:
+				require.NoError(t, err)
+			case <-time.After(30 * time.Second):
+				t.Error("the grouped read is queued behind the open write transaction")
+			}
+			close(release)
+			<-done
+		})
+	}
 }

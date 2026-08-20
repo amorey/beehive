@@ -2196,7 +2196,7 @@ func (s sqliteEvents) Snapshot(
 ) ([]storeapi.Event, int64, error) {
 	var runs []storeapi.Event
 	var at int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.withinRead(ctx, func(ctx context.Context) error {
 		var err error
 		if runs, err = s.Events().List(ctx, id, q); err != nil {
 			return err
@@ -2223,7 +2223,7 @@ func (s sqliteEvents) ListSince(
 	}
 	var runs []storeapi.Event
 	var trimmed int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.withinRead(ctx, func(ctx context.Context) error {
 		var err error
 		if runs, trimmed, err = s.eventPage(ctx, id, category, afterRV, limit); err != nil {
 			return err
@@ -3452,7 +3452,7 @@ func (s *sqliteStore) snapshot(
 ) ([]*storeapi.RawObject, int64, error) {
 	var rows []*storeapi.RawObject
 	var at int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.withinRead(ctx, func(ctx context.Context) error {
 		var err error
 		if rows, err = list(ctx); err != nil {
 			return err
