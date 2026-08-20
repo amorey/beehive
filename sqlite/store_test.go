@@ -8673,7 +8673,7 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 func sqlSites(t *testing.T, match func(sql string) bool) []string {
 	t.Helper()
 	var sites []string
-	require.NoError(t, inspectPackage(t, func(fn string, n ast.Node) {
+	require.NoError(t, inspectPackage(t, func(fn, _ string, n ast.Node) {
 		lit, ok := n.(*ast.BasicLit)
 		if ok && lit.Kind == token.STRING && match(lit.Value) {
 			sites = append(sites, fn)
@@ -8682,9 +8682,53 @@ func sqlSites(t *testing.T, match func(sql string) bool) []string {
 	return sites
 }
 
-// inspectPackage walks this package's non-test files, calling visit with the name
-// of the enclosing function for every node.
-func inspectPackage(t *testing.T, visit func(fn string, n ast.Node)) error {
+// callSites names every function calling any of methods, qualified by receiver
+// so two methods sharing a name stay apart.
+func callSites(t *testing.T, methods ...string) []string {
+	t.Helper()
+	want := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		want[m] = true
+	}
+	var sites []string
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && want[sel.Sel.Name] {
+			sites = append(sites, qualify(recv, fn))
+		}
+	}))
+	return sites
+}
+
+// receiverName is a FuncDecl's receiver type, without the pointer.
+func receiverName(decl *ast.FuncDecl) string {
+	if decl.Recv == nil || len(decl.Recv.List) == 0 {
+		return ""
+	}
+	expr := decl.Recv.List[0].Type
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	if id, ok := expr.(*ast.Ident); ok {
+		return id.Name
+	}
+	return ""
+}
+
+func qualify(recv, fn string) string {
+	if recv == "" {
+		return fn
+	}
+	return recv + "." + fn
+}
+
+// inspectPackage walks this package's non-test files, calling visit for every
+// node with the enclosing function's name and its receiver type, "" for a plain
+// function.
+func inspectPackage(t *testing.T, visit func(fn, recv string, n ast.Node)) error {
 	t.Helper()
 	return filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -8697,12 +8741,12 @@ func inspectPackage(t *testing.T, visit func(fn string, n ast.Node)) error {
 		if err != nil {
 			return err
 		}
-		var fn string
+		var fn, recv string
 		ast.Inspect(file, func(n ast.Node) bool {
 			if decl, ok := n.(*ast.FuncDecl); ok {
-				fn = decl.Name.Name
+				fn, recv = decl.Name.Name, receiverName(decl)
 			}
-			visit(fn, n)
+			visit(fn, recv, n)
 			return true
 		})
 		return nil
@@ -8918,15 +8962,10 @@ func TestAReadTransactionSeesOneSnapshot(t *testing.T) {
 		if first, err = store.Objects().Get(ctx, obj.ID); err != nil {
 			return err
 		}
-		// The write runs on its own ctx, so it takes the writer rather than
-		// joining this frame.
-		wrote := make(chan error, 1)
-		go func() {
-			_, err := store.Objects().UpdateStatus(
-				context.Background(), testGK, obj.ID, []byte(`{"n":1}`), 0)
-			wrote <- err
-		}()
-		require.NoError(t, <-wrote)
+		// Its own ctx, so it takes the writer rather than joining this frame.
+		_, err = store.Objects().UpdateStatus(
+			context.Background(), testGK, obj.ID, []byte(`{"n":1}`), 0)
+		require.NoError(t, err)
 
 		second, err = store.Objects().Get(ctx, obj.ID)
 		return err
@@ -8985,27 +9024,30 @@ func TestAReadTransactionRunsItsHooks(t *testing.T) {
 // The property the change exists for: a grouped read runs on the reader while a
 // write transaction holds the writer. On disk, since OpenMemory has one pool.
 func TestAGroupedReadRunsBesideAWriteTransaction(t *testing.T) {
-	reads := map[string]func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error{
-		"ObjectWrites().ListSince": func(ctx context.Context, store *sqliteStore, _ storeapi.ObjectID) error {
+	reads := []struct {
+		name string
+		read func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error
+	}{
+		{"ObjectWrites().ListSince", func(ctx context.Context, store *sqliteStore, _ storeapi.ObjectID) error {
 			_, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 16)
 			return err
-		},
-		"ObjectWrites().Snapshot": func(ctx context.Context, store *sqliteStore, _ storeapi.ObjectID) error {
+		}},
+		{"ObjectWrites().Snapshot", func(ctx context.Context, store *sqliteStore, _ storeapi.ObjectID) error {
 			_, _, err := store.ObjectWrites().Snapshot(ctx, testGK)
 			return err
-		},
-		"Events().ListSince": func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error {
+		}},
+		{"Events().ListSince", func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error {
 			_, _, err := store.Events().ListSince(ctx, id, nil, 0, 16)
 			return err
-		},
-		"Events().Snapshot": func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error {
+		}},
+		{"Events().Snapshot", func(ctx context.Context, store *sqliteStore, id storeapi.ObjectID) error {
 			_, _, err := store.Events().Snapshot(ctx, id, storeapi.EventQuery{})
 			return err
-		},
+		}},
 	}
 
-	for name, read := range reads {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range reads {
+		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			store := newDiskStore(t)
 			obj := newKindObject(t, store, testGK)
@@ -9023,7 +9065,7 @@ func TestAGroupedReadRunsBesideAWriteTransaction(t *testing.T) {
 			<-holding
 
 			got := make(chan error, 1)
-			go func() { got <- read(ctx, store, obj.ID) }()
+			go func() { got <- tc.read(ctx, store, obj.ID) }()
 			select {
 			case err := <-got:
 				require.NoError(t, err)
@@ -9037,43 +9079,52 @@ func TestAGroupedReadRunsBesideAWriteTransaction(t *testing.T) {
 }
 
 // Which reads moved to the reader, structurally. Two must not: Events().Sweep,
-// whose scan and trim are one transaction on the writer, and the waker's
-// ListSinceAll, which is ungrouped so a commit wake mid-scan is still seen.
+// whose scan and the trim after it are one transaction on the writer, and the
+// waker's ListSinceAll, which is ungrouped so a commit wake mid-scan is seen.
 func TestTheGroupedReadsAreTheOnesThatMoved(t *testing.T) {
-	var sites []string
-	require.NoError(t, inspectPackage(t, func(fn string, n ast.Node) {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return
-		}
-		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "withinRead" {
-			sites = append(sites, fn)
-		}
-	}))
-
 	assert.ElementsMatch(t, []string{
-		"Snapshot",  // Events().Snapshot
-		"ListSince", // Events().ListSince
-		"ListSince", // ObjectWrites().ListSince
-		"snapshot",  // the object listing's
-	}, sites, "a fifth grouped read on the reader needs its own argument")
+		"sqliteEvents.Snapshot",
+		"sqliteEvents.ListSince",
+		"sqliteObjectWrites.ListSince",
+		"sqliteStore.snapshot",
+	}, callSites(t, "withinRead"),
+		"a fifth grouped read on the reader needs its own argument")
 }
 
-// The refusal comes from the reader pool's query_only pragma, not from
-// sql.TxOptions.ReadOnly, which only picks the begin verb. On disk: OpenMemory
-// aliases the reader to the writer, where the same write succeeds.
+// A write inside a read transaction is refused twice over, and the second covers
+// the case the first cannot.
 func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
 	ctx := context.Background()
-	store := newDiskStore(t)
-	obj := newKindObject(t, store, testGK)
 
-	err := store.withinRead(ctx, func(ctx context.Context) error {
-		_, err := store.conn(ctx).ExecContext(ctx,
-			`UPDATE objects SET updated_at = updated_at + 1 WHERE id = ?`, obj.ID)
-		return err
+	// sql.TxOptions.ReadOnly only picks the begin verb; the pragma is what refuses.
+	t.Run("by the reader's pragma", func(t *testing.T) {
+		store := newDiskStore(t)
+		obj := newKindObject(t, store, testGK)
+		err := store.withinRead(ctx, func(ctx context.Context) error {
+			_, err := store.conn(ctx).ExecContext(ctx,
+				`UPDATE objects SET updated_at = updated_at + 1 WHERE id = ?`, obj.ID)
+			return err
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "readonly database")
 	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "readonly database")
+
+	// OpenMemory aliases the reader to the writer, so that pragma is absent and the
+	// write lands — with a version withinRead never publishes. Almost the whole
+	// suite runs here, which is why the frame latches it too.
+	t.Run("by the frame, where there is no pragma", func(t *testing.T) {
+		store := newRawStore(t)
+		obj := newKindObject(t, store, testGK)
+		err := store.withinRead(ctx, func(ctx context.Context) error {
+			_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
+			return err
+		})
+		assert.ErrorIs(t, err, errWroteInReadTx)
+
+		got, err := store.Objects().Get(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Empty(t, got.Status, "and the write must be discarded with the frame")
+	})
 }
 
 // A read draws no version, and the refill is a write on the connection this call

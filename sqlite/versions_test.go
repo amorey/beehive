@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go/ast"
 	"path/filepath"
 	"regexp"
 	"sync"
@@ -473,27 +472,16 @@ func TestTheCounterIsWrittenInOnePlace(t *testing.T) {
 // freeze the cursor below live writes — silently. "No site draws outside a
 // transaction" is a claim over an open set, so this asserts the structure instead.
 func TestEveryDrawSiteIsInsideATransaction(t *testing.T) {
-	var sites []string
-	require.NoError(t, inspectPackage(t, func(fn string, n ast.Node) {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if ok && (sel.Sel.Name == "nextResourceVersion" || sel.Sel.Name == "advanceResourceVersion") {
-			sites = append(sites, fn)
-		}
-	}))
-
 	assert.ElementsMatch(t, []string{
-		"nextResourceVersion", // the one-version wrapper over advanceResourceVersion
-		"objectsCreate",
-		"recordObjectWrite",
-		"Add", // Events().Add
-		"markForDeletion",
-		"markManyForDeletion",
-		"objectsDelete",
-	}, sites, "a new draw site must run inside Within, or published stops bounding it")
+		"sqliteStore.nextResourceVersion", // the one-version wrapper
+		"sqliteStore.objectsCreate",
+		"sqliteStore.recordObjectWrite",
+		"sqliteEvents.Add",
+		"sqliteStore.markForDeletion",
+		"sqliteStore.markManyForDeletion",
+		"sqliteStore.objectsDelete",
+	}, callSites(t, "nextResourceVersion", "advanceResourceVersion"),
+		"a new draw site must run inside Within, or published stops bounding it")
 }
 
 // The seed read runs after the migrations, so a database whose migrations are

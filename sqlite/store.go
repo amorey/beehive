@@ -230,6 +230,12 @@ type txState struct {
 	// transaction committed, so "over" and "over and durable" differ.
 	committed bool
 
+	// readOnly marks a frame opened by withinRead. conn refuses one: its tx is on
+	// the reader, where a write is a pragma error on disk and silently fine under
+	// OpenMemory — and where a version drawn onto the frame would never be
+	// published, since withinRead settles nothing.
+	readOnly bool
+
 	// drawn is the highest resource version this transaction has taken, which is
 	// what its commit publishes. Nested frames share it, rolled-back draws
 	// included: a burned version belongs to no write, so publishing over it is safe.
@@ -556,11 +562,37 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	}
 
 	s.txCount.Add(1)
-	tx, err := s.db.BeginTx(ctx, nil)
+	return s.runTx(ctx, s.db, nil, fn, func(ctx context.Context, st *txState) {
+		// Both before the hooks. Publishing after them lets the waker's dependent
+		// sample the cursor below its target's version; refilling after them puts
+		// the draw behind whatever transaction a hook has opened on the connection
+		// this commit just released.
+		s.versions.publish(st.highestDraw())
+		s.refillVersions(ctx)
+	})
+}
+
+// errWroteInReadTx reports a write attempted inside withinRead. Not a sentinel
+// callers handle: it is a programming error, and the transaction is discarded.
+var errWroteInReadTx = errors.New("beehive/sqlite: write inside a read transaction")
+
+// runTx is the frame protocol both Within and withinRead run: begin, install the
+// frame, seal, commit, settle, then drain the hooks the commit owed. settle runs
+// only on a clean commit and may be nil.
+//
+// The ordering here is contractual. Nothing outside this function may reorder it.
+func (s *sqliteStore) runTx(
+	ctx context.Context,
+	db *sql.DB,
+	opts *sql.TxOptions,
+	fn func(ctx context.Context) error,
+	settle func(ctx context.Context, st *txState),
+) error {
+	tx, err := db.BeginTx(ctx, opts)
 	if err != nil {
 		return err
 	}
-	st := &txState{tx: tx}
+	st := &txState{tx: tx, readOnly: opts != nil && opts.ReadOnly}
 	defer st.close() // covers the rollback and early-return paths
 	ctx = context.WithValue(ctx, txKey{}, &txFrame{st: st})
 	defer tx.Rollback() // no-op once Commit succeeds; rolls back on any early return
@@ -571,18 +603,20 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	// frame still open belongs to another goroutine — COMMIT would release its
 	// savepoint and land its writes. Both are checked, and the door shut on new
 	// frames, in one critical section; the deferred Rollback does the discarding.
+	if st.readOnly && st.highestDraw() != 0 {
+		// Only a write draws. On the reader that is a pragma error already, but
+		// under OpenMemory it would commit with a version nothing publishes.
+		return errWroteInReadTx
+	}
 	if err := st.sealForCommit(); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Both before the hooks. Publishing after them lets the waker's dependent sample
-	// the cursor below its target's version; refilling after them puts the draw
-	// behind whatever transaction a hook has opened on the connection this commit
-	// just released.
-	s.versions.publish(st.highestDraw())
-	s.refillVersions(ctx)
+	if settle != nil {
+		settle(ctx, st)
+	}
 	// flush latches closed before the hooks below run — a close deferred to return
 	// would read false while a hook can hand its captured tx ctx back to the store.
 	hooks := st.flush()
@@ -617,37 +651,14 @@ func (st *txState) highestDraw() int64 {
 // reader pool's query_only pragma, not by the flag, so under OpenMemory, where
 // readDB is the writer, it succeeds instead.
 func (s *sqliteStore) withinRead(ctx context.Context, fn func(ctx context.Context) error) error {
-	// A nested call joins by running on the same ctx, not by taking a savepoint:
-	// a savepoint is a rollback boundary and a read has nothing to roll back.
-	// Nested in a Within it is therefore a write transaction, which is correct —
-	// that one holds the lock, and its uncommitted writes must be visible.
-	if st := liveTx(ctx); st != nil {
+	// Joins an ambient transaction on its ctx: a read has nothing to roll back, so
+	// there is no savepoint to take.
+	if liveTx(ctx) != nil {
 		return fn(ctx)
 	}
-	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return err
-	}
-	st := &txState{tx: tx}
-	defer st.close()
-	ctx = context.WithValue(ctx, txKey{}, &txFrame{st: st})
-	defer tx.Rollback()
-	if err := fn(ctx); err != nil {
-		return err
-	}
-	if err := st.sealForCommit(); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	// The frame took hooks like any other, and committing is what they were owed.
-	// The version allocator is not settled here: a read draws nothing, and the
-	// refill is a write on the writer this call exists to stay off.
-	for _, hook := range st.flush() {
-		hook.fn()
-	}
-	return nil
+	// No settle: a read draws no version, and the refill would be a write on the
+	// connection this call exists to stay off.
+	return s.runTx(ctx, s.readDB, &sql.TxOptions{ReadOnly: true}, fn, nil)
 }
 
 // AfterCommit defers fn to the outermost transaction's commit. Outside a
@@ -3452,6 +3463,9 @@ func (s *sqliteStore) snapshot(
 ) ([]*storeapi.RawObject, int64, error) {
 	var rows []*storeapi.RawObject
 	var at int64
+	// The longest-held read transaction in the store: list has no bound, so this
+	// pins one of WithReadConnections' connections, and the WAL against a
+	// checkpoint, for the whole kind. The paged reads hold theirs for one page.
 	err := s.withinRead(ctx, func(ctx context.Context) error {
 		var err error
 		if rows, err = list(ctx); err != nil {
