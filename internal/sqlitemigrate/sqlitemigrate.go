@@ -61,9 +61,8 @@ func OpenPool(path string, maxConns int) *sql.DB {
 // OpenReadPool opens a read-only pool at path, sized maxConns. Reads run here so
 // they do not queue behind writes in Go's pool, which WAL already allows.
 //
-// query_only, not mode=ro: it is enforced — a write fails with "attempt to write
-// a readonly database" rather than blocking — and it leaves SQLite free to
-// recover the -wal and -shm files.
+// query_only, not mode=ro: it is enforced, and says so — a write fails with
+// "attempt to write a readonly database" rather than blocking.
 //
 // The DSN deliberately omits _txlock=immediate. BEGIN IMMEDIATE takes a write
 // lock, which query_only refuses, so inheriting it would fail every transaction

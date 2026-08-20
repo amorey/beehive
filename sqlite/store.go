@@ -96,8 +96,8 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
-	// readDB serves reads that are not inside a transaction. nil when the
-	// database cannot be opened twice (see OpenMemory), where reads use db.
+	// readDB serves reads that are not inside a transaction. Aliased to db where
+	// the database cannot be opened twice (see OpenMemory).
 	readDB *sql.DB
 
 	// txCount counts transactions begun; a nested Within (savepoint) does not add.
@@ -112,13 +112,13 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
-	// Readers first: they hold snapshots the writer's checkpoint waits on.
-	if s.readDB != nil {
-		if err := s.readDB.Close(); err != nil {
-			return err
-		}
+	// Readers first: they hold snapshots the writer's checkpoint waits on. The
+	// writer closes whatever happened above it, so a failed reader cannot leak it.
+	var readErr error
+	if s.readDB != s.db {
+		readErr = s.readDB.Close()
 	}
-	return s.db.Close()
+	return errors.Join(readErr, s.db.Close())
 }
 
 // Drain floor: release only past both an absolute size and a share of the file.
@@ -482,6 +482,15 @@ type dbtx interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// roDBTX is dbtx without ExecContext, and read returns it so that routing a
+// write onto the reader does not compile. A runtime check could not stand in:
+// inside a transaction read hands back that transaction, where a write would
+// commit on the writer and look correct.
+type roDBTX interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // conn returns the ambient transaction if ctx carries a live one, else the pool.
 // A closed txState degrades to the pool — the ctx outlives its transaction, so a
 // write issued on it commits standalone rather than failing with sql.ErrTxDone.
@@ -500,17 +509,11 @@ func (s *sqliteStore) conn(ctx context.Context) dbtx {
 // A read issued inside a transaction on any other connection sees the database
 // as of before that transaction's own uncommitted writes — and unlike today's
 // deadlock, that failure is silent.
-//
-// readDB is nil where the database cannot be opened twice (see OpenMemory), and
-// reads fall back to the writer.
-func (s *sqliteStore) read(ctx context.Context) dbtx {
+func (s *sqliteStore) read(ctx context.Context) roDBTX {
 	if st := liveTx(ctx); st != nil {
 		return st.tx
 	}
-	if s.readDB != nil {
-		return s.readDB
-	}
-	return s.db
+	return s.readDB
 }
 
 // liveTx returns the ctx's transaction frame while it is still open. A ctx
@@ -3232,6 +3235,7 @@ func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, 
 // version removed per kind, with the total. Closes its rows before returning, so
 // the horizon writes that follow get the single connection back.
 func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, where string, args ...any) (map[storeapi.GroupKind]int64, int, error) {
+	// conn, not read: a DELETE ... RETURNING is a write however it is issued.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`DELETE FROM object_writes WHERE `+where+`
 		 RETURNING "group", kind, resource_version`, args...)

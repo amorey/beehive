@@ -36,10 +36,8 @@ var migrations embed.FS
 // package: the store must not import the control plane.
 var ErrInvalidOption = errors.New("beehive/sqlite: option value is invalid")
 
-// defaultReadConnections is a guess, and only the first connection is load
-// bearing — one already keeps reads out of the writers' queue. More helps only
-// readers that genuinely overlap, which the drivers do: the owed pass runs per
-// kind, the tailers per watched kind.
+// defaultReadConnections is a guess: one connection already keeps reads out of
+// the writers' queue, and more helps only readers that genuinely overlap.
 const defaultReadConnections = 4
 
 // Option configures a store at Open. Deliberately not beehive's option type:
@@ -58,24 +56,16 @@ func WithReadConnections(n int) Option {
 	return func(o *openOptions) { o.readConns = n }
 }
 
-func resolveOpen(opts []Option) (openOptions, error) {
+// Open opens (or creates) a Beehive SQLite database at path, running any
+// pending schema migrations before returning. Reads that are not inside a
+// transaction run on their own pool; see WithReadConnections.
+func Open(path string, opts ...Option) (*sqliteStore, error) {
 	o := openOptions{readConns: defaultReadConnections}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	if o.readConns < 1 {
-		return o, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
-	}
-	return o, nil
-}
-
-// Open opens (or creates) a Beehive SQLite database at path, running any
-// pending schema migrations before returning. Reads that are not inside a
-// transaction run on their own pool; see WithReadConnections.
-func Open(path string, opts ...Option) (*sqliteStore, error) {
-	o, err := resolveOpen(opts)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
 	}
 	s, err := open(sqlitemigrate.OpenPool(path, 1))
 	if err != nil {
@@ -111,6 +101,8 @@ func open(db *sql.DB) (*sqliteStore, error) {
 	}
 	return &sqliteStore{
 		db: db,
+		// Aliased until a caller opens a read pool, so read never branches.
+		readDB: db,
 		// Truncated to ms to match condition timestamps: a sub-ms processStart would
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),

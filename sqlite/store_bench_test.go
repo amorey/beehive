@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/amorey/beehive"
@@ -242,5 +243,69 @@ func benchSpecWrite(b *testing.B, specKB, conds int, mode string) {
 			b.Fatalf("unknown mode %q", mode)
 		}
 		require.NoError(b, err)
+	}
+}
+
+// BenchmarkReadUnderWrites measures a bare read while writes are in flight,
+// which is what the read pool exists for: the drivers scan on a cadence forever
+// and every one of those reads used to sit in the writers' queue.
+//
+// BenchmarkWritesUnderWatch does not move on this change, and cannot: a watch
+// tailer reads through ObjectWrites().ListSince, which self-wraps in Within and
+// so still takes the writer. That is the grouped-read spec's to fix.
+//
+// On disk, since OpenMemory has no read pool.
+func BenchmarkReadUnderWrites(b *testing.B) {
+	for _, writers := range []int{0, 1, 4} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+			require.NoError(b, err)
+			defer store.Close()
+			ctx := context.Background()
+
+			obj, err := store.Objects().Create(ctx, testGK, storeapi.ObjectsCreateInput{
+				Name: "read-target", Spec: []byte(`{}`),
+			})
+			require.NoError(b, err)
+
+			targets := make([]storeapi.ObjectID, writers)
+			for i := range targets {
+				o, err := store.Objects().Create(ctx, testGK, storeapi.ObjectsCreateInput{
+					Name: fmt.Sprintf("write-target-%d", i), Spec: []byte(`{}`),
+				})
+				require.NoError(b, err)
+				targets[i] = o.ID
+			}
+
+			stop := make(chan struct{})
+			var wg sync.WaitGroup
+			for _, id := range targets {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for n := 0; ; n++ {
+						select {
+						case <-stop:
+							return
+						default:
+						}
+						status := fmt.Appendf(nil, `{"n":%d}`, n)
+						if _, err := store.Objects().UpdateStatus(ctx, testGK, id, status, 0); err != nil {
+							return
+						}
+					}
+				}()
+			}
+
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := store.Objects().GetMeta(ctx, obj.ID); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+			close(stop)
+			wg.Wait()
+		})
 	}
 }
