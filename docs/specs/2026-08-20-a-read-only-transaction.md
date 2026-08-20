@@ -2,9 +2,9 @@
 
 - **Status:** Planned.
 - **Date:** 2026-08-20
-- **Depends on:** [reads get their own connections](2026-08-20-reads-get-their-own-connections.md).
-  A grouped read belongs on the read pool, and it needs a transaction there to
-  see one instant across its statements.
+- **Depends on:** the read pool, which shipped —
+  [ADR](../adr/2026-08-20-reads-get-their-own-connections.md). A grouped read belongs on that pool,
+  and it needs a transaction there to see one instant across its statements.
 
 ## Why
 
@@ -34,6 +34,10 @@ already queues there.
 With the read pool it stops being merely wasteful. These five reads belong on the
 reader, and the reader is opened `query_only(true)`, which refuses a write lock —
 so `IMMEDIATE` there does not work at all. This is what lets those call sites move.
+
+It is also the whole of the watch win. The reader is flat in writer count where
+these are not: 403µs against 31µs at four writers, and moving them is what takes
+`BenchmarkWritesUnderWatch` down rather than sideways.
 
 `modernc.org/sqlite` gives us the deferred begin for free: `newTx` applies the
 DSN's `_txlock` only when `opts.ReadOnly` is false (`tx.go:22-25`). So

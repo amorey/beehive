@@ -2,11 +2,11 @@
 
 - **Status:** Planned, with one question open — see *Read transactions*.
 - **Date:** 2026-08-20
-- **Depends on:** nothing. An earlier draft made this wait on
-  [the connection split](2026-08-20-reads-get-their-own-connections.md), on the
-  belief that a held statement taxes its connection; measured properly, a *cached*
-  statement barely pays that and caching more is what avoids it. The two changes
-  are independent and compose.
+- **Depends on:** nothing. An earlier draft made this wait on the connection
+  split ([ADR](../adr/2026-08-20-reads-get-their-own-connections.md)), on the belief that a
+  held statement taxes its connection; measured properly, a *cached* statement
+  barely pays that and caching more is what avoids it. The two are independent
+  and compose.
 - **Related:** [a read-only transaction](2026-08-20-a-read-only-transaction.md),
   which decides whether the store's grouped reads can share a statement.
 
@@ -73,10 +73,10 @@ Keep the queue on the frame and never in the table. A marker in the table outliv
 the transaction that would have cleared it, so a failed `Within` leaves that SQL
 uncached for the life of the store.
 
-With [the connection split](2026-08-20-reads-get-their-own-connections.md) in
-place the deadlock is confined to the writer, since a read miss prepares on the
-reader while the transaction holds the writer — but the rule stands either way,
-and it is cheaper to keep than to make conditional on another spec landing.
+The [connection split](../adr/2026-08-20-reads-get-their-own-connections.md)
+confines the deadlock to the writer — a read miss prepares on the reader while
+the transaction holds the writer — but the rule stands either way, and is
+cheaper to keep than to make conditional on which pool a caller is on.
 
 ## The rule everything rests on
 
@@ -176,16 +176,14 @@ a sixth optional predicate doubles it silently.
 
 ## Edge cases the implementer would otherwise guess at
 
-- **The table is per pool, once
-  [the connection split](2026-08-20-reads-get-their-own-connections.md) lands.** A
-  `*sql.Stmt` belongs to the pool that prepared it, so one prepared on the writer
-  and executed through `s.read` runs on the writer and quietly undoes the split.
-  Key the table by pool, or hold one per pool.
+- **The table is per pool.** A `*sql.Stmt` belongs to the pool that prepared it,
+  so one prepared on the writer and executed through `s.read` runs on the writer
+  and quietly undoes the
+  [split](../adr/2026-08-20-reads-get-their-own-connections.md). Key the table by
+  pool, or hold one per pool.
 
 - **A statement is compiled once per connection.** `database/sql` prepares
-  lazily, so once
-  [the connection split](2026-08-20-reads-get-their-own-connections.md) lands a
-  hot statement is compiled on each reader that runs it. Memory scales with N,
+  lazily, so a hot statement is compiled on each reader that runs it. Memory scales with N,
   and so does the small residual cost a cached statement pays on a busy
   connection (+7%).
 
