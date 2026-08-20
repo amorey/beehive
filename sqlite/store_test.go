@@ -3449,14 +3449,6 @@ func TestTxStateSealForCommit(t *testing.T) {
 		assert.ErrorIs(t, st.sealForCommit(), assert.AnError)
 	})
 
-	// Here rather than in runTx: outside this lock a sibling goroutine can draw
-	// between the check and the seal.
-	t.Run("refuses a read frame that drew", func(t *testing.T) {
-		st := &txState{readOnly: true}
-		st.noteDraw(7)
-
-		assert.ErrorIs(t, st.sealForCommit(), errWroteInReadTx)
-	})
 }
 
 // TestWithinRefusesAContextFromAnUnwoundFrame: depth is reusable, so it cannot be the
@@ -6485,7 +6477,9 @@ func TestWithinReportsACommitFailure(t *testing.T) {
 		// End the transaction underneath database/sql, so its own Commit finds no
 		// transaction to commit. This is the one failure Within cannot rule out by
 		// construction: the statement it runs last is the one it cannot check first.
-		_, err := store.conn(ctx).ExecContext(ctx, `ROLLBACK`)
+		c, err := store.conn(ctx)
+		require.NoError(t, err)
+		_, err = c.ExecContext(ctx, `ROLLBACK`)
 		return err
 	})
 	require.Error(t, err, "a failed commit must reach the caller")
@@ -8727,6 +8721,14 @@ func receiverName(decl *ast.FuncDecl) string {
 	return ""
 }
 
+// bareName drops a receiver qualifier, so callSites and sqlSites results compare.
+func bareName(fn string) string {
+	if i := strings.LastIndex(fn, "."); i >= 0 {
+		return fn[i+1:]
+	}
+	return fn
+}
+
 func qualify(recv, fn string) string {
 	if recv == "" {
 		return fn
@@ -9100,27 +9102,62 @@ func TestTheGroupedReadsAreTheOnesThatMoved(t *testing.T) {
 		"a fifth grouped read on the reader needs its own argument")
 }
 
-// A write inside a read transaction is refused twice over, and the second covers
-// the case the first cannot.
+// No write statement bypasses conn, which is what makes refusing a read frame
+// there refuse every write. A runtime roster cannot hold this: a verb added
+// without going through conn is also a verb nobody adds to the roster.
+//
+// Blind to SQL built by concatenation and to writes outside this package.
+func TestNoWriteBypassesConn(t *testing.T) {
+	writesData := regexp.MustCompile(`(?is)\b(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+
+	// Both helpers report the enclosing function; callSites qualifies it by
+	// receiver and sqlSites does not, so compare on the bare name.
+	takesConn := map[string]bool{}
+	for _, fn := range callSites(t, "conn") {
+		takesConn[bareName(fn)] = true
+	}
+	// Helpers handed a dbtx by a caller that did take one from conn.
+	for _, fn := range []string{
+		"drawResourceVersions", "appendWriteLog", "appendWriteLogUpdates",
+		"appendWriteLogDelete", "bumpObject", "upsertConditions",
+		"deleteWriteLogRows", "markManyForDeletionChunk",
+		"reconcileOwedSweepQuery", // builds a string, executes nothing
+	} {
+		takesConn[fn] = true
+	}
+
+	var bypass []string
+	for _, fn := range sqlSites(t, writesData.MatchString) {
+		if !takesConn[bareName(fn)] {
+			bypass = append(bypass, fn)
+		}
+	}
+	assert.Empty(t, bypass, "a write here takes its connection from somewhere conn cannot refuse")
+}
+
+// A write inside a read transaction is refused before any statement runs, in both
+// pool modes. OpenMemory is the one that matters: it has no reader pool, so no
+// query_only pragma stands behind conn — and almost the whole suite runs there.
 func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
 	ctx := context.Background()
 
-	// sql.TxOptions.ReadOnly only picks the begin verb; the pragma is what refuses.
-	t.Run("by the reader's pragma", func(t *testing.T) {
-		store := newDiskStore(t)
+	t.Run("nothing of the write lands", func(t *testing.T) {
+		store := newRawStore(t)
 		obj := newKindObject(t, store, testGK)
+
 		err := store.withinRead(ctx, func(ctx context.Context) error {
-			_, err := store.conn(ctx).ExecContext(ctx,
-				`UPDATE objects SET updated_at = updated_at + 1 WHERE id = ?`, obj.ID)
+			_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
 			return err
 		})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "readonly database")
+		require.ErrorIs(t, err, errWroteInReadTx)
+		got, err := store.Objects().Get(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Empty(t, got.Status)
 	})
 
-	// A nested frame a sibling goroutine opened and closed during fn is caught by
-	// the same latch, since the draw is on the shared frame either way.
-	t.Run("by the frame, from a sibling goroutine", func(t *testing.T) {
+	// A nested frame a sibling goroutine opened and closed during fn is refused
+	// too: it joins on a savepoint, so it inherits readOnly.
+	t.Run("from a sibling goroutine's nested frame", func(t *testing.T) {
 		store := newRawStore(t)
 		obj := newKindObject(t, store, testGK)
 		err := store.withinRead(ctx, func(readCtx context.Context) error {
@@ -9135,24 +9172,6 @@ func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
 			return <-done // the nested frame closes before fn returns
 		})
 		assert.ErrorIs(t, err, errWroteInReadTx)
-	})
-
-	// OpenMemory aliases the reader to the writer, so that pragma is absent and the
-	// write lands — with a version withinRead never publishes. Almost the whole
-	// suite runs here, which is why the frame latches it too. Only a write that
-	// draws is caught: see the ADR for what that leaves.
-	t.Run("by the frame, when the write draws", func(t *testing.T) {
-		store := newRawStore(t)
-		obj := newKindObject(t, store, testGK)
-		err := store.withinRead(ctx, func(ctx context.Context) error {
-			_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
-			return err
-		})
-		assert.ErrorIs(t, err, errWroteInReadTx)
-
-		got, err := store.Objects().Get(ctx, obj.ID)
-		require.NoError(t, err)
-		assert.Empty(t, got.Status, "a draw-bearing write is discarded with the frame")
 	})
 }
 
@@ -9285,4 +9304,115 @@ func TestAReadTransactionRefusesToCommitBadly(t *testing.T) {
 		<-done
 		assert.ErrorIs(t, err, beehive.ErrConcurrentNestedTx)
 	})
+}
+
+// Every write verb refuses a read frame. TestNoWriteBypassesConn is what holds
+// the set closed — this walks it, so each verb's refusal is exercised rather than
+// argued from the one in conn.
+func TestEveryWriteVerbRefusesAReadTransaction(t *testing.T) {
+	ctx := context.Background()
+	gk := testGK
+
+	writes := []struct {
+		name  string
+		write func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error
+	}{
+		{"Objects().Create", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
+			_, err := s.Objects().Create(ctx, gk, storeapi.ObjectsCreateInput{Name: "n", Spec: []byte(`{}`)})
+			return err
+		}},
+		{"Objects().UpdateSpec", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, _, err := s.Objects().UpdateSpec(ctx, gk, id, []byte(`{"a":1}`), 0)
+			return err
+		}},
+		{"Objects().UpdateStatus", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, err := s.Objects().UpdateStatus(ctx, gk, id, []byte(`{"a":1}`), 0)
+			return err
+		}},
+		{"Objects().SetObservedGeneration", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, err := s.Objects().SetObservedGeneration(ctx, gk, id, 1)
+			return err
+		}},
+		{"Objects().DeleteFinalizer", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, err := s.Objects().DeleteFinalizer(ctx, gk, id, "f")
+			return err
+		}},
+		{"Objects().Delete", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.Objects().Delete(ctx, id)
+		}},
+		{"Conditions().Set", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.Conditions().Set(ctx, gk, id, storeapi.Condition{Type: "Ready", Status: "True"})
+		}},
+		{"Conditions().Delete", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.Conditions().Delete(ctx, gk, id, "Ready")
+		}},
+		{"Events().Add", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.Events().Add(ctx, gk, id, storeapi.EventsAddInput{
+				Category: "c", Type: "Normal", Reason: "R", Message: "m",
+			})
+		}},
+		{"Events().Sweep", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
+			_, err := s.Events().Sweep(ctx, 1, time.Hour, 16)
+			return err
+		}},
+		{"Edges().Add", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, err := s.Edges().Add(ctx, id, id, storeapi.RelationDependsOn)
+			return err
+		}},
+		{"Edges().Delete", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, err := s.Edges().Delete(ctx, id, id, storeapi.RelationDependsOn)
+			return err
+		}},
+		{"Edges().DeleteFinalizingDependsOn", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.Edges().DeleteFinalizingDependsOn(ctx, id)
+		}},
+		{"Dependencies().WatermarkSet", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.Dependencies().WatermarkSet(ctx, id, 1)
+		}},
+		{"DeletionRequests().Create", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, err := s.DeletionRequests().Create(ctx, gk, id)
+			return err
+		}},
+		{"DeletionRequests().CreateFromOwner", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			_, err := s.DeletionRequests().CreateFromOwner(ctx, id)
+			return err
+		}},
+		{"ReconcileOwed().Stamp", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.ReconcileOwed().Stamp(ctx, []storeapi.ObjectRef{{ID: id, Group: gk.Group, Kind: gk.Kind}})
+		}},
+		{"ReconcileOwed().Increment", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return sqliteReconcileOwed{s}.Increment(ctx, id) // not on the interface
+		}},
+		{"ReconcileOwed().Decrement", func(ctx context.Context, s *sqliteStore, id storeapi.ObjectID) error {
+			return s.ReconcileOwed().Decrement(ctx, gk, id, 1)
+		}},
+		{"ReconcileOwed().Sweep", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
+			_, err := s.ReconcileOwed().Sweep(ctx, []storeapi.GroupKind{gk})
+			return err
+		}},
+		{"ObjectWrites().Sweep", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
+			// A maxAge that matches every entry, so the sweep reaches its delete.
+			_, err := s.ObjectWrites().Sweep(ctx, 16, time.Nanosecond)
+			return err
+		}},
+		{"DriverCursors().Set", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
+			return s.DriverCursors().Set(ctx, "d", 1)
+		}},
+	}
+
+	for _, tc := range writes {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRawStore(t)
+			obj := newKindObject(t, store, gk)
+			// A child, so the cascade has something to mark: with none it is a lone
+			// SELECT and there is no write to refuse.
+			child := newKindObject(t, store, gk)
+			require.NoError(t, addEdge(ctx, store, child.ID, obj.ID, storeapi.RelationOwnedBy))
+
+			err := store.withinRead(ctx, func(ctx context.Context) error {
+				return tc.write(ctx, store, obj.ID)
+			})
+			assert.ErrorIs(t, err, errWroteInReadTx)
+		})
+	}
 }

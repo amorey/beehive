@@ -37,21 +37,39 @@ not a permission. This is invisible in our code and the whole change rests on it
 *commits*. Measured, same statement both ways: `attempt to write a readonly
 database (8)` on disk, `<nil>` in memory. Nine call sites in the sqlite suite open
 on disk against ~380 tests, so the pragma is absent almost everywhere the tests
-run. The frame therefore latches what it can: `sealForCommit` refuses a read frame
-that drew a resource version, since a version drawn onto a read frame is never
-published — `withinRead` settles nothing. **In `sealForCommit`, not beside it**:
-that is the one critical section holding the lock which admits nested frames, so
-outside it a sibling goroutine can draw between the check and the seal.
+run, so the pragma cannot be the guard.
 
-**The latch catches draw-bearing writes only, and that is the whole of it.** A
-write that draws nothing — `DriverCursors().Set` is the one in the store today —
-passes the seal, and under `OpenMemory` commits. Nothing reaches it now, because
-all four grouped reads are pure reads; a future one that also stamped a cursor
-would. A tighter guard was considered and declined: `conn` is shared with `Within`
-and cannot be made airtight anyway, since a `DELETE … RETURNING` writes through
-`QueryContext` — the same reason `read`'s own comment gives for why a runtime
-check cannot stand in for its read-only interface. A partial guard that reads as
-total is worse than a stated limit.
+**`conn` is.** It returns `(dbtx, error)` and refuses a read frame outright, so no
+statement is issued at all. That works because of a property the package already
+had: **every data write takes its connection from `conn`**, and the only direct
+uses of `st.tx` are the savepoint statements. `TestNoWriteBypassesConn` holds that
+structurally — it lists the functions carrying write SQL and asserts each takes
+its connection from `conn` or from a caller that did. A roster of verbs could not:
+a verb added without going through `conn` is also a verb nobody adds to a roster.
+
+Note what this is and is not bought by. On disk the pragma is already total —
+`query_only` rejects a write whatever Go method issued it, `UPDATE … RETURNING`
+included. What `roDBTX` cannot catch is a separate point, about the *type*: it
+keeps `QueryContext`, so a `RETURNING` write compiles onto it. The guard in `conn`
+exists for `OpenMemory`, and that is the whole of it.
+
+**So the alternative was to fix `OpenMemory` instead**, giving it a `query_only`
+reader so both modes enforce identically. Declined, but it is the better long-term
+shape and worth revisiting: `file::memory:` is per-connection, so a second pool is
+a different and empty database, and the ways around that are a shared-cache DSN —
+which trades this divergence for another, with no WAL and different locking — or
+bracketing the frame with `PRAGMA query_only` on a pinned connection, which needs
+verifying that SQLite honours the flip inside an open transaction.
+
+The cost is a returned error on ~25 write paths that previously could not fail
+there, and one write path (`Edges().Add`) folded from three `conn` calls to one.
+`deleteWriteLogRows` now takes its `c` from its caller, as `appendWriteLog` did.
+
+**`errWroteInReadTx` is unexported and undocumented on `Store`,** unlike every
+other error those methods return. Deliberate: `withinRead` is unexported, so only
+this store can build a frame that produces it, and no embedder implementing
+`Store` can be in a position to match on it. It is a programming error, not a
+condition a caller handles.
 
 **`Within` and `withinRead` share one frame protocol** (`runTx`). Begin, install
 the frame, seal, commit, settle, drain the hooks: that ordering is contractual,
