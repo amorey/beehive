@@ -37,9 +37,12 @@ not a permission. This is invisible in our code and the whole change rests on it
 *commits*. Measured, same statement both ways: `attempt to write a readonly
 database (8)` on disk, `<nil>` in memory. Nine call sites in the sqlite suite open
 on disk against ~380 tests, so the pragma is absent almost everywhere the tests
-run. The frame therefore latches it too: `runTx` refuses to commit a read frame
-that drew a resource version, because only a write draws, and a version drawn onto
-a read frame is never published — `withinRead` settles nothing.
+run. The frame therefore latches it too: `sealForCommit` refuses a read frame that drew
+a resource version, because only a write draws, and a version drawn onto a read
+frame is never published — `withinRead` settles nothing. **In `sealForCommit`, not
+beside it**: that is the one critical section holding the lock which admits nested
+frames, so outside it a sibling goroutine can draw between the check and the
+seal.
 
 **`Within` and `withinRead` share one frame protocol** (`runTx`). Begin, install
 the frame, seal, commit, settle, drain the hooks: that ordering is contractual,

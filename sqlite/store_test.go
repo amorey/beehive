@@ -3448,6 +3448,15 @@ func TestTxStateSealForCommit(t *testing.T) {
 
 		assert.ErrorIs(t, st.sealForCommit(), assert.AnError)
 	})
+
+	// Here rather than in runTx: outside this lock a sibling goroutine can draw
+	// between the check and the seal.
+	t.Run("refuses a read frame that drew", func(t *testing.T) {
+		st := &txState{readOnly: true}
+		st.noteDraw(7)
+
+		assert.ErrorIs(t, st.sealForCommit(), errWroteInReadTx)
+	})
 }
 
 // TestWithinRefusesAContextFromAnUnwoundFrame: depth is reusable, so it cannot be the
@@ -9107,6 +9116,25 @@ func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
 		})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "readonly database")
+	})
+
+	// A nested frame a sibling goroutine opened and closed during fn is caught by
+	// the same latch, since the draw is on the shared frame either way.
+	t.Run("by the frame, from a sibling goroutine", func(t *testing.T) {
+		store := newRawStore(t)
+		obj := newKindObject(t, store, testGK)
+		err := store.withinRead(ctx, func(readCtx context.Context) error {
+			done := make(chan error, 1)
+			go func() {
+				done <- store.Within(readCtx, func(nested context.Context) error {
+					_, err := store.Objects().UpdateStatus(
+						nested, testGK, obj.ID, []byte(`{"n":1}`), 0)
+					return err
+				})
+			}()
+			return <-done // the nested frame closes before fn returns
+		})
+		assert.ErrorIs(t, err, errWroteInReadTx)
 	})
 
 	// OpenMemory aliases the reader to the writer, so that pragma is absent and the

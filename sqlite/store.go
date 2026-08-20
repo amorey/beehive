@@ -311,6 +311,9 @@ func (st *txState) pushSavepoint(depth int, caller int64) (name int64, err error
 // committing is safe — both under the lock that admits frames, so nothing slips
 // between the check and the commit. A live frame here can only belong to another
 // goroutine.
+//
+// The read-frame check belongs in here for that same reason: outside the lock, a
+// sibling goroutine can draw between the check and the seal.
 func (st *txState) sealForCommit() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -319,6 +322,11 @@ func (st *txState) sealForCommit() error {
 	}
 	if st.height != 0 {
 		return storeapi.ErrConcurrentNestedTx
+	}
+	// Only a write draws. On the reader that is a pragma error already, but under
+	// OpenMemory it would commit with a version nothing publishes.
+	if st.readOnly && st.drawn != 0 {
+		return errWroteInReadTx
 	}
 	st.sealed = true
 	return nil
@@ -603,11 +611,6 @@ func (s *sqliteStore) runTx(
 	// frame still open belongs to another goroutine — COMMIT would release its
 	// savepoint and land its writes. Both are checked, and the door shut on new
 	// frames, in one critical section; the deferred Rollback does the discarding.
-	if st.readOnly && st.highestDraw() != 0 {
-		// Only a write draws. On the reader that is a pragma error already, but
-		// under OpenMemory it would commit with a version nothing publishes.
-		return errWroteInReadTx
-	}
 	if err := st.sealForCommit(); err != nil {
 		return err
 	}
