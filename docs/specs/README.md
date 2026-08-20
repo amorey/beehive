@@ -28,7 +28,7 @@ by measured value now that some of them have been measured — the read-only
 transaction moved down after a prototype priced it.
 
 1. [Reserve resource versions in blocks](2026-08-20-reserve-resource-versions-in-blocks.md)
-   — ~16 µs off every write, about 40% of a minimal one. No open questions.
+   — ~26 µs off every write: 27% of a status write, 15% of a spec write.
 2. [A spec write writes before it reads](2026-08-20-a-spec-write-writes-before-it-reads.md)
    — one statement instead of two whenever a spec write changes something.
 3. [Cache prepared statements](2026-08-20-cache-prepared-statements.md) — ~2–6 µs
