@@ -96,6 +96,10 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
+	// readDB serves reads that are not inside a transaction. nil when the
+	// database cannot be opened twice (see OpenMemory), where reads use db.
+	readDB *sql.DB
+
 	// txCount counts transactions begun; a nested Within (savepoint) does not add.
 	// Test-only, to assert a fast path answered without BEGIN IMMEDIATE.
 	txCount atomic.Int64
@@ -477,10 +481,40 @@ type dbtx interface {
 // write issued on it commits standalone rather than failing with sql.ErrTxDone.
 // Hooks should use the detached ctx AfterCommit hands them.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
-	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
-		return fr.st.tx
+	if st := liveTx(ctx); st != nil {
+		return st.tx
 	}
 	return s.db
+}
+
+// read returns the connection a read-only statement runs on: the ambient
+// transaction while it is live, else the read pool.
+//
+// Returning the transaction is the whole safety property, not an optimisation.
+// A read issued inside a transaction on any other connection sees the database
+// as of before that transaction's own uncommitted writes — and unlike today's
+// deadlock, that failure is silent.
+//
+// readDB is nil where the database cannot be opened twice (see OpenMemory), and
+// reads fall back to the writer.
+func (s *sqliteStore) read(ctx context.Context) dbtx {
+	if st := liveTx(ctx); st != nil {
+		return st.tx
+	}
+	if s.readDB != nil {
+		return s.readDB
+	}
+	return s.db
+}
+
+// liveTx returns the ctx's transaction frame while it is still open. A ctx
+// outlives its transaction, so a closed frame reads as none: a statement issued
+// on it commits standalone rather than failing with sql.ErrTxDone.
+func liveTx(ctx context.Context) *txState {
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		return fr.st
+	}
+	return nil
 }
 
 // Within runs fn inside a single transaction. A nested Within joins the outer
