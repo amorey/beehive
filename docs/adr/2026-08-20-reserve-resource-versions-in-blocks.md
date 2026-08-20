@@ -35,7 +35,9 @@ the writer is one connection and the caller holds it, so the draw waits for a
 connection its own caller will not release — measured, a hang rather than an error.
 A second writer pool does not help, because `_txlock=immediate` means the ambient
 transaction holds SQLite's write lock. So the reservation runs at `open` and at the
-tail of the outermost `Within`, after `tx.Commit()` has returned the connection.
+tail of the outermost `Within`, after `tx.Commit()` has returned the connection and
+**before the `AfterCommit` hooks** — a hook may open a transaction on that one
+connection, and the refill would then queue behind it.
 Its failure is swallowed: the commit has already landed, so it cannot be reported,
 and the next draw raises it where a caller can act.
 
@@ -78,7 +80,7 @@ and at or below the watermark it stamps.
 
 **A commit publishes its own draws, never the allocator's high water mark.**
 Publication happens in the tail of `Within`, immediately after `Commit` released
-SQLite's write lock and **before** the `AfterCommit` hooks — those wake the waker,
+SQLite's write lock and before the `AfterCommit` hooks — those wake the waker,
 whose dependent samples the cursor on another goroutine. Another writer can be
 mid-transaction by the time a commit publishes, holding a version out of the
 block. Publishing `next - 1` would cover it, and a concurrent

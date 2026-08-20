@@ -211,9 +211,10 @@ func TestTheCursorNeverCoversALiveTransaction(t *testing.T) {
 // one connection that transaction is holding; unbounded, the commit waits out its
 // whole life.
 func TestARefillDoesNotWaitOutASiblingTransaction(t *testing.T) {
-	withBlockSize(t, 1) // spent after every write, so every commit refills
+	const block = 2
+	withBlockSize(t, block)
 	prev := refillTimeout
-	refillTimeout = 20 * time.Millisecond
+	refillTimeout = time.Millisecond // tight: the refill must not be waiting at all
 	t.Cleanup(func() { refillTimeout = prev })
 
 	ctx := context.Background()
@@ -225,8 +226,11 @@ func TestARefillDoesNotWaitOutASiblingTransaction(t *testing.T) {
 	returned := make(chan error, 1)
 	go func() {
 		returned <- store.Within(ctx, func(ctx context.Context) error {
-			if _, err := store.Objects().UpdateStatus(ctx, testGK, first.ID, []byte(`{"n":1}`), 0); err != nil {
-				return err
+			// block draws spend it however it was positioned, so the commit refills.
+			for i := range block {
+				if _, err := store.Objects().UpdateStatus(ctx, testGK, first.ID, fmt.Appendf(nil, `{"n":%d}`, i), 0); err != nil {
+					return err
+				}
 			}
 			store.AfterCommit(ctx, func(context.Context) {
 				go func() {
@@ -250,6 +254,10 @@ func TestARefillDoesNotWaitOutASiblingTransaction(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the commit is waiting on a connection the sibling transaction holds")
 	}
+	// The sibling took one version out of the refilled block, so one is left. Spent
+	// would mean the refill was still queued behind the sibling when it timed out.
+	assert.False(t, store.versions.spent(),
+		"the refill must run before a hook can open a transaction on the one connection")
 	close(release)
 	<-sibling
 }

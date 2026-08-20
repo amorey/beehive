@@ -577,9 +577,12 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Before the hooks: they wake the waker, whose dependent samples the cursor on
-	// another goroutine and would stamp a watermark below its target's version.
+	// Both before the hooks. Publishing after them lets the waker's dependent sample
+	// the cursor below its target's version; refilling after them puts the draw
+	// behind whatever transaction a hook has opened on the connection this commit
+	// just released.
 	s.versions.publish(st.highestDraw())
+	s.refillVersions(ctx)
 	// flush latches closed before the hooks below run — a close deferred to return
 	// would read false while a hook can hand its captured tx ctx back to the store.
 	hooks := st.flush()
@@ -587,7 +590,6 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	for _, hook := range hooks {
 		hook.fn()
 	}
-	s.refillVersions(ctx)
 	return nil
 }
 
