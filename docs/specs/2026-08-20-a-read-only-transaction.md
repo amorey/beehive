@@ -2,8 +2,9 @@
 
 - **Status:** Planned.
 - **Date:** 2026-08-20
-- **Depends on:** nothing. Wanted before the read-pool split in
-  [`TODO.md`](../TODO.md).
+- **Depends on:** [reads get their own connections](2026-08-20-reads-get-their-own-connections.md).
+  A grouped read belongs on the read pool, and it needs a transaction there to
+  see one instant across its statements.
 
 ## Why
 
@@ -28,9 +29,11 @@ Measured on an arm64 sandbox, on disk:
 
 So about 2.8 µs per grouped read today, and a write lock held for no reason.
 The lock costs nothing while the pool is one connection, because everything
-already queues there. It starts costing the moment there is a read pool, which
-is the change `TODO.md` parks. Doing this first means that change does not have
-to also fix these five call sites.
+already queues there.
+
+With the read pool it stops being merely wasteful. These five reads belong on the
+reader, and the reader is opened `query_only(true)`, which refuses a write lock —
+so `IMMEDIATE` there does not work at all. This is what lets those call sites move.
 
 `modernc.org/sqlite` gives us the deferred begin for free: `newTx` applies the
 DSN's `_txlock` only when `opts.ReadOnly` is false (`tx.go:22-25`). So
@@ -74,9 +77,9 @@ The five call sites above switch to it.
   opened the transaction, so nested frames, `sealForCommit` and the unwind rules
   are untouched. Do not fork them.
 
-- **A read transaction still holds the connection.** The rule that a read issued
-  outside the transaction while inside one deadlocks is unchanged, and is still
-  stated in `Client.Watch`'s godoc.
+- **A read transaction still holds a connection**, one of the reader's N. It
+  also pins the WAL: it cannot be checkpointed past this snapshot while the
+  transaction is open, so a grouped read that pages is what grows the file.
 
 - **`fakeStore` in `testutils_test.go`** gains `WithinRead`, running fn inline as
   its `Within` does.
@@ -104,5 +107,5 @@ matters for later readers — `Within` means "I intend to write", and choosing i
 for a read is now a mistake rather than a style. Note the modernc detail, because
 the whole thing rests on it and it is invisible in our code.
 
-Add a line to the read-pool item in [`TODO.md`](../TODO.md): the five call sites
-are already correct, so that change is the pool plus `s.read(ctx)`, nothing more.
+The read-pool ADR and this one describe one boundary from two sides; cross-link
+them rather than restating either.

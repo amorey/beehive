@@ -3,7 +3,9 @@
 - **Status:** Planned. No semantic change; the whole of it is a statement table
   in front of `s.conn`.
 - **Date:** 2026-08-20
-- **Depends on:** nothing.
+- **Depends on:** [reads get their own connections](2026-08-20-reads-get-their-own-connections.md).
+  Not for convenience: a held statement taxes the connection it sits on, so
+  without the split every configuration of this spec regresses something.
 
 ## Why
 
