@@ -29,6 +29,17 @@ type stmtID int
 const (
 	stmtGetObjectRow stmtID = iota
 	stmtIncrementOwed
+	stmtCheckObjectExists
+	stmtGetObjectRowByName
+	stmtGetForReconcile
+	stmtListUnsettledIDs
+	stmtListIDs
+	// The scoped reads: one per column list selectScoped is asked for.
+	stmtScopedGate
+	stmtScopedDeletion
+	stmtScopedGeneration
+	stmtScopedStatus
+	stmtScopedFinalizers
 
 	numStmts
 )
@@ -37,6 +48,34 @@ const (
 var stmtSQL = [numStmts]string{
 	stmtGetObjectRow:  `SELECT ` + objectColumns + ` FROM objects WHERE id = ?`,
 	stmtIncrementOwed: `UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`,
+
+	stmtCheckObjectExists:  `SELECT 1 FROM objects WHERE id = ?`,
+	stmtGetObjectRowByName: `SELECT ` + objectColumns + ` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
+	stmtGetForReconcile: `
+		SELECT ` + objectColumns + `,
+		       EXISTS (SELECT 1 FROM edges
+		                WHERE from_id = objects.id AND relation = 'depends_on')
+		  FROM objects WHERE id = ?`,
+	stmtListUnsettledIDs: `SELECT id FROM objects
+		 WHERE "group" = ? AND kind = ?
+		   AND (observed_generation IS NULL OR observed_generation < generation)
+		 ORDER BY id`,
+	stmtListIDs: `SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
+
+	stmtScopedGate:       scopedSQL(``),
+	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
+	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
+	stmtScopedStatus:     scopedSQL(`schema_version_status, status`),
+	stmtScopedFinalizers: scopedSQL(`finalizers, deletion_requested_at IS NOT NULL`),
+}
+
+// scopedSQL builds selectScoped's read: the kind gate's two columns, plus
+// whatever the caller scans beside them.
+func scopedSQL(cols string) string {
+	if cols == "" {
+		return `SELECT "group", kind FROM objects WHERE id = ?`
+	}
+	return `SELECT "group", kind, ` + cols + ` FROM objects WHERE id = ?`
 }
 
 // stmtWrites marks the ids that write, which are prepared on the writer alone.

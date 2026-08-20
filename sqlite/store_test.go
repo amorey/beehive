@@ -4205,16 +4205,16 @@ func TestSelectScopedGatesAndReadsNamedColumns(t *testing.T) {
 	obj := newRefObject(t, store)
 
 	var gen int64
-	var deletionAt sql.NullInt64
+	var observed sql.NullInt64
 	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID,
-		`generation, deletion_requested_at`, &gen, &deletionAt))
+		stmtScopedGeneration, &gen, &observed))
 	assert.Equal(t, obj.Generation, gen)
-	assert.False(t, deletionAt.Valid)
+	assert.False(t, observed.Valid, "nothing has reconciled it")
 
 	// No columns: the gate alone, which is what checkObjectScoped wants.
-	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID, ``))
-	assert.ErrorIs(t, store.selectScoped(ctx, testGK, 999999, ``), beehive.ErrNotFound)
-	assert.ErrorIs(t, store.selectScoped(ctx, beehive.GroupKind{Kind: "Other"}, obj.ID, ``),
+	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID, stmtScopedGate))
+	assert.ErrorIs(t, store.selectScoped(ctx, testGK, 999999, stmtScopedGate), beehive.ErrNotFound)
+	assert.ErrorIs(t, store.selectScoped(ctx, beehive.GroupKind{Kind: "Other"}, obj.ID, stmtScopedGate),
 		beehive.ErrWrongKind)
 }
 
@@ -8785,14 +8785,18 @@ func inspectPackage(t *testing.T, visit func(fn, recv string, n ast.Node)) error
 		if err != nil {
 			return err
 		}
-		var fn, recv string
-		ast.Inspect(file, func(n ast.Node) bool {
-			if decl, ok := n.(*ast.FuncDecl); ok {
-				fn, recv = decl.Name.Name, receiverName(decl)
+		// Per declaration, so a package-level var after a function is attributed to
+		// no function rather than to whichever one precedes it.
+		for _, decl := range file.Decls {
+			var fn, recv string
+			if fd, ok := decl.(*ast.FuncDecl); ok {
+				fn, recv = fd.Name.Name, receiverName(fd)
 			}
-			visit(fn, recv, n)
-			return true
-		})
+			ast.Inspect(decl, func(n ast.Node) bool {
+				visit(fn, recv, n)
+				return true
+			})
+		}
 		return nil
 	})
 }
@@ -9598,4 +9602,48 @@ func TestOpenFailsOnAStatementItCannotPrepare(t *testing.T) {
 	reopened, err := Open(path)
 	require.NoError(t, err)
 	t.Cleanup(func() { reopened.Close() })
+}
+
+// Each objects-family read reaches stmtFor. The count is "at least one" rather
+// than exact: some of these attach conditions, and this pins the wiring, not the
+// statement count.
+func TestTheObjectsFamilyIssuesPreparedStatements(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	reads := []struct {
+		name string
+		read func() error
+	}{
+		{"checkObjectExists", func() error { return store.checkObjectExists(ctx, obj.ID) }},
+		{"selectScoped", func() error {
+			_, err := store.probeObjectScoped(ctx, testGK, obj.ID)
+			return err
+		}},
+		{"getObjectRowByName", func() error {
+			_, err := store.getObjectRowByName(ctx, testGK, obj.Name)
+			return err
+		}},
+		{"GetForReconcile", func() error {
+			_, err := store.Objects().GetForReconcile(ctx, obj.ID)
+			return err
+		}},
+		{"ListUnsettledIDs", func() error {
+			_, err := store.Objects().ListUnsettledIDs(ctx, testGK)
+			return err
+		}},
+		{"ListIDs", func() error {
+			_, err := store.Objects().ListIDs(ctx, testGK)
+			return err
+		}},
+	}
+
+	for _, tc := range reads {
+		t.Run(tc.name, func(t *testing.T) {
+			before := store.stmtUses.Load()
+			require.NoError(t, tc.read())
+			assert.Greater(t, store.stmtUses.Load(), before, "issues a prepared statement")
+		})
+	}
 }

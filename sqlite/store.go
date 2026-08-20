@@ -957,15 +957,15 @@ func (s *sqliteStore) selectScoped(
 	ctx context.Context,
 	gk storeapi.GroupKind,
 	id storeapi.ObjectID,
-	cols string,
+	stmt stmtID,
 	dest ...any,
 ) error {
-	q := `SELECT "group", kind FROM objects WHERE id = ?`
-	if cols != "" {
-		q = `SELECT "group", kind, ` + cols + ` FROM objects WHERE id = ?`
+	ps, err := s.stmtFor(ctx, stmt)
+	if err != nil {
+		return err
 	}
 	var group, kind string
-	err := s.read(ctx).QueryRowContext(ctx, q, id).
+	err = ps.QueryRowContext(ctx, id).
 		Scan(append([]any{&group, &kind}, dest...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storeapi.ErrNotFound // bare, like scanObject's
@@ -990,7 +990,7 @@ func gateKind(gk storeapi.GroupKind, id storeapi.ObjectID, group, kind string) e
 // errors as a scoped read: ErrNotFound, ErrWrongKind.
 func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (deletionPending bool, err error) {
 	var deletionAt sql.NullInt64
-	if err := s.selectScoped(ctx, gk, id, `deletion_requested_at`, &deletionAt); err != nil {
+	if err := s.selectScoped(ctx, gk, id, stmtScopedDeletion, &deletionAt); err != nil {
 		return false, err
 	}
 	return deletionAt.Valid, nil
@@ -999,8 +999,12 @@ func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKi
 // checkObjectExists is probeObjectScoped without the kind gate: ErrNotFound, or
 // nil.
 func (s *sqliteStore) checkObjectExists(ctx context.Context, id storeapi.ObjectID) error {
+	ps, err := s.stmtFor(ctx, stmtCheckObjectExists)
+	if err != nil {
+		return err
+	}
 	var one int
-	err := s.read(ctx).QueryRowContext(ctx, `SELECT 1 FROM objects WHERE id = ?`, id).Scan(&one)
+	err = ps.QueryRowContext(ctx, id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storeapi.ErrNotFound // bare, like scanObject's
 	}
@@ -1009,7 +1013,7 @@ func (s *sqliteStore) checkObjectExists(ctx context.Context, id storeapi.ObjectI
 
 // checkObjectScoped is probeObjectScoped for callers that only need the gate.
 func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
-	return s.selectScoped(ctx, gk, id, ``)
+	return s.selectScoped(ctx, gk, id, stmtScopedGate)
 }
 
 // getObjectRow reads the objects row without assembling conditions.
@@ -1050,12 +1054,11 @@ func (s sqliteObjects) Get(ctx context.Context, id storeapi.ObjectID) (*storeapi
 // would be both unobserved by this load and at or below the watermark it stamps.
 func (s sqliteObjects) GetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
 	load := storeapi.ReconcileLoad{Cursor: s.versions.latest()}
-	row := s.read(ctx).QueryRowContext(ctx, `
-		SELECT `+objectColumns+`,
-		       EXISTS (SELECT 1 FROM edges
-		                WHERE from_id = objects.id AND relation = 'depends_on')
-		  FROM objects WHERE id = ?`, id)
-	obj, err := scanObject(row, &load.HasDependencies)
+	ps, err := s.stmtFor(ctx, stmtGetForReconcile)
+	if err != nil {
+		return storeapi.ReconcileLoad{}, err
+	}
+	obj, err := scanObject(ps.QueryRowContext(ctx, id), &load.HasDependencies)
 	if err != nil {
 		return storeapi.ReconcileLoad{}, err
 	}
@@ -1081,10 +1084,11 @@ func (s sqliteObjects) GetMetaByName(ctx context.Context, gk storeapi.GroupKind,
 // getObjectRowByName is getObjectRow keyed by name within gk. No ErrWrongKind:
 // the kind is in the WHERE.
 func (s *sqliteStore) getObjectRowByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
-	row := s.read(ctx).QueryRowContext(ctx,
-		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
-		gk.Group, gk.Kind, name)
-	return scanObject(row)
+	ps, err := s.stmtFor(ctx, stmtGetObjectRowByName)
+	if err != nil {
+		return nil, err
+	}
+	return scanObject(ps.QueryRowContext(ctx, gk.Group, gk.Kind, name))
 }
 
 func (s sqliteObjects) GetByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
@@ -1190,12 +1194,11 @@ func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.O
 }
 
 func (s sqliteObjects) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT id FROM objects
-		 WHERE "group" = ? AND kind = ?
-		   AND (observed_generation IS NULL OR observed_generation < generation)
-		 ORDER BY id`,
-		gk.Group, gk.Kind)
+	ps, err := s.stmtFor(ctx, stmtListUnsettledIDs)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, gk.Group, gk.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -1404,9 +1407,11 @@ func (s sqliteDependencies) WatermarkSet(ctx context.Context, id storeapi.Object
 }
 
 func (s sqliteObjects) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
-		gk.Group, gk.Kind)
+	ps, err := s.stmtFor(ctx, stmtListIDs)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, gk.Group, gk.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -1684,7 +1689,7 @@ func (s sqliteObjects) SetObservedGeneration(ctx context.Context, gk storeapi.Gr
 			generation  int64
 			observedGen sql.NullInt64
 		)
-		if err := s.selectScoped(ctx, gk, id, `generation, observed_generation`, &generation, &observedGen); err != nil {
+		if err := s.selectScoped(ctx, gk, id, stmtScopedGeneration, &generation, &observedGen); err != nil {
 			return err
 		}
 		if err := checkObservedNotFuture(observedGeneration, generation, id); err != nil {
@@ -1761,8 +1766,7 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 			storedVersion int
 			storedStatus  []byte
 		)
-		if err := s.selectScoped(ctx, gk, id,
-			`schema_version_status, status`,
+		if err := s.selectScoped(ctx, gk, id, stmtScopedStatus,
 			&storedVersion, &storedStatus); err != nil {
 			return err
 		}
@@ -2515,8 +2519,8 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 			raw             []byte
 			deletionPending bool
 		)
-		if err := s.selectScoped(ctx, gk, id,
-			`finalizers, deletion_requested_at IS NOT NULL`, &raw, &deletionPending); err != nil {
+		if err := s.selectScoped(ctx, gk, id, stmtScopedFinalizers,
+			&raw, &deletionPending); err != nil {
 			return err
 		}
 		var held []string
