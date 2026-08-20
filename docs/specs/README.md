@@ -27,11 +27,15 @@ been measured came back below its estimate, so price the rest before building
 them.
 
 1. [Cache prepared statements](2026-08-20-cache-prepared-statements.md) — ~2–6 µs
-   off every statement, so the widest of these. The table serves the **read pool
-   only**: −63% on a bare read, the writer untouched. That is what settles the
-   question the spec used to turn on — the shared-cursor hazard lives inside a
-   transaction on the writer, and the pool rules it out on the reader. One
-   benchmark is owed before implementation; the spec says which.
+   off every statement, so the widest of these. Every constant statement prepared
+   at startup into a named field per pool: −63% on a bare read, −24% on a write
+   transaction. No runtime table to cap, evict or guard, and no new guarantee —
+   the transaction contract already says a transaction ctx belongs to one
+   goroutine. It carries four doc fixes that say so where it is read, and re-keys
+   two structural tripwires the SQL hoist would otherwise break. The measurement
+   it owed is taken: a connection holding prepared statements taxes everything on
+   it, +25% unprepared and +4% prepared, as a step that saturates by fifteen
+   statements rather than a slope.
 2. [Conclude a pass in one transaction](2026-08-20-conclude-a-pass-in-one-transaction.md)
    — proposed; ~20 µs a pass, and it changes three failure arguments. Unmeasured.
 

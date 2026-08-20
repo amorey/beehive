@@ -1,419 +1,457 @@
 # Cache prepared statements
 
-- **Status:** Planned, with one benchmark owed *before* implementation — see
-  *Measure this first*. The question this spec turned on is settled: the table
-  serves the read pool, and the writer is left alone.
+- **Status:** Planned. Every statement whose text is constant is **prepared at
+  startup, into a named field on each pool's set**. Nothing is prepared at
+  runtime. The one measurement this spec owed has been taken — see *What
+  residency costs*.
 - **Date:** 2026-08-20
-- **Depends on:** two things already shipped.
-  [Reads get their own connections](../adr/2026-08-20-reads-get-their-own-connections.md)
-  draws the line the table stops at.
-  [A read that groups is a read transaction](../adr/2026-08-20-a-read-that-groups-is-a-read-transaction.md)
-  is **unexported** — no caller can open a read transaction, which is what makes
-  caching inside one safe without asking anyone to promise anything.
+- **Depends on:** [reads get their own connections](../adr/2026-08-20-reads-get-their-own-connections.md),
+  which is why there are two pools to prepare against.
+- **Also changes:** four places where the transaction contract is stated
+  wrongly, not at all, or as a defence it is not — see *The contract this rests
+  on* — and two structural tripwires that the SQL hoist re-keys, see *What is
+  prepared*.
 
 ## Why
 
 `database/sql` prepares a statement, runs it, and throws it away on every
-`QueryContext` / `ExecContext`. SQLite parses and plans the SQL each time, and
-the store issues about seventy distinct SQL strings, so every one of those parses
-repeats forever.
+`QueryContext` / `ExecContext`. SQLite parses and plans the SQL each time, so
+every one of those parses repeats forever.
 
 Measured on an arm64 sandbox, on disk, WAL, `synchronous=NORMAL`. The saving is
 per statement and scales with how much SQL there is to parse, so the statement
 has to be named beside the number:
 
-| Statement | plain | cached | saved |
+| Statement | plain | prepared | saved |
 |---|---|---|---|
 | one column by primary key | 5.9 µs | 3.0 µs | 2.9 µs |
 | seventeen columns by primary key, 1000-row table | 15.9 µs | 9.7 µs | 6.2 µs |
 
-End to end, a `GetMeta` on a store with a warm cache of 22 statements ran 21.2 µs
-plain against 7.7 µs cached — **−63%**.
-
-**A standalone `Prepare` costs more than the parse it saves, and the two numbers
-measure different things.** `PrepareContext` plus `Close` of the seventeen-column
-select is 13.8 µs against 17.8 µs for the whole plain query. Preparing in a loop
-reads higher still, 16–23 µs each, because every one pays a pool round trip and
-`database/sql`'s per-statement bookkeeping. The saving above is the marginal
-parse the plain path pays inline. Neither figure contradicts the other; a reader
-who sees only the second concludes the implementation underperformed.
-
-So **each SQL shape costs about 19 µs once and returns 2–6 µs per execution**,
-and break-even is a handful of executions per shape.
-
-## Where the statements live
-
-**On the read pool, and nowhere else.** Bare reads, and reads inside a read
-transaction. Every statement the writer runs — every write, and every read inside
-a write transaction — is left exactly as it is today.
-
-The store measured four ways, before any split:
+The store measured three ways:
 
 | | pool read | write transaction | ten reads in a transaction |
 |---|---|---|---|
-| no cache | 21.2 µs | 89.0 µs | 202.4 µs |
-| cached everywhere | 7.8 µs (−63%) | 67.2 µs (−24%) | 73.4 µs (−64%) |
-| cached except cursor-holding reads in a transaction | 7.7 µs (−64%) | 81.6 µs (**−8%**) | 255.5 µs (**+26%**) |
+| nothing prepared | 21.2 µs | 89.0 µs | 202.4 µs |
+| **prepared everywhere** | **7.8 µs (−63%)** | **67.2 µs (−24%)** | **73.4 µs (−64%)** |
+| prepared except cursor-holding reads in a transaction | 7.7 µs (−64%) | 81.6 µs (−8%) | 255.5 µs (**+26%**) |
 
-The third row is what happens when an uncached statement shares a connection with
-cached ones: it pays for the caching without receiving it. Reading the table
-against the rule above:
+The middle row is what this spec builds. The third is the shape to avoid: an
+unprepared statement sharing a connection with prepared ones pays for the
+preparation without receiving it, which is why the answer is *every* constant
+statement rather than a hot subset. What every statement pays for sharing a
+connection with prepared ones — prepared statements included — is measured below.
 
-- **Pool read** takes the first column: −63%, the widest number here and the one
-  on the hottest path.
-- **Write transaction** is untouched. Not the −24%, and not the −8% either —
-  nothing on that connection changes, so the figure stays 89.0 µs.
-- **Ten reads in a read transaction** is the second row's shape: one connection,
-  every statement on it cached. The 73.4 µs should carry, but it was measured on
-  the writer, so treat it as the expectation and not as a measurement of this
-  configuration.
+**A standalone `Prepare` costs more than the parse it saves, and the two numbers
+measure different things.** `PrepareContext` plus `Close` of the seventeen-column
+select is 13.8 µs against 17.8 µs for the whole plain query. The saving above is
+the marginal parse the plain path pays inline. Neither figure contradicts the
+other; a reader who sees only the second concludes the implementation
+underperformed.
 
-**The third row is what we are buying our way out of, and one edge of it
-remains.** A caller's `Within` cannot regress: the writer carries nothing cached
-to mix with. The reader can — up to seven of the excluded data-rendered reads run
-there beside cached statements, the same mixed shape. That is the one number to settle
-before building any of this; see *Measure this first*.
+So **each statement costs about 19 µs per connection, once, at `open`, and
+returns 2–6 µs per execution.**
 
-## Filling the table
+## How they are prepared
 
-The table holds `*sql.Stmt` values prepared on the read pool. Outside a
-transaction they are executed directly; inside one they are not, and that is the
-part to get right.
+**At `open`, into named fields, one preparation per pool.** Nothing is prepared
+at runtime, so there is no table, no key, no fill path and no cap.
 
-**A hit inside a read transaction executes through `tx.StmtContext(ctx, stmt)`,
-never through the pooled statement itself.** A `*sql.Stmt` from
-`readDB.PrepareContext` belongs to the *pool*: calling its `QueryContext` inside
-`withinRead` checks out a second connection, so the read runs outside the
-transaction's snapshot — the silent failure `read` exists to prevent
-(`sqlite/store.go:531`) — and at `WithReadConnections(1)`, or under `OpenMemory`,
-it deadlocks instead of lying. `StmtContext` reuses the driver handle if this
-connection already compiled it and compiles it on this connection otherwise,
-taking no second connection either way.
+**Two sets, indexed by an id.**
 
-**A hit outside a transaction executes the pooled statement directly.**
+```go
+type stmtID int
 
-**A miss inside a read transaction cannot fill the table.** Putting an entry in it
-means `readDB.PrepareContext`, which waits for a connection while this goroutine
-is holding one — a guaranteed deadlock at a pool of one, and at N when N readers
-miss at once. Run the statement raw, queue its SQL, and prepare it once the
-transaction has returned.
+const (
+	stmtGetMeta stmtID = iota
+	stmtUpdateSpec
+	// ...
+	numStmts
+)
 
-**A miss outside a transaction prepares inline.** Nothing holds a connection, so
-this is an ordinary pool wait.
+// stmtSet is one pool's preparations. A write's slot in the reader's set stays
+// nil: preparing a write there succeeds and only fails on execution.
+type stmtSet [numStmts]*sql.Stmt
+```
 
-The queue is what the implementer would otherwise get wrong:
+A read is prepared in both sets; a write only in the writer's. **That asymmetry
+is load-bearing.** `PrepareContext` of an `INSERT` against a `query_only(true)`
+pool *succeeds* — measured, it returns nil, and only the execution fails with
+`attempt to write a readonly database (8)`. A slot that stays nil is the only
+representation `Open` can check.
 
-- **It lives on the `txState`, not the `txFrame`, and drains only when the
-  outermost frame returns.** A nested `withinRead` joins on a savepoint with a new
-  frame and the same state (`store.go:652`); draining when *that* frame returns
-  calls `PrepareContext` while the outermost transaction still holds the
-  connection, which is the deadlock the queue exists to prevent.
-- **It is guarded by `txState.mu`**, like every other field there: sibling
-  goroutines on one frame are legal.
-- **It drains synchronously in `withinRead`'s tail**, after `runTx` has returned
-  and released the connection, on a `context.WithoutCancel` ctx. Not in `settle`,
-  which is commit-only, and not in a goroutine: the store owns none.
-- **It drains whether or not `fn` succeeded**, or a read transaction that errors
-  leaves nothing warm.
+**The id, not a `*sql.Stmt`, is what a call site names.** A `*sql.Stmt` is one
+preparation, and choosing the preparation is the whole job: a site passing the
+reader's copy has chosen before anything looked at the ctx, and case 3 would then
+run `tx.StmtContext` with a read-pool statement on a write frame — the silent
+stale read. The site cannot choose correctly either, because the answer depends
+on the ctx it is about to pass.
 
-What the queue holds is SQL, never a marker in the table. A marker outlives the
-transaction that would have cleared it, so a failed read leaves that SQL uncached
-for the life of the store.
+```go
+// stmtFor returns id bound to the connection ctx selects: the transaction's own
+// connection while one is live, else the pool's own preparation. A nil slot is a
+// routing bug, and is reported here rather than at execution.
+func (s *sqliteStore) stmtFor(ctx context.Context, id stmtID) (*sql.Stmt, error)
+```
 
-**The table warms after one call; the compilation does not.** A statement is
-compiled per connection, so on a four-connection reader a hot statement is
-compiled four times, lazily, one reader at a time.
+`prepareStatements` asserts the invariant at startup — every read id non-nil in
+both sets, every write id nil in the reader's — which is stronger than any test
+over it, and makes the completeness check a loop rather than reflection over two
+struct types.
 
-**Every hit inside a read transaction allocates a tx-scoped `*sql.Stmt`** that
-`Tx.StmtContext` appends to `tx.stmts`, released only when the transaction ends.
-At the two to four reads the four `withinRead` bodies make, that is nothing — and
-the body that would make it something is the long, fanning-out one the invariant
-below already forbids.
+Three cases:
 
-## The accessors
+1. **No live transaction** — the statement from the pool's own set.
+2. **A `readOnly` frame** — `tx.StmtContext(ctx, s.readStmts[id])`. Never the pooled
+   statement itself: it belongs to the *pool*, so executing it inside
+   `withinRead` checks out a second connection and reads from outside the
+   transaction's snapshot — the silent failure `read` exists to prevent
+   (`sqlite/store.go:531`) — and at `WithReadConnections(1)`, or under
+   `OpenMemory`, it deadlocks instead of lying.
+3. **A write frame** — `tx.StmtContext(ctx, s.writeStmts[id])`, for reads as well as
+   writes. A read-pool statement here misses the transaction's own uncommitted
+   writes: measured, a read of a row the open writer transaction had just
+   inserted returned 0 rows, silently. This is why every read is prepared in the
+   writer's set as well.
 
-Two, and the routing lives inside them so no call site decides anything:
+`StmtContext` reuses the handle the transaction's connection already compiled, or
+compiles it there, taking no second connection either way.
 
-- **`s.read(ctx)`** keeps its name and now returns a caching `roDBTX`. It caches
-  when the ctx carries no live transaction, or one that is `readOnly`; otherwise
-  it hands back what it hands back today. Both `QueryContext` and
-  `QueryRowContext` route — 17 of the 39 sites are `QueryRowContext`, so a caching
-  pair that covers only `Query` covers less than half of them.
-- **`s.readRaw(ctx)`** is today's behaviour, for the data-rendered reads below.
+Call sites keep `s.read(ctx)` / `s.conn(ctx)` and gain a statement argument, so
+what is prepared is visible where the query is issued rather than inferred from a
+rule.
 
-Seven of the 39 sites move to `readRaw`. The other 32 are untouched — including
-`listObjectsWhere` (`:1098`), which needs the split described next rather than a
-move.
+**Preparation is its own step, and `open` is the wrong place for it.** `open`
+sets `readDB: db` (`sqlite.go:105`); `Open` installs the real read pool
+afterwards, at `sqlite.go:76`. Preparing inside `open` would bind every read
+statement to the *writer* for the on-disk store — finding the readonly failure
+above, in the other direction and just as late. So `prepareStatements` is called
+from `Open` after `s.readDB` is assigned, and from `OpenMemory` before it
+returns.
 
-**`listObjectsWhere` is shared across the line and has to be split.** It is the
-`s.read` for all three of its callers: `Objects().List` (`:1079`) and
-`ListByIncomingEdge` (`:1088`) pass constant tails and are cacheable, while
-`Objects().ListByIDs` (`:3577`) passes a rendered one and must not be. Give it a
-raw twin — the body takes the `roDBTX`, `listObjectsWhere` passes `s.read` and
-`listObjectsWhereRaw` passes `s.readRaw` — and point `ListByIDs` at the twin.
-`ListByIDs` is the statement *Measure this first* benchmarks, so this split comes
-before the experiment, not with the migration.
+It still runs after the migrations: a statement prepared before `Apply` names a
+schema that does not exist yet. A failed preparation fails the constructor and
+closes **both** pools — `open`'s existing failure path (`sqlite.go:111`) closes
+`db` alone, which is correct only while there is one pool to close. That is the
+point of preparing eagerly: SQL is validated at startup, so a typo on a cold path
+is a startup error rather than a runtime one.
 
-`conditionSetLoad` is the near miss that needs nothing: it takes `s.read`
-directly and has one caller.
+**Then warm the reader's other connections — only those.**
+`DB.PrepareContext` compiles on the connection it grabs and records it
+(`stmt.css`), so the statement is already compiled on one connection of each
+pool. The writer is one connection, so it is done. The reader needs its other
+N−1.
 
-## The rule everything rests on
+Warming needs no argument lists, which is what keeps it from becoming sixty
+signatures kept in sync forever: call the statement with **no arguments**.
+`Stmt.QueryContext` reaches `connStmt` — which compiles on the connection it
+grabbed and records it — before `driverArgsConnLocked` rejects the argument
+count, and an argument-count error is not `ErrBadConn`, so `database/sql` does
+not retry. The compile lands; the error is discarded. **Warm reads only**: an
+argless execution of a write that happens to bind no placeholders would really
+run.
 
-**A statement is cached only where nothing else can reach it concurrently.**
+Hold every reader connection with `Conn` until the last is out, or the pool hands
+the same one back and it gets warmed N times.
 
-A cached statement is one compiled handle per connection, and `modernc`'s rows
-keep it positioned until they close (`stmt.pstmt`, and `reuseStmt = true` on the
-rows it returns). Two callers sharing one handle is silent corruption, not an
-error. Measured, two goroutines each listing 1000 rows through one shared
-statement: **309** and **1691** rows, `err == nil`.
+The shape of the cost: reads are prepared twice and writes once, so the
+preparations are more than the statement count; only reads land on the reader, so
+the warm-up is reads × (N−1). Both are milliseconds at `open`, paid by a
+short-lived process that may run none of them. The `Open` benchmark reports the
+number; there is no point deriving it here.
 
-The read pool is where that rule holds for free.
+**`OpenMemory` prepares one set and points both at it**, because `readDB` is
+aliased to `db` there. It also wants `SetConnMaxIdleTime(0)`, and for a reason
+larger than statements: `file::memory:` is per-connection, so reaping that
+connection discards *the database*. Today's five minutes (`sqlite.go:93`) is a
+latent bug that no test has been slow enough to hit; preparing on that connection
+does not cause it, only makes it more expensive when it fires.
 
-**Outside a transaction, the pool guarantees it.** `database/sql` checks a
-connection out to one caller for as long as its rows are open, and prepares a
-separate driver statement per connection. Two concurrent callers hold two
-handles; at a pool of one they queue instead. Safety comes from the pool at any
-pool size, `OpenMemory` included, not from a rule anyone has to follow.
+## What is prepared
 
-**Inside a read transaction, an invariant guarantees it — not the pool.**
-`StmtContext` deliberately reuses the driver handle already compiled on the
-transaction's connection, `database/sql` does not serialize a `Tx`, and
-`txState.mu` licenses sibling goroutines on a frame. Two goroutines issuing the
-same SQL inside one read transaction would therefore share one handle. What stops
-them is that **no `withinRead` body fans out**: all four run strictly
-sequentially, and `sqlite/store.go` contains no `go` statement at all.
-`withinRead` being unexported is what keeps that true — only this package can add
-a caller — but it is not what makes it true, and the difference matters, because
-a fifth caller that spawns a goroutine is silent corruption rather than an error.
+**Every statement whose text is constant** — the middle row of the table above is
+the whole set, not a subset of it. A statement is prepared iff it is a field, and
+the only thing that keeps it from being one is text that varies with data.
 
-State the property on `withinRead`, where a fifth caller will read it, and pin it
-structurally: a test that walks the package AST, finds every `withinRead` call,
-and fails on a `go` statement in the literal it is passed. The suite already
-carries this kind of tripwire — `TestNoWriteBypassesConn`,
-`TestEveryDrawSiteIsInsideATransaction`, `TestOwnedByIsWrittenInOnePlace`.
+Text rendered from a **runtime count** cannot be a field: one statement per
+arity, each used once, and a batch already amortises one preparation over every
+row it binds. A *count*, not a slice length — `conditionSetLoad(types int)`
+renders from a number, and a rule stated over slices does not reach it. Thirteen
+call sites, line numbers as of this branch:
 
-**Inside a write transaction the hazard is real**, because the connection is
-already held and `txState.mu` licenses sibling goroutines: *"AfterCommit and bare
-reads stay legal concurrently."* Nothing on the writer is cached, so nothing there
-can be entered twice.
-
-## Why the writer is left alone
-
-Earlier drafts turned on a question — how a statement inside a transaction
-becomes safe to cache — and offered three answers: **mark the origin** (a trusted
-flag on beehive's own transactions), **narrow the contract** (document that a
-`Within` fn must not issue concurrent store calls), or **decline** and cache only
-where a cursor cannot be shared.
-
-Confining the table to the read pool answers it by removing it. Against the
-three:
-
-- Nothing is withdrawn from `ControllerClient.Within`, so no controller author
-  who fans out breaks silently.
-- No origin flag, and none of the plumbing to carry one from `beehive` into
-  `sqlite`.
-- No assumption to state or pin. *Mark the origin* had one — that `client.go`'s
-  `c.decode`, which runs the caller's `UnmarshalJSON` inside a transaction, does
-  not fan out concurrent store calls.
-- No path gets slower. *Decline* was the +26% row applied to all 23 of beehive's
-  own transactions; *mark the origin* was the same row applied to a caller's,
-  which is a regression on a public path that its recommendation did not price.
-
-**What it gives up is the −24% on write transactions.** That is the whole cost,
-and it is recoverable later: with the read pool cached and measured, marking the
-origin or narrowing the contract is still available as a follow-on, against
-evidence rather than against an estimate.
-
-## Measure this first
-
-**Before the migration, not after it.** The +26% row is the whole argument for
-leaving the writer alone, and its mechanism has never been isolated. By *What may
-be cached*, up to seven excluded data-rendered reads run on the read pool beside
-cached statements — the same mixed shape. If that costs what the third row costs, the
-conclusion does not take a patch: it flips toward caching everywhere, which is the
-row that measured −24% and −64%.
-
-The experiment needs a table and one hot read, not the 39-call-site migration:
-benchmark `Objects().ListByIDs` on a reader whose table is warm against the same
-read with the table empty, on disk. Settle that number, then build.
-
-## What may be cached
-
-The line is **whether the text varies with data**, not whether a function built
-it. `selectScoped`, `listObjectsWhere`, `trimEvents`, `eventHorizon` and
-`deleteWriteLogRows` all take a fragment parameter and are fine: their text ranges
-over a handful of compile-time constants.
-
-Text rendered from a **runtime count** must not be cached — one entry per arity
-fills the table with single-use statements, and a batch already amortises one
-preparation over every row it binds. A count, not a slice length:
-`conditionSetLoad(types int)` renders from a number, and a rule stated over
-slices does not reach it.
-
-Thirteen call sites, line numbers as of this branch:
-
-| Site | Function | Renders with | Can reach |
-|---|---|---|---|
-| `:906` | `appendWriteLogUpdates` | `tupleRows` | writer |
-| `:1154` | `conditionsByIDsChunk` | local `placeholders` | reader |
-| `:1237` | `ReconcileOwed().Stamp` | `placeholders` | writer |
-| `:1249` | `reconcileOwedSweepQuery` | `kindTuples` | writer |
-| `:1325` | `Dependencies().ListStaleSince` | `kindTuples` | reader |
-| `:1520` | `readImages` | `placeholders` | reader |
-| `:1870` | `conditionSetLoad` | `placeholders(types)` | reader |
-| `:2052` | `upsertConditions` | `tupleRows` | writer |
-| `:2236` | `Events().List` | `strings.Join(where)` | reader |
-| `:2629` | `markManyForDeletionChunk` | `tupleRows` | writer |
-| `:2721` | `unblockedTargetsChunk` | `placeholders` | writer |
-| `:3066` | `edgesByIDsChunk` | local `placeholders` | reader |
-| `:3578` | `Objects().ListByIDs` | `placeholders` | reader |
+| Site | Function | Renders with |
+|---|---|---|
+| `:906` | `appendWriteLogUpdates` | `tupleRows` |
+| `:1154` | `conditionsByIDsChunk` | local `placeholders` |
+| `:1237` | `ReconcileOwed().Stamp` | `placeholders` |
+| `:1249` | `reconcileOwedSweepQuery` | `kindTuples` |
+| `:1325` | `Dependencies().ListStaleSince` | `kindTuples` |
+| `:1520` | `readImages` | `placeholders` |
+| `:1870` | `conditionSetLoad` | `placeholders(types)` |
+| `:2052` | `upsertConditions` | `tupleRows` |
+| `:2236` | `Events().List` | `strings.Join(where)` |
+| `:2629` | `markManyForDeletionChunk` | `tupleRows` |
+| `:2721` | `unblockedTargetsChunk` | `placeholders` |
+| `:3066` | `edgesByIDsChunk` | local `placeholders` |
+| `:3578` | `Objects().ListByIDs` | `placeholders` |
 
 Three helpers render: `placeholders` (`:3582`), `tupleRows` (`:3588`) and
-`kindTuples` (`:3593`), the last serving two sites.
+`kindTuples` (`:3593`), the last serving two sites. `:1154` and `:3066` build the
+placeholder list into a **local** `[]string` named `placeholders`, shadowing the
+package function, so a grep for `placeholders(` misses both.
 
-The last column is *paths that reach it*, not a property of the statement.
-`conditionsByIDsChunk` and `edgesByIDsChunk` are called from both kinds of
-caller; `unblockedTargetsChunk` reads through `s.read` but is sound only inside
-the write transaction that set the marks it reads (`:2694`), so it never sees the
-reader. Route on the SQL's own shape regardless: which connection a call uses
-today is a fact about the call graph, and it changes.
-
-The six writer rows are excluded twice over as things stand. **The seven that can
-reach the reader are what costs something** — they are the uncached statements
-that will sit beside cached ones on the read pool, the shape *Measure this first*
-is about. Seven is the upper bound, since two of them only sometimes arrive
-there.
-
-`:1154` and `:3066` build the placeholder list into a **local** `[]string` named
-`placeholders`, shadowing the package function. A grep for `placeholders(` misses
-both — which is how the fourteenth gets added unnoticed.
+Six of the thirteen only ever run on the writer, `unblockedTargetsChunk` (`:2721`)
+among them: it reads through `s.read`, but is sound only inside the write
+transaction that set the marks it reads (`:2694`), so it never sees the reader.
+That decides nothing about how they are routed — the toll below is charged per
+connection, not per pool — but it is what the count of seven rests on.
 
 `Events().List` (`:2236`) is the judgement call: its `WHERE` is assembled from an
 optional predicate slice plus an optional `LIMIT`, so up to 32 bounded shapes.
-Raw anyway — the bound is a property of today's `EventQuery`, not of the code, and
-a sixth optional predicate doubles it silently.
+Excluded anyway — the bound is a property of today's `EventQuery`, not of the
+code, and a sixth optional predicate doubles it silently.
+
+**The SQL has to be hoisted into named constants** for the set to be enumerable,
+which is what makes the completeness test below possible. That is most of the
+diff — and it **breaks two structural tripwires**, which have to be re-keyed in
+the same change or two documented invariants go unpinned:
+
+- `TestObjectStatusIsWrittenInOnePlace` (`store_test.go:8661`) asserts that
+  exactly `{sqliteStore.objectsCreate, sqliteObjects.UpdateStatus}` hold SQL
+  writing `objects.status` — the single-writer property the whole status-baseline
+  skip rests on.
+- `TestNoWriteBypassesConn` (`store_test.go:9101`) asserts every write is issued
+  through `conn`.
+
+Both read through `sqlSites`, which attributes a string literal to the enclosing
+`FuncDecl` by walking the file in source order (`inspectPackage`, `:8748`). A
+package-level `const` is inside no function, so its literal lands on whichever
+function textually precedes it, or on `""`. They fail loudly rather than pass
+wrongly, which is the good outcome, but the repair is a decision this spec owes
+rather than a mechanical edit.
+
+**The re-keying is two hops.** After this change `UpdateStatus` holds neither the
+literal nor the const — it holds a statement *field*. So `sqlSites` resolves
+field → const → text: parse the package's const declarations for `name → literal`,
+parse `prepareStatements` for `field → const`, then attribute a field reference
+inside a `FuncDecl` to that function. The claim each test makes survives exactly:
+"which functions issue SQL that writes `objects.status`" becomes "which functions
+reference a statement whose SQL writes it". `TestOwnedByIsWrittenInOnePlace` is
+call-keyed and unaffected.
+
+**`listObjectsWhere` needs splitting**, because it is the `s.read` for callers on
+both sides of the constant line (`:1098`). `Objects().List` (`:1079`) and
+`ListByIncomingEdge` (`:1088`) pass constant tails, so each holds a field with
+its own whole `SELECT`; `Objects().ListByIDs` (`:3577`) renders its tail and
+keeps today's path. Split the helper so the scan-and-attach tail stays shared and
+only the query differs.
+
+## What residency costs
+
+**A connection holding prepared statements taxes everything that runs on it**,
+prepared and unprepared alike. Measured on one read connection, on disk, 1000
+objects, seventeen columns by primary key (`BenchmarkResidencyToll`):
+
+| statements resident | unprepared | prepared |
+|---|---|---|
+| 0 | 21.9 µs | 7.46 µs |
+| 15 | 26.3 µs | 7.54 µs |
+| 60 | 27.3 µs | 7.74 µs |
+| 240 | 27.4 µs | 7.77 µs |
+
+**It is a step, not a slope.** Nearly all of it arrives by fifteen resident
+statements, and sixteen times more adds almost nothing. Whatever the set grows
+to, the toll does not.
+
+**Preparing is not the escape, but it is most of one**: +0.3 µs (+4%) against
++5.4 µs (+25%), fifteen times the cost unprepared. This is the "+7% residual a
+cached statement pays on a busy connection" an earlier draft carried, re-measured.
+
+The thirteen rendered statements cannot be prepared, and seven of them can reach
+the read pool, so they pay the full toll. What that costs in place
+(`BenchmarkUnpreparedBesidePrepared`, `Objects().ListByIDs`, sixty resident):
+
+| | none resident | 60 resident | toll |
+|---|---|---|---|
+| 1 id | 48.5 µs | 57.5 µs | +19% |
+| 1 id, in a read transaction | 53.9 µs | 63.2 µs | +17% |
+| 64 ids | 385 µs | 388 µs | +0.8% |
+| 64 ids, in a read transaction | 395 µs | 400 µs | +1.2% |
+
+A large batch amortises the toll to nothing; a single id does not, and
+`ListByIDs` takes whatever a tailer page holds.
+
+**None of this moves the headline.** The −63% was measured against a store with
+22 statements resident, so the tax is already inside it. The net is what it says:
+a prepared statement saves about 14 µs having paid the toll, an unprepared one
+pays the toll with nothing against it.
+
+**Likely mechanism, and why it is worth a line.** SQLite's per-connection
+lookaside allocator: each resident statement holds lookaside memory for its
+lifetime, and once the small default pool is exhausted every allocation on that
+connection falls back to the general allocator. It predicts exactly what was
+measured — a step completing around fifteen statements, flat to 240, paid by
+prepared and unprepared alike. Not actionable: `modernc` exposes no lookaside
+knob, and the word does not appear in the package. Worth stating so the next
+reader does not go looking for a way to make the toll shrink with the set.
+
+## The contract this rests on
+
+**A prepared statement is executed only where nothing else can reach it
+concurrently.**
+
+A compiled statement is one handle per connection, and `modernc`'s rows keep it
+positioned until they close (`stmt.pstmt`, and `reuseStmt = true` on the rows it
+returns). Two callers sharing one handle is silent corruption, not an error.
+Measured, two goroutines each listing 1000 rows through one shared statement:
+**309** and **1691** rows, `err == nil`.
+
+**Outside a transaction, the pool guarantees it.** `database/sql` checks a
+connection out to one caller for as long as its rows are open, and compiles a
+separate driver statement per connection. Two concurrent callers hold two
+handles; at a pool of one they queue instead. A `*sql.Stmt` is safe for
+concurrent use, and that is why.
+
+**Inside a transaction, the contract guarantees it**, and it is already written
+down (`internal/storeapi/storeapi.go:429`): *"A transaction ctx belongs to one
+goroutine — the refusal is a tripwire, not a lock."* `database/sql` permits
+concurrent use of a `Tx` and serialises the calls, which is what makes the
+violation silent rather than an error: the calls are ordered, the cursor is not.
+Nothing else in this design needs a promise from anyone.
+
+Four places say otherwise, say nothing, or overstate what is being guarded.
+This change fixes them:
+
+- **`txState.mu`'s comment** — *"AfterCommit and bare reads stay legal
+  concurrently"* — asserts the opposite of the contract. It describes what the
+  implementation tolerates today. Correct it to the rule.
+- **`ControllerClient.Within`'s godoc** says "pass fn's ctx to every store call
+  it makes" and nothing about goroutines. The contract lives on
+  `internal/storeapi`, which an embedder never sees. Add the rule where a
+  controller author reads it.
+- **The README's `Within` rule** (line 633) covers which ctx to pass. Add what
+  goes wrong if fn fans out: interleaved rows, no error.
+- **[The read-transaction ADR](../adr/2026-08-20-a-read-that-groups-is-a-read-transaction.md)**
+  justifies two of its defences — the nested read's savepoint, and putting the
+  read-frame draw check inside `sealForCommit` — as guards against a sibling
+  goroutine committing or drawing mid-read. Both are worth keeping and neither is
+  a guard: they are tripwires for a contract violation, which is what
+  `ErrConcurrentNestedTx`'s own doc already calls them. Say that, so the next
+  reader does not take concurrent use of a transaction for a case the design owes
+  an answer to.
+
+**Enforcement stays partial, deliberately.** A sibling goroutine entering a
+nested `Within` is refused by `pushSavepoint`'s depth check, which covers the five
+self-wrapping store methods. Overlapping *bare* reads are not detected, and
+catching them would mean a `defer` in every store method — the hazard window is
+"cursor open", not "call in progress", so a chokepoint counter would drop while
+rows are still live. That is the same posture as the
+[sole-writer rule](../adr/2026-08-05-one-process-one-beehive-sole-writer.md),
+which is documented and not enforced, and it is a bigger constraint than this one.
 
 ## Edge cases the implementer would otherwise guess at
 
-- **The table belongs to the read pool.** A `*sql.Stmt` belongs to the pool that
-  prepared it, so one prepared on the writer and executed through `s.read` runs on
-  the writer and quietly undoes the
-  [split](../adr/2026-08-20-reads-get-their-own-connections.md). One table, reached
-  only from `read`, is what keeps that from being expressible.
+- **A `*sql.Stmt` belongs to the pool that prepared it.** Executing a read-pool
+  statement on the writer's transaction is a silent stale read, not an error.
+  `stmtFor` is the only place that chooses, which is what keeps that
+  unexpressible at a call site.
 
-- **Route on the frame, not on the method.** A statement is cached when the ctx
-  carries no live transaction, or one that is `readOnly`. A `withinRead` nested
-  inside a caller's `Within` joins the writer's frame on a savepoint, so it is
-  neither — and stays uncached, with no special case needed to say so.
+- **The writer's idle reap now matters.** `OpenPool` sets
+  `SetConnMaxIdleTime(5 * time.Minute)` and no `MaxIdleConns`
+  (`internal/sqlitemigrate/sqlitemigrate.go:57`). Reopening a connection drops
+  every statement compiled on it, so a beehive quiet for five minutes — which
+  `examples/lowpower` is by design — pays every writer parse again on its next
+  write. Set it to 0, for the reason `OpenReadPool` already keeps its idle
+  readers: *"either would have a quiet beehive drop reader connections between
+  ticks and reopen them on the next one."* The reader needs no change.
 
-- **A statement is compiled once per connection.** `database/sql` prepares
-  lazily, so a hot statement is compiled on each reader that runs it. Memory scales with N,
-  and so does the small residual cost a cached statement pays on a busy
-  connection (+7%).
+- **Preparing compiles on one connection, not none and not all.**
+  `DB.PrepareContext` compiles on the connection it grabbed and records it in
+  `stmt.css`; the pool's other connections compile at first use. That is the
+  whole reason the warm-up exists, and the reason it skips the writer.
 
-- **The reader is already exempt from idle reaping; `OpenMemory` is not.**
-  Reopening a connection drops every statement compiled on it, so an idle reap is
-  a repeated cold start once the table exists. `OpenReadPool` sets no
-  `ConnMaxIdleTime` and keeps `MaxIdleConns(maxConns)` — deliberately, and it says
-  so (`internal/sqlitemigrate/sqlitemigrate.go:81`). The five-minute reap is
-  `OpenPool`'s, on the writer, which holds no table. The one pool that reaps a
-  table-holding connection is `OpenMemory`'s (`sqlite.go:92`). Change nothing;
-  know which is which.
+- **A warm-up that does not hold its connections warms one.** `database/sql`
+  hands back the connection just released, so a loop that runs a statement N
+  times compiles it on the same connection N times. Hold every `*sql.Conn` until
+  the last one is out.
 
-- **Never prepare while holding a connection.** The rule *Filling the table*
-  rests on: a prepare inside a read transaction waits for a connection this
-  goroutine already holds — deadlock at a pool of one, and at N when N readers
-  miss at once. Hence the queue. Say it where the table is defined; it is
-  invisible otherwise.
+- **Compiled programs scale with statements × connections**, and live for the
+  process. Sixty over five connections is the resident cost, not sixty.
 
-- **A cap is a backstop, not a policy.** With data-rendered SQL excluded the key
-  space is the constant SQL in the package. Keep a cap anyway, cap-and-stop, and
-  **never evict**: closing a `*sql.Stmt` another goroutine is running yields
-  `sql: statement is closed`. Check the room *before* `PrepareContext`, or a full
-  table prepares and closes on every call, which is worse than not caching.
+- **Each execution inside a transaction allocates a tx-scoped `*sql.Stmt`** that
+  `Tx.StmtContext` appends to `tx.stmts`, released when the transaction ends. At
+  the sizes beehive's transactions run — a handful of statements — that is
+  nothing.
 
-- **A failed preparation records nothing** and runs uncached; a later call tries
-  again. Do not leave a marker: a marker that outlives the thing that would have
-  cleared it is how a statement stays uncached for the life of the store.
+- **`Close` closes the statements before the pools.** Not because it would
+  otherwise block — measured, `db.Close()` with live statements returns nil
+  immediately — but because it frees the driver's compiled programs. Idempotent,
+  so `Close` stays so.
 
-- **`Close` closes the table before the pools.** Not because it would otherwise
-  block — measured, `db.Close()` with live statements returns nil immediately —
-  but because it frees the driver's compiled programs. Idempotent, so `Close`
-  stays so.
+- **A failed preparation fails `Open`**, and must close whatever opened above it.
+  `open` already has that shape for `seedVersions` (`sqlite.go:111`).
 
-- **`map` under an `RWMutex`, not `sync.Map`**: a cap needs a length, and the
-  read path is a lookup under `RLock` that N readers take concurrently.
-
-- **PRAGMAs stay off the table.** `ReclaimSpace` takes its own `*sql.Conn` on the
+- **PRAGMAs are not fields.** `ReclaimSpace` takes its own `*sql.Conn` on the
   writer; `PRAGMA incremental_vacuum` must be `Exec`'d and carries its page count
   in the text.
 
 - **Transaction control and savepoint SQL go straight at the transaction**
-  (`sqlite/store.go:331`), never through the table.
-
-- **`OpenMemory` keeps the table, on a connection the on-disk store never has.**
-  `readDB` is aliased to `db` there, so cached read statements sit on the same
-  single connection that runs write transactions — the mixed shape the read-pool
-  boundary exists to avoid. Correct, because the pool still hands that connection
-  to one caller at a time; but it means the in-memory suite does not measure the
-  on-disk shape, so **the benchmarks run on disk**.
+  (`sqlite/store.go:331`). Savepoint names are interpolated, so the text varies
+  by construction.
 
 ## Tests
 
 In `sqlite/store_test.go`:
 
-- A read outside a transaction is prepared once and reused.
-- **A cached read inside a read transaction still sees the transaction's
-  snapshot.** Warm the statement inside a read transaction, commit a write from
-  the writer while that transaction is open, read again through the cached
-  statement: it must return the pre-write row. This is the regression test for
-  executing a pooled `*sql.Stmt` instead of `tx.StmtContext`, and nothing else in
-  this list catches it — on a pool of one that mistake hangs, but on four it
-  quietly answers from outside the snapshot.
-- A read *inside a read transaction* runs uncached the first time and cached the
-  next, which is the queue working; the table does not grow mid-transaction.
-- A nested `withinRead` drains nothing until the outermost frame returns.
-- A read *inside a write transaction* is never cached, and neither is a write. The
-  table does not grow either way.
-- A `withinRead` nested inside a `Within` caches nothing.
-- Concurrent reads through one cached statement each see every row — the
+- **A prepared read inside a read transaction sees the transaction's snapshot.**
+  Warm the statement, commit a write from the writer while the read transaction
+  is open, read again: it must return the pre-write row. The regression test for
+  executing `st.read` instead of `tx.StmtContext` — on a pool of one that mistake
+  hangs, but on four it quietly answers from outside the snapshot.
+- **A read inside a write transaction sees that transaction's own uncommitted
+  writes.** The regression test for case 3, and the reason both pools are
+  prepared: write inside a `Within`, read the same row, see the new value.
+- **Completeness: no constant SQL reaches an unprepared path.** The load-bearing
+  test of this design, and the only guard against a new hot read being silently
+  unprepared. Walk the package for const string declarations holding SQL, compare
+  against the two statement sets by reflection, and fail on a constant no set
+  names. It shares its machinery with the re-keyed `sqlSites`, which is the
+  argument for doing the re-keying properly rather than patching it.
+- **The re-keyed tripwires still hold**: `TestObjectStatusIsWrittenInOnePlace`
+  and `TestNoWriteBypassesConn` name the same functions after the hoist as
+  before.
+- **A write is never prepared on the reader.** Assert the read set holds no
+  statement whose SQL writes — the failure `Open` cannot catch, since preparing
+  a write against `query_only` succeeds.
+- Data-rendered SQL stays unprepared, one case per site, including both sides of
+  the `listObjectsWhere` split.
+- Concurrent reads through one prepared statement each see every row — the
   regression test for the shared-handle corruption. It can only fail on broken
   code, so it is a detector rather than a flake.
-- Data-rendered SQL never reaches the table, one case per chunked call site —
-  including both sides of the `listObjectsWhere` split: `Objects().List` caches,
-  `Objects().ListByIDs` does not.
-- No `withinRead` body fans out: the AST tripwire from *The rule everything rests
-  on*, which is what makes caching inside a read transaction safe.
-- The cap stops filling and never evicts; cached statements keep working.
-- A failed preparation leaves nothing behind and the next call retries.
-- `Close` returns nil, twice, and releases the table.
+- The warm-up compiles on every reader connection, not N times on one: assert
+  over the connections it held, never over timing.
+- A failed preparation fails `Open` and leaks no pool.
+- `Close` returns nil, twice, and releases the statements.
+- `OpenMemory` prepares once and the suite still passes over it.
 
-**The drift guard, in two halves.** Collapsing placeholder runs and `VALUES`
-tuple sets to one and comparing entries catches a rendered statement — but only
-once two arities of the same shape are cached, and a site that always binds a full
-chunk, or a test that always passes the same length, produces one key and passes.
-So pair it with a **golden list of the cached SQL**, asserted at the end of the
-suite: a fourteenth site then shows up as a diff rather than as a collision that
-may never happen. Matching the placeholder text directly does not work:
-`placeholders(n)` renders `"?, ?"` **with a space** (`:3583`), and a hand-written
-constant `VALUES (?, ?)` would fail it. Run the collision half from the suite's
-store constructor so every test is a sample, not from one hand-picked test.
-
-Benchmark three, on disk: the pool read and a read transaction for the win, and a
-write transaction for the "unchanged" claim, which is a promise this design makes
-and not merely an omission. The fourth — the excluded data-rendered read beside
-cached ones — is *Measure this first*, and it runs before any of this.
+Benchmark the pool read, a read transaction and a write transaction, on disk —
+one per column of the table in *Why*, so each claimed number has a tripwire.
+`OpenMemory` shares one connection between the pools, a shape the on-disk store
+never has, so it is the wrong place to measure any of them.
 
 ## Not in this spec
 
-**Eagerly preparing a fixed list at `open()`.** It buys no speed — lazy filling
-pays the same ~19 µs per shape, just at first use — and it adds ~1.3 ms to
-`open()` for statements a short-lived process may never run. What it would buy is
-SQL validated at open, so a typo on a cold path is a startup error rather than a
-runtime one. A different argument, with a list to maintain; decide it separately,
-against an embedder that cares about startup.
+**A statement table filled at runtime**, keyed by SQL text. It catches every
+statement rather than the named ones, and pays for that with a fill path that
+cannot prepare inside a transaction, a cap that must never evict, and a drift
+guard over rendered SQL. This store's SQL is fixed at compile time, so what the
+catching buys is worth less than the machinery costs. Git holds the worked
+version.
 
-**Caching on the writer.** Worth −24% on a write transaction, and unavailable
-without either marking beehive's own transactions or narrowing what a `Within` fn
-may do — see *Why the writer is left alone*. Decide it after this ships, with the
-reader's numbers in hand.
+**Read-pool pragmas and `PRAGMA optimize`**, both in [`TODO.md`](../TODO.md). The
+first is one line of DSN that may be worth more than this whole spec, and it
+should be priced on the benchmarks above.
+
+**`OpenMemory`'s five-minute idle reap discards the database**, since
+`file::memory:` is per-connection. This spec sets it to 0 because it also drops
+prepared statements, but the bug predates it and is worth fixing whether or not
+this ships.
