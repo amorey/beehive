@@ -9117,6 +9117,16 @@ func TestAReadTransactionRefusesToCommitBadly(t *testing.T) {
 		assert.ErrorIs(t, store.withinRead(ctx, func(context.Context) error { return boom }), boom)
 	})
 
+	t.Run("a failed commit is returned", func(t *testing.T) {
+		store := newDiskStore(t)
+		// Ending the transaction under withinRead leaves its COMMIT nothing to
+		// commit, which is the only way a read transaction's commit fails.
+		err := store.withinRead(ctx, func(inner context.Context) error {
+			return liveTx(inner).tx.Rollback()
+		})
+		assert.ErrorIs(t, err, sql.ErrTxDone)
+	})
+
 	t.Run("an open sibling frame is refused", func(t *testing.T) {
 		store := newDiskStore(t)
 		entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
