@@ -1094,13 +1094,12 @@ func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
-// GetLatestResourceVersion reads the sequence itself (contract on
-// storeapi.Store). One row, always present: the migration seeds it.
+// GetLatestResourceVersion reports the highest version a committed write took
+// (contract on storeapi.Store). From the allocator, not the counter row: the row
+// holds the reservation's end, and a cursor above what was handed out strands
+// every write in the gap.
 func (s *sqliteStore) GetLatestResourceVersion(ctx context.Context) (int64, error) {
-	var rv int64
-	err := s.read(ctx).QueryRowContext(ctx,
-		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)
-	return rv, err
+	return s.versions.latest(), nil
 }
 
 // Stamp records a page of findings in one statement (contract on

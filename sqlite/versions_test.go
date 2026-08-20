@@ -99,3 +99,23 @@ func TestWritesDrawFromTheBlock(t *testing.T) {
 	drawn := seqValue(t, store) - before
 	assert.Less(t, drawn, int64(10), "ten writes must not write the counter ten times")
 }
+
+// The counter row holds the block's end, so the write cursor cannot be read from
+// it: a value above what has been handed out strands every write in the gap.
+func TestLatestResourceVersionStaysAtWhatWasHandedOut(t *testing.T) {
+	withBlockSize(t, 64)
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
+	require.NoError(t, err)
+	written, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+
+	latest, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, written.ResourceVersion, latest,
+		"the cursor must be the last version a write took, not the block's end")
+	assert.Less(t, latest, seqValue(t, store), "...which is below the reservation")
+}
