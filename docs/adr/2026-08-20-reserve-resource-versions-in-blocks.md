@@ -68,9 +68,11 @@ fallback and burns the remainder.
 
 ## Consequences
 
-Measured against the real store, baseline and stubbed runs alternated so drift
-cancels: a status write in a `Within` is 17% faster, a spec write that changes the
-spec 14%.
+Measured against the real store, blocks-off and blocks-on runs alternated so drift
+cancels, medians of fifteen each side: a status write in a `Within` goes 97.7 µs →
+79.5 µs (**−19%**) and a spec write that changes the spec 178.9 µs → 152.9 µs
+(**−15%**). A deletion cascade is unmoved: its cost is the row writes, and the
+`markManyForDeletion` range draw was already one statement for the level.
 
 A restart leaves a gap of up to `blockSize`, which nothing observes.
 
