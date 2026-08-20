@@ -3449,6 +3449,14 @@ func TestTxStateSealForCommit(t *testing.T) {
 		assert.ErrorIs(t, st.sealForCommit(), assert.AnError)
 	})
 
+	t.Run("frameUsable surfaces poison too", func(t *testing.T) {
+		st := &txState{}
+		st.poison(assert.AnError)
+
+		assert.ErrorIs(t, st.frameUsable(0, 0), assert.AnError)
+		require.NoError(t, (&txState{}).frameUsable(0, 0), "a fresh frame is usable")
+	})
+
 	// Here rather than in runTx: outside this lock a sibling goroutine can draw
 	// between the check and the seal.
 	t.Run("refuses a read frame that drew", func(t *testing.T) {
@@ -9187,6 +9195,32 @@ func TestAReadTransactionSettlesNoVersions(t *testing.T) {
 
 // withinRead's two error paths: fn's own, and a frame a sibling goroutine left
 // open, which is refused for the same reason Within refuses it.
+// A ctx captured from a frame that has since unwound is refused, as it was when
+// these reads took a savepoint to join. An ungrouped read on the same ctx still
+// answers from the outer transaction — that asymmetry predates the read
+// transaction and is not settled here.
+func TestAReadTransactionRefusesADeadFrame(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	obj := newKindObject(t, store, testGK)
+
+	require.NoError(t, store.Within(ctx, func(outer context.Context) error {
+		boom := errors.New("boom")
+		var stale context.Context
+		require.ErrorIs(t, store.Within(outer, func(inner context.Context) error {
+			stale = inner
+			return boom
+		}), boom)
+
+		_, _, err := store.ObjectWrites().ListSince(stale, testGK, 0, 16)
+		assert.ErrorIs(t, err, beehive.ErrStaleTxContext)
+
+		_, err = store.Objects().Get(stale, obj.ID)
+		assert.NoError(t, err, "an ungrouped read degrades to the ambient transaction")
+		return nil
+	}))
+}
+
 func TestAReadTransactionRefusesToCommitBadly(t *testing.T) {
 	ctx := context.Background()
 

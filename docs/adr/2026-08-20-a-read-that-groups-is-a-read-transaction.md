@@ -49,6 +49,15 @@ the frame, seal, commit, settle, drain the hooks: that ordering is contractual,
 and it had two copies with the rules written on one of them. `Within` passes the
 version-settling tail; `withinRead` passes none.
 
+**Joining an ambient transaction still checks the frame.** A read takes no
+savepoint, and taking one is what used to reject a ctx captured from an unwound
+nested frame — so `withinRead` runs `pushSavepoint`'s test without pushing
+(`frameUsable`). Without it these four reads would have quietly started answering
+on a dead frame, a contract change no one asked for. `s.read(ctx)` on the same ctx
+still answers from the ambient transaction, as it always has
+([ADR](2026-08-20-reads-get-their-own-connections.md)); that asymmetry between
+grouped and ungrouped reads predates this change and is not settled here.
+
 **A read transaction still runs its hooks.** It opens a frame, so `AfterCommit`
 queues onto it, and it commits, so the queue is owed. No read path queues one
 today; the prototype that skipped the flush is why this is written down.
