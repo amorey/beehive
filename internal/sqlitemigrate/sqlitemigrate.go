@@ -79,6 +79,11 @@ func OpenReadPool(path string, maxConns int) *sql.DB {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", dsn)
 	db.SetMaxOpenConns(maxConns)
+	// Idle readers are kept, not reaped. database/sql keeps two by default and
+	// OpenPool retires a connection idle for five minutes; either would have a
+	// quiet beehive drop reader connections between ticks and reopen them on the
+	// next one.
+	db.SetMaxIdleConns(maxConns)
 	return db
 }
 

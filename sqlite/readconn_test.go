@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -237,4 +238,33 @@ func TestEveryWritePathRunsOnTheWriter(t *testing.T) {
 	require.NoError(t, err)
 	_, err = store.ReclaimSpace(ctx, 8)
 	require.NoError(t, err)
+}
+
+// database/sql keeps two idle connections by default and OpenPool reaps after
+// five minutes, so a reader would churn connections between ticks. Asserted on
+// the pool's own counters: no test can wait out a five-minute timer.
+func TestTheReaderKeepsItsConnections(t *testing.T) {
+	const n = 4
+	store := newDiskStore(t, WithReadConnections(n))
+	ctx := context.Background()
+	id := newRefObject(t, store).ID
+
+	// More concurrent reads than the idle default, so connections are opened and
+	// then returned to the pool.
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				_, err := store.Objects().GetMeta(ctx, id)
+				require.NoError(t, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	stats := store.readDB.Stats()
+	assert.Zero(t, stats.MaxIdleClosed, "a returned connection was closed over the idle count")
+	assert.Zero(t, stats.MaxIdleTimeClosed, "a returned connection was reaped on a timer")
 }
