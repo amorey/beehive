@@ -54,6 +54,17 @@ system compares `>`, so a crash or a rollback burning the rest of a block costs
 nothing. This is what lets the reservation be coarse, and what lets a guarded
 `markForDeletion` draw a version it never stamps.
 
+A burned version is free; a burned version that is also *published* is not quite.
+`markForDeletion` draws before the `IS NULL` guard runs, so a mark the guard blocks
+still advances the committing transaction's high draw. `GetLatestResourceVersion`
+then moves for a delete request that wrote nothing, which defeats the
+stale-dependents sweep's `cursor == mark` early-out and costs one real scan.
+`requestDeletion`'s probe absorbs the steady-state already-pending case and a mark
+that matches no row rolls back without publishing, so only the race between the two
+reaches it. One wasted sweep, no correctness consequence — recorded because "gaps
+are free" is what a reader will take from the rule above, and this is the corner
+where it is not.
+
 **The cursor sites read the allocator, not the counter row.** Once a block is
 reserved that row holds the reservation's *end*, above what has been handed out.
 `GetForReconcile`'s cursor becomes `reconciled_against`, and `ListStaleSince`
