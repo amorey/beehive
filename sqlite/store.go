@@ -638,7 +638,16 @@ func (s *sqliteStore) withinRead(ctx context.Context, fn func(ctx context.Contex
 	if err := st.sealForCommit(); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// The frame took hooks like any other, and committing is what they were owed.
+	// The version allocator is not settled here: a read draws nothing, and the
+	// refill is a write on the writer this call exists to stay off.
+	for _, hook := range st.flush() {
+		hook.fn()
+	}
+	return nil
 }
 
 // AfterCommit defers fn to the outermost transaction's commit. Outside a

@@ -8964,3 +8964,20 @@ func TestAReadTransactionJoinsAWriteTransaction(t *testing.T) {
 	assert.JSONEq(t, `{"n":1}`, string(seen.Status),
 		"a read inside the write transaction must see its uncommitted write")
 }
+
+// A read transaction still opens a frame, so AfterCommit queues onto it — and it
+// still commits, so the queue must drain. Dropping it as "not needed for a read"
+// loses the hook silently.
+func TestAReadTransactionRunsItsHooks(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	obj := newKindObject(t, store, testGK)
+
+	ran := 0
+	require.NoError(t, store.withinRead(ctx, func(ctx context.Context) error {
+		store.AfterCommit(ctx, func(context.Context) { ran++ })
+		_, err := store.Objects().Get(ctx, obj.ID)
+		return err
+	}))
+	assert.Equal(t, 1, ran, "a hook queued inside a read transaction must run at its commit")
+}
