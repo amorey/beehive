@@ -260,12 +260,12 @@ type Client[Spec, Status any] interface {
 	// Everything after comes from the kind's shared tailer: a commit wakes it,
 	// and a floor tick covers what a wake cannot. Delivery is latest-per-object,
 	// so changes to one object collapse. A watch cannot be opened inside a
-	// transaction: its snapshot waits for the connection the transaction holds.
+	// transaction: its snapshot takes the writer, which the transaction holds.
 	//
 	// The wider rule is worth stating on its own. Pass the ctx you were given to
-	// every store call inside a transaction. Reads now run on their own pool, so
-	// one issued on an outer ctx no longer deadlocks — it returns committed
-	// state, silently missing the transaction's own writes.
+	// every store call inside a transaction. An ordinary read on another ctx
+	// runs on the read pool, so it does not block — it returns committed state,
+	// silently missing the transaction's own writes.
 	Watch(ctx context.Context, id ObjectID, opts ...WatchOption) (*ObjectStream[Spec, Status], error)
 	// WatchEvents streams id's event log: a snapshot of the runs matching opts,
 	// the position it was read at, and the runs the log grows by above it. An
