@@ -96,7 +96,9 @@ func OpenMemory() (*sqliteStore, error) {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)&_pragma=auto_vacuum(incremental)")
 	db.SetMaxOpenConns(1)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	// Never reaped: file::memory: is per-connection, so losing the connection
+	// loses the database — and with it every statement compiled on it.
+	db.SetMaxIdleConns(1)
 	s, err := open(db)
 	if err != nil {
 		return nil, err

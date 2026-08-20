@@ -54,7 +54,10 @@ func OpenPool(path string, maxConns int) *sql.DB {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", dsn)
 	db.SetMaxOpenConns(maxConns)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	// Idle writers are kept, not reaped: reopening a connection drops every
+	// statement compiled on it, and a quiet beehive would pay every parse again
+	// on its next write.
+	db.SetMaxIdleConns(maxConns)
 	return db
 }
 
