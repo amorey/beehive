@@ -1,10 +1,12 @@
 # A read-only transaction
 
-- **Status:** Ready to build. Measured three times, most recently against the
-  shipped read pool and version blocks. **The case has moved**: the writer-side
-  win it was first justified by is gone at the shipping throttle, and the
-  grouped read's own latency — which nobody had measured — is where the change
-  pays. See *What it is worth*. The prototype is not kept; git holds it.
+- **Status:** Ready to build. Measured against the shipped read pool and version
+  blocks. **The case has moved twice**: the writer-side win it was first justified
+  by is gone at the shipping throttle, and the drain-read win that replaced it is
+  absorbed by the tailer's scan floor. What survives is the two reads no floor
+  covers — a watch's opening snapshot, object or event — where the cost stops
+  scaling with write pressure. See *What it is worth*. The prototype is not kept;
+  git holds it.
 - **Date:** 2026-08-20
 - **Depends on:** the read pool, which shipped
   ([ADR](../adr/2026-08-20-reads-get-their-own-connections.md)). A grouped read
@@ -36,6 +38,11 @@ So about 2.8 µs per grouped read today, and a write lock held for no reason.
 The lock costs nothing while the pool is one connection, because everything
 already queues there.
 
+On disk only: `OpenMemory`'s DSN carries no `_txlock`, so an in-memory `Within`
+is already a deferred `BEGIN` and none of this applies to it. That is a
+convenience for the tests and a trap for them too — see the enforcement note
+below.
+
 With the read pool it stops being merely wasteful. These five reads belong on the
 reader, and the reader is opened `query_only(true)`, which refuses a write lock —
 so `IMMEDIATE` there does not work at all. This is what lets those call sites move.
@@ -55,23 +62,53 @@ A prototype — `withinRead` over the four read-only sites — passed the whole 
 unchanged, so what follows is the real behaviour rather than an approximation.
 On disk, medians of alternating runs a side.
 
-### The grouped read stops queueing behind writers
+### Where it pays: the reads no floor covers
 
-This is the measurement nobody had taken, and it is the case for the change.
-`ObjectWrites().ListSince` — every object tailer's drain read — with writers in
-flight:
+Two of the four sites run once per watch, on the caller's own latency, with
+nothing pacing them. They are where a user feels this.
+
+`Events().Snapshot` — an event watch's start (`eventswatch.go:151`):
+
+| writers | now | with `withinRead` | |
+|---|---|---|---|
+| 0 | 34.9 µs | 34.1 µs | −2% |
+| 1 | 112.6 µs | 47.3 µs | **−58%** |
+| 4 | 303.6 µs | 43.1 µs | **−86%** |
+
+`ObjectWrites().Snapshot` — an object watch's initial listing, 200 objects
+(`objectswatch.go:220-224`):
+
+| writers | now | with `withinRead` | |
+|---|---|---|---|
+| 0 | 755.5 µs | 760.2 µs | +1% |
+| 1 | 835.8 µs | 860.6 µs | +3% |
+| 4 | 1094.1 µs | 852.9 µs | **−22%** |
+
+The percentages matter less than the shape: today these reads **scale with write
+pressure**, because `BEGIN IMMEDIATE` puts them in the writers' queue for the one
+connection. On the reader they flatten — 34.9 to 43.1 µs across four writers
+rather than 34.9 to 303.6. The object listing moves less because 750 µs of it is
+the listing itself, not lock waiting, and at one writer it is 3% *worse*: a read
+transaction on the reader gives up the writer's warm page cache. That cost is
+fixed; the saving grows.
+
+### Where it does not: the read behind the floor
+
+`ObjectWrites().ListSince` is the tailer's drain read, and the drain is floored at
+`defaultWatchScanMinInterval`:
 
 | writers | now | with `withinRead` | |
 |---|---|---|---|
 | 0 | 43.4 µs | 42.3 µs | −2% |
-| 1 | 169.7 µs | 119.6 µs | **−30%** |
-| 4 | 380.4 µs | 119.8 µs | **−68%** |
+| 1 | 169.7 µs | 119.6 µs | −30% |
+| 4 | 380.4 µs | 119.8 µs | −68% |
 
-The percentages matter less than the shape. Today the read's cost **scales with
-write pressure**, because `BEGIN IMMEDIATE` puts it in the writers' queue for the
-one connection. On the reader it is **flat** — 119.6 µs against 119.8 µs at one
-writer and at four. That is the property being bought, and it does not degrade as
-a deployment gets busier.
+**Do not lead with this row.** The floor absorbs it: a tailer that finishes its
+drain sooner waits out the rest of the window regardless, which is exactly what
+the delivery table below shows. What a faster drain leaves behind is a connection
+held for less time, and that shows up on the writer side — measured next, at
+nothing. `Events().ListSince` is floored the same way
+(`eventswatch.go:103`, `rategate.NewSingle`).
 
 ### The writer side is now worth nothing
 
@@ -123,8 +160,9 @@ A sibling of `Within`, unexported on `sqliteStore` (see *Exported, or not*):
 ```go
 // withinRead runs fn inside a read transaction on the read pool: every read sees
 // one snapshot, and no write lock is taken. A write issued inside fn is a
-// programming error — SQLite refuses it, and the error is not wrapped into
-// anything a caller can handle.
+// programming error. The reader pool refuses it with "attempt to write a
+// readonly database" — from its query_only pragma, not from ReadOnly below —
+// and the error is not wrapped into anything a caller can handle.
 //
 // A nested withinRead joins the ambient transaction, read or write. Nested inside
 // a write transaction it is therefore a write transaction, which is correct: the
@@ -180,18 +218,22 @@ the one thing the grouping exists to prevent.
 
 Yes, on three grounds, none of which is the one this spec was first written on:
 
-- **The grouped read stops scaling with write pressure.** −30% at one writer,
-  −68% at four, and flat thereafter. A busier deployment gets more of this, not
-  less, which is the opposite of every other item on the list.
 - **It settles the export question that
-  [cache prepared statements](2026-08-20-cache-prepared-statements.md) turns on**,
-  and that spec is the widest win in the set and blocked until this one decides.
+  [cache prepared statements](2026-08-20-cache-prepared-statements.md) turns on.**
+  That spec is the widest win in the set and blocked until this one decides. This
+  is now the strongest reason, and it is worth being plain about that.
+- **Opening a watch stops scaling with write pressure.** −86% on an event watch's
+  snapshot under four writers, −22% on an object watch's listing. Both flatten;
+  the saving grows with load rather than shrinking.
 - **It is the right shape.** Four pure reads taking `BEGIN IMMEDIATE` on the
   writer is wrong on its face and stays wrong however little it costs.
 
-What it is **not** worth building for: the write path, which does not move at the
-shipping throttle, and watch delivery latency, which is floor-bound. Both were
-claimed by earlier drafts of this spec and neither survives measurement.
+What it is **not** worth building for, all three claimed by earlier drafts and
+none surviving measurement: the write path, which does not move at the shipping
+throttle; watch delivery latency, which is floor-bound; and the tailer's drain
+read, which is behind that same floor. A change measured on a floored path buys
+nothing a user can see — the spec applies that test to its own writer-side
+number, and it has to survive being turned on the read side too.
 
 Both specs that outranked it are gone — resource version blocks
 [shipped](../adr/2026-08-20-reserve-resource-versions-in-blocks.md), and folding
@@ -222,17 +264,38 @@ with it — record that dependency in both ADRs rather than in one.
 
 ## Edge cases the implementer would otherwise guess at
 
+- **`ReadOnly: true` enforces nothing. `query_only` does.** modernc reads the
+  flag only to pick the begin verb (`tx.go:18-31`); it is not a permission. What
+  refuses a write inside `withinRead` is the reader pool's `query_only` pragma,
+  and **`OpenMemory` has no reader pool** — `readDB` is aliased to `db`, so there
+  a write inside a grouped read *succeeds*. Measured, same statement both ways:
+
+  | pool | write inside the read transaction |
+  |---|---|
+  | `Open` (reader pool) | `attempt to write a readonly database (8)` |
+  | `OpenMemory` (aliased) | `<nil>` — it commits |
+
+  Nine call sites in the whole sqlite suite open on disk, against ~380 tests. So
+  a stray write inside a grouped read is invisible to almost all of it and breaks
+  only in a deployment. Two consequences: the godoc must credit the pragma rather
+  than the flag, and the test for the refusal **must be on disk** or it fails
+  outright.
+
 - **Nesting a write inside a read is not defended against.** A `Within` reached
-  from inside a `withinRead` joins the read transaction and its writes fail at
-  the SQLite level. That is loud and correct. Say so in the godoc; do not add a
-  runtime check for it.
+  from inside a `withinRead` joins the read transaction, and on disk its writes
+  fail at the SQLite level. That is loud and correct where it is loud at all. Do
+  not add a runtime check for it.
 
 - **The savepoint machinery is shared.** `txState` does not care which begin verb
   opened the transaction, so nested frames, `sealForCommit` and the unwind rules
   are untouched. Do not fork them.
 
 - **A read transaction holds one of the reader's N connections** for its whole
-  life, so a drain that pages holds one for the whole drain.
+  life. `WithReadConnections(1)` is legal — `sqlite/sqlite.go:67` rejects only
+  below 1 — and at N=1 a snapshot over a large kind blocks every other read for
+  its duration: client `Get`s, driver scans, the lot. Not a regression in
+  aggregate, since today those same reads queue behind the single writer instead,
+  but it moves who waits, and the default of 4 is what keeps it unremarkable.
 
 - **A commit wake can arrive inside an open snapshot.** An autocommit read
   starts a fresh snapshot every statement, so a wake is always seen. Grouped in a
@@ -265,7 +328,9 @@ In `sqlite/store_test.go`:
 - A `withinRead` that groups two reads sees one snapshot: write between them from
   the same store and the second read must not see it. Drive the write from
   another goroutine through a seam, not by timing.
-- A write inside `withinRead` fails, and the failure is the driver's.
+- A write inside `withinRead` fails, and the failure is the driver's. **On disk**:
+  `OpenMemory` aliases the reader to the writer, which has no `query_only`, so in
+  memory the write succeeds and this test would fail.
 - `withinRead` does not increment `txCount`, and `TestSpecWriteTakesItsTransaction`
   (or whichever test reads that counter) still passes.
 - A `withinRead` nested in a `Within` commits with the outer one, and its reads
