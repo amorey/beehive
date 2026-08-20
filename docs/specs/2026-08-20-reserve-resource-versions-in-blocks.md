@@ -78,8 +78,9 @@ A draw of `n`:
   hand out a version *below* one the fallback returned, and versions would go
   backwards.
 
-At `open`, seed `next = end = published = ` the sequence row's current value: an
-empty block, and a `published` above every version the previous process used.
+At `open`, read the sequence row for `published` and reserve the first block.
+`open` has no transaction, so it takes the same safe path as a refill — and it is
+what keeps the first write of each process off the fallback.
 
 ## Where the refill happens
 
@@ -89,6 +90,7 @@ transaction. **That cannot be done, on two counts:**
 - The writer pool is `MaxOpenConns(1)` and the caller is inside a transaction
   holding it. The reservation waits for a connection its own caller will not
   release — a hang, not an error, on the background context the store passes.
+  Measured: `context deadline exceeded` after 2.008s against a 2s deadline.
 - A second writer pool over the same file does not help: `_txlock=immediate`
   means the ambient transaction holds SQLite's write lock, so the reservation
   gets `SQLITE_BUSY`. This is a SQLite property; no amount of connections fixes
@@ -96,12 +98,14 @@ transaction. **That cannot be done, on two counts:**
 
 And reserving *inside* the transaction is unsafe: a rollback unwinds the
 sequence write while memory keeps the block, so the next reservation draws from a
-lower value and hands out versions already used.
+lower value and hands out versions already used. Measured: a block reserved
+through 256 inside a transaction leaves the row at 0 once it rolls back.
 
 So the refill runs where there is provably no transaction: **at the end of
 `Within`, on the outermost path, after `tx.Commit()` succeeds.** `Commit` returns
 the connection to the pool, so the refill's own statement autocommits and cannot
-be rolled back by anything.
+be rolled back by anything. Measured: the draw that deadlocks inside the
+transaction takes 36 µs one line after the commit.
 
 Two steps, in this order, and the order is the whole point:
 
