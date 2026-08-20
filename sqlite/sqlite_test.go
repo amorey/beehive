@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/amorey/beehive/internal/sqlitemigrate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -142,4 +143,23 @@ func TestCloseClosesBothPools(t *testing.T) {
 
 	assert.Error(t, store.readDB.Ping(), "the read pool should be closed too")
 	assert.NoError(t, store.Close(), "Close is idempotent")
+}
+
+// A failed migration is reported rather than half-opened, and no read pool is
+// built behind it — the reader opens only after the writer has migrated.
+func TestOpenReportsAMigrationFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "newer.db")
+	db := sqlitemigrate.OpenPool(path, 1)
+	_, err := db.Exec(`CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`)
+	require.NoError(t, err)
+	// A version this binary does not have: Apply refuses to downgrade.
+	_, err = db.Exec(`INSERT INTO schema_migrations VALUES (9999, 'from a newer binary', 0)`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	store, err := Open(path)
+	require.Error(t, err)
+	assert.Nil(t, store)
+	assert.Contains(t, err.Error(), "newer than binary supports")
 }
