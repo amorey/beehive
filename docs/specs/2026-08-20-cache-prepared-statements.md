@@ -248,29 +248,31 @@ only the query differs.
 ## What residency costs
 
 **A connection holding prepared statements taxes everything that runs on it**,
-prepared and unprepared alike. Measured on one read connection, on disk, 1000
-objects, seventeen columns by primary key (`BenchmarkResidencyToll`):
+prepared and unprepared alike — but the tax is small beside what preparing saves.
+Measured on one read connection, on disk, 1000 objects, seventeen columns by
+primary key (`BenchmarkResidencyToll`):
 
-| statements resident | unprepared | prepared |
-|---|---|---|
-| 0 | 21.9 µs | 7.46 µs |
-| 15 | 26.3 µs | 7.54 µs |
-| 60 | 27.3 µs | 7.74 µs |
-| 240 | 27.4 µs | 7.77 µs |
+| | unprepared | prepared | preparing saves |
+|---|---|---|---|
+| no statements resident | 24.7 µs | 7.38 µs | −17.3 µs (−70%) |
+| 60 resident | 26.9 µs | 7.60 µs | −19.3 µs (−72%) |
+| residency costs | +2.3 µs (+9%) | +0.2 µs (+3%) | |
 
-**It is a step, not a slope.** Nearly all of it arrives by fifteen resident
+**Arms must be interleaved across separate `go test` invocations.** `-count`
+repeats each sub-benchmark consecutively, so slow machine drift lands entirely on
+whichever arm ran first: two earlier runs put the unprepared toll at +25% and
++6%, both from that artefact. Every figure above is the median of four
+alternating invocations, with under 1.5% spread inside each arm.
+
+**It is a step, not a slope.** Nearly all of the toll arrives by fifteen resident
 statements, and sixteen times more adds almost nothing. Whatever the set grows
-to, the toll does not.
+to, the toll does not — and two resident statements cost under 1%, so a partly
+migrated store pays almost nothing, it simply has not collected the win yet.
 
-**The magnitude is run-dependent; the shape is not.** A second run on a busier
-machine put the unprepared step at +6% rather than +25%, with the same
-saturation by fifteen. Compare within a run, never across. Two resident
-statements cost under 1%, so a partly migrated store pays almost nothing — it
-simply has not collected the win yet.
-
-**Preparing is not the escape, but it is most of one**: +0.3 µs (+4%) against
-+5.4 µs (+25%), fifteen times the cost unprepared. This is the "+7% residual a
-cached statement pays on a busy connection" an earlier draft carried, re-measured.
+**The net is not close.** A prepared execution saves about 17 µs; an unprepared
+one pays about 2.3 µs. The migration is ahead as long as prepared executions are
+more than about an eighth of unprepared ones, which every call pattern in this
+store satisfies by a wide margin.
 
 The thirteen rendered statements cannot be prepared, and seven of them can reach
 the read pool, so they pay the full toll. What that costs in place
@@ -283,13 +285,13 @@ the read pool, so they pay the full toll. What that costs in place
 | 64 ids | 385 µs | 388 µs | +0.8% |
 | 64 ids, in a read transaction | 395 µs | 400 µs | +1.2% |
 
-A large batch amortises the toll to nothing; a single id does not, and
-`ListByIDs` takes whatever a tailer page holds.
+Those four are from grouped `-count` runs, so read them for shape and not for
+magnitude: a large batch amortises the toll to nothing, a single id does not, and
+`ListByIDs` takes whatever a tailer page holds. Re-measure them alternating if
+the exact figure ever matters.
 
-**None of this moves the headline.** The −63% was measured against a store with
-22 statements resident, so the tax is already inside it. The net is what it says:
-a prepared statement saves about 14 µs having paid the toll, an unprepared one
-pays the toll with nothing against it.
+**None of this moves the headline.** The −63% end to end was measured against a
+store with 22 statements resident, so the tax is already inside it.
 
 **Likely mechanism, and why it is worth a line.** SQLite's per-connection
 lookaside allocator: each resident statement holds lookaside memory for its
