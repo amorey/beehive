@@ -47,9 +47,9 @@ uses of `st.tx` are the savepoint statements. Two structural tests hold that.
 takes its connection from `conn` or from a caller that did; both sides are
 receiver-qualified, because `Add`, `Delete`, `Set` and `Sweep` each name a write
 on more than one sub-API and a bare name would let a new one pass on an existing
-one's behalf. `TestTheTransactionHandleHasThreeUsers` covers the way around
-`conn`: `st.tx` is reachable from `conn`, `read` and the savepoint statements, and
-nowhere else. A roster of verbs could hold neither — a verb added without going
+one's behalf. `TestTheTransactionHandleHasFourUsers` covers the way around
+`conn`: `st.tx` is reachable from `conn`, `read`, `stmtFor` and the savepoint
+statements, and nowhere else. A roster of verbs could hold neither — a verb added without going
 through `conn` is also a verb nobody adds to a roster.
 
 **`conn` is taken before a write's no-op early return**, not at first use. Several
@@ -90,10 +90,12 @@ version-settling tail; `withinRead` passes none.
 exactly as `Within` does. Not for the rollback: a read has nothing to roll back,
 and that is the reason the spec gave for skipping it. The savepoint is doing two
 other jobs. It is the frame's admission check, which rejects a ctx captured from
-an unwound frame; and it is the record that the read is running, without which the
-outer transaction seals and commits from under a sibling goroutine's grouped read,
-taking the single snapshot with it. Both were properties these reads had before
-they moved, and neither is about rollback.
+an unwound frame; and it is the record that the read is running, which is what
+`sealForCommit` refuses to commit over. That second job is a **tripwire, not a
+guard**: a transaction ctx belongs to one goroutine (`internal/storeapi`,
+`Within`), so an outer transaction committing under a sibling goroutine's grouped
+read is a contract violation rather than a case this design owes an answer to.
+`ErrConcurrentNestedTx` already says the same of itself.
 
 `s.read(ctx)` on a dead frame still answers from the ambient transaction, as it
 always has ([ADR](2026-08-20-reads-get-their-own-connections.md)). That asymmetry
@@ -103,12 +105,12 @@ between grouped and ungrouped reads predates this change and is not settled here
 queues onto it, and it commits, so the queue is owed. No read path queues one
 today; the prototype that skipped the flush is why this is written down.
 
-**Unexported.** A cached prepared statement is one compiled handle, and two
-callers sharing one corrupts both silently. Inside a read transaction the
-connection is already held, so sharing is possible unless nothing outside the
-store can reach that transaction. Keeping `withinRead` unexported is what will let
-[statement caching](2026-08-20-reads-get-their-own-connections.md) treat these as
-single-threaded. Export it later and that changes with it.
+**Unexported.** A prepared statement is one compiled handle per connection, and
+two callers sharing one corrupts both silently. Inside a read transaction the
+connection is already held, so sharing is possible unless the body is
+single-threaded. What makes it so is the one-goroutine contract, not this; but
+unexported is what keeps the contract cheap to hold here, since only this package
+can add a caller. Export it later and each new one has to be checked.
 
 ## Consequences
 

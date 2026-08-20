@@ -233,8 +233,9 @@ type txFrame struct {
 type txState struct {
 	tx *sql.Tx
 
-	// mu guards against a Within fn fanning calls across goroutines; AfterCommit
-	// and bare reads stay legal concurrently.
+	// mu keeps this state consistent. It is not a licence to fan out: a
+	// transaction ctx belongs to one goroutine (internal/storeapi, Within), and
+	// two goroutines sharing a prepared statement interleave on one cursor.
 	mu    sync.Mutex
 	hooks []queuedHook
 
