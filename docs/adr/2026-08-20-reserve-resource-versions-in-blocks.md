@@ -66,10 +66,11 @@ highest version a committed transaction took — and `GetForReconcile` samples i
 and at or below the watermark it stamps.
 
 **A commit publishes its own draws, never the allocator's high water mark.**
-Publication happens at the tail of `Within`, after `Commit` released SQLite's write
-lock and after the `AfterCommit` hooks — a wide window, since a hook may itself
-open a transaction. Another writer can be mid-transaction by then, holding a
-version out of the block. Publishing `next - 1` would cover it, and a concurrent
+Publication happens in the tail of `Within`, immediately after `Commit` released
+SQLite's write lock and **before** the `AfterCommit` hooks — those wake the waker,
+whose dependent samples the cursor on another goroutine. Another writer can be
+mid-transaction by the time a commit publishes, holding a version out of the
+block. Publishing `next - 1` would cover it, and a concurrent
 `GetForReconcile` would stamp a watermark past a write it never saw, which
 `ListStaleSince` then skips for good. So `txState` carries the highest version its
 transaction took, and that is what its commit publishes; it is monotonic, because

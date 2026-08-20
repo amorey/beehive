@@ -72,6 +72,16 @@ func TestVersionBlockCoversWhatFits(t *testing.T) {
 		assert.Equal(t, int64(2), v.latest())
 	})
 
+	t.Run("publish takes the committer's draw, not the allocator's", func(t *testing.T) {
+		v := versions{next: 1, end: 10}
+		mine, _ := v.take(1)
+		_, _ = v.take(1) // another writer, still open
+
+		v.publish(mine)
+		assert.Equal(t, mine, v.latest(),
+			"covering a version a live transaction holds stamps a watermark past it")
+	})
+
 	t.Run("publish never goes backwards", func(t *testing.T) {
 		v := versions{next: 1, end: 5}
 		v.publish(4)
@@ -149,14 +159,14 @@ func TestConcurrentWritersNeverGoBackwards(t *testing.T) {
 	}
 }
 
-// The cursor must never cover a version a live transaction is still holding.
-// settleVersions runs after Commit released the write lock and after the hook loop,
-// so another writer can be mid-transaction by then; publishing the allocator's high
-// water mark would hand a reconcile load a cursor over a write it did not see, and
+// The cursor must never cover a version a live transaction is still holding: a
+// reconcile load would stamp a watermark past a write it did not see, and
 // ListStaleSince would skip that write for good.
 //
-// The interleaving is forced through an AfterCommit hook, which runs inside the
-// window.
+// End to end, through an AfterCommit hook that leaves a second writer open across
+// the first's commit. The unit test above is the guard for the rule itself — since
+// publish moved ahead of the hook loop there is no seam left to force the ordering
+// from here.
 func TestTheCursorNeverCoversALiveTransaction(t *testing.T) {
 	ctx := context.Background()
 	store := newDiskStore(t)

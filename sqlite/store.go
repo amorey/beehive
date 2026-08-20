@@ -577,6 +577,9 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Before the hooks: they wake the waker, whose dependent samples the cursor on
+	// another goroutine and would stamp a watermark below its target's version.
+	s.versions.publish(st.highestDraw())
 	// flush latches closed before the hooks below run — a close deferred to return
 	// would read false while a hook can hand its captured tx ctx back to the store.
 	hooks := st.flush()
@@ -584,7 +587,7 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	for _, hook := range hooks {
 		hook.fn()
 	}
-	s.settleVersions(ctx, st.highestDraw())
+	s.refillVersions(ctx)
 	return nil
 }
 
@@ -675,14 +678,13 @@ func drawResourceVersions(ctx context.Context, c dbtx, n int) (int64, error) {
 	return rv, err
 }
 
-// settleVersions publishes what the transaction took and reserves the next block.
-// It must run where no transaction is open: a reservation that rolls back leaves
-// the allocator handing out versions the counter no longer covers.
+// refillVersions reserves the next block. It must run where no transaction is
+// open: a reservation that rolls back leaves the allocator handing out versions
+// the counter no longer covers.
 //
 // The draw is outside the allocator's lock. It waits for the writer connection,
 // which a sibling transaction may hold while itself waiting to take a version.
-func (s *sqliteStore) settleVersions(ctx context.Context, drawn int64) {
-	s.versions.publish(drawn)
+func (s *sqliteStore) refillVersions(ctx context.Context) {
 	if blockSize <= 0 || !s.versions.spent() {
 		return
 	}
