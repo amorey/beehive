@@ -7,7 +7,7 @@
   held statement taxes its connection; measured properly, a *cached* statement
   barely pays that and caching more is what avoids it. The two are independent
   and compose.
-- **Related:** [a read-only transaction](2026-08-20-a-read-only-transaction.md),
+- **Related:** [a read that groups is a read transaction](../adr/2026-08-20-a-read-that-groups-is-a-read-transaction.md),
   which decides whether the store's grouped reads can share a statement.
 
 ## Why

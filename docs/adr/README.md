@@ -57,6 +57,7 @@ for the mapping.
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [auto_vacuum=INCREMENTAL, drained by the GC sweeper](2026-07-29-auto-vacuum-incremental.md)
 - [Reads get their own connections](2026-08-20-reads-get-their-own-connections.md)
+- [A read that groups is a read transaction](2026-08-20-a-read-that-groups-is-a-read-transaction.md)
 - [Resource versions are reserved in blocks](2026-08-20-reserve-resource-versions-in-blocks.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
 - [The driver cadences are configurable, because every trigger pushes at commit](2026-08-06-driver-cadences-are-configurable.md)

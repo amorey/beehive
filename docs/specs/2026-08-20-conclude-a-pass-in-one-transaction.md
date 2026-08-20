@@ -18,7 +18,7 @@ A settled reconcile ends with three separate writes, each its own transaction
 Three transactions, three commits, for what is one event: this pass concluded.
 Grouping them costs one `BEGIN`/`COMMIT` instead of three, about 20 µs a pass on
 the numbers in
-[the read-transaction spec](2026-08-20-a-read-only-transaction.md).
+[the read transaction](../adr/2026-08-20-a-read-that-groups-is-a-read-transaction.md).
 
 ## The question to settle first
 

@@ -387,9 +387,15 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `WithReadConnections` (4 by default), so they no longer queue behind writes.
   `s.read(ctx)` returns the ambient transaction while it is live — that is the
   safety property, and a read on any other ctx now returns stale committed state
-  rather than deadlocking. A grouped read still takes the writer, because the
-  five that self-wrap in `Within` have not moved.
-  → [ADR](docs/adr/2026-08-20-reads-get-their-own-connections.md)
+  rather than deadlocking. **A read that groups is a read transaction**
+  (`withinRead`), on the reader, sharing `Within`'s frame protocol but settling no
+  versions; four of the five grouped reads moved. `Events().Sweep` did not — its
+  scan and the trim after it are one transaction — and the waker's `ListSinceAll`
+  is ungrouped so a commit wake mid-scan is seen. `ReadOnly` only picks the begin
+  verb: `query_only` refuses the write, and `OpenMemory` has no reader pool, so
+  the frame latches a read that drew a version.
+  → [ADR](docs/adr/2026-08-20-reads-get-their-own-connections.md),
+  [ADR](docs/adr/2026-08-20-a-read-that-groups-is-a-read-transaction.md)
 - **Resource versions are reserved in blocks, and are unique and increasing but
   never contiguous.** Every cursor in the system compares `>`, so a crash or a
   rollback burning the rest of a block costs nothing. The reservation runs where
