@@ -16,6 +16,7 @@ package sqlite
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/amorey/beehive/internal/storeapi"
@@ -58,4 +59,44 @@ func TestAReadOnAClosedFrameUsesThePool(t *testing.T) {
 	require.NotNil(t, store.read(escaped))
 	_, err := store.Objects().GetMeta(escaped, storeapi.ObjectID(1))
 	assert.ErrorIs(t, err, storeapi.ErrNotFound, "want a clean miss, not sql.ErrTxDone")
+}
+
+func TestOpenUsesADefaultReadPool(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+
+	require.NotNil(t, store.readDB, "an on-disk store gets a read pool")
+	assert.Equal(t, defaultReadConnections, store.readDB.Stats().MaxOpenConnections)
+}
+
+func TestWithReadConnections(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"), WithReadConnections(2))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	assert.Equal(t, 2, store.readDB.Stats().MaxOpenConnections)
+
+	for _, n := range []int{0, -1} {
+		_, err := Open(filepath.Join(t.TempDir(), "bad.db"), WithReadConnections(n))
+		assert.ErrorIs(t, err, ErrInvalidOption, "n = %d", n)
+	}
+}
+
+// The database cannot be opened twice in memory, so the option is a no-op there
+// rather than a second, empty database.
+func TestOpenMemoryHasNoReadPool(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	assert.Nil(t, store.readDB)
+}
+
+func TestCloseClosesBothPools(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	_, err = store.readDB.ExecContext(context.Background(), `SELECT 1`)
+	assert.Error(t, err, "the read pool should be closed too")
+	assert.NoError(t, store.Close(), "Close is idempotent")
 }

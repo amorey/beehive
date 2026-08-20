@@ -112,6 +112,12 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
+	// Readers first: they hold snapshots the writer's checkpoint waits on.
+	if s.readDB != nil {
+		if err := s.readDB.Close(); err != nil {
+			return err
+		}
+	}
 	return s.db.Close()
 }
 
