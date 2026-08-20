@@ -387,6 +387,19 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   rather than deadlocking. A grouped read still takes the writer, because the
   five that self-wrap in `Within` have not moved.
   → [ADR](docs/adr/2026-08-20-reads-get-their-own-connections.md)
+- **Resource versions are reserved in blocks, and are unique and increasing but
+  never contiguous.** Every cursor in the system compares `>`, so a crash or a
+  rollback burning the rest of a block costs nothing. The reservation runs where
+  no transaction is open — `open` and the tail of the outermost `Within` — because
+  one that rolls back would hand out versions the counter no longer covers, and it
+  cannot run on the pool from inside a transaction: the writer is one connection
+  and the caller holds it. The counter row therefore holds the reservation's
+  **end**, so the two cursor sites (`GetForReconcile`, `GetLatestResourceVersion`)
+  read the allocator instead; a cursor above what was handed out strands every
+  write in the gap. `published` bounds them only because **every draw happens
+  while the writer connection is held**, pinned by
+  `TestEveryDrawSiteIsInsideATransaction`.
+  → [ADR](docs/adr/2026-08-20-reserve-resource-versions-in-blocks.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration
   is). The sweeper drains the freelist through `Store.ReclaimSpace`, gated on a

@@ -166,9 +166,9 @@ may matter more:
   today — the cost grows with write pressure, where a read-pool read is flat.
 
 Neither is urgent. If the list is ranked by measured value this sits below
-[resource version blocks](2026-08-20-reserve-resource-versions-in-blocks.md) and
 [the spec write's read](2026-08-20-a-spec-write-writes-before-it-reads.md), and
-that is how the README now orders it.
+that is how the README now orders it. Resource version blocks outranked it and
+have [shipped](../adr/2026-08-20-reserve-resource-versions-in-blocks.md).
 
 ## Exported, or not
 

@@ -245,8 +245,10 @@ type RawObject struct {
 // ReconcileLoad is everything one reconcile pass needs from its opening read.
 type ReconcileLoad struct {
 	Object RawObject
-	// Cursor is the store-wide write cursor as of the same statement that read
-	// Object — the value to record on success.
+	// Cursor is the store-wide write cursor — the value to record on success. It
+	// must be sampled before Object is read, and may lag a committed write but
+	// never lead one: a cursor covering a write this load did not see stamps a
+	// watermark past it, and the dependent never learns.
 	Cursor int64
 	// HasDependencies reports whether Object had an outgoing depends_on edge at
 	// load, letting a dependency-free reconcile skip Dependencies().WatermarkSet.
@@ -441,10 +443,11 @@ type Store interface {
 	// sequence and nothing recovers.
 	AfterCommit(ctx context.Context, fn func(ctx context.Context))
 
-	// GetLatestResourceVersion returns the highest resource version issued. It
-	// reads the sequence, not a table, so retention cannot lower it. It moves
-	// for an event write too, so it is a "did anything change" answer, not a
-	// log position to scan from.
+	// GetLatestResourceVersion returns the highest resource version a committed
+	// write took. Never a table's MAX, so retention cannot lower it, and never
+	// above what has been issued: a caller may use it to bound a sweep. It may
+	// lag a write that has just committed. It moves for an event write too, so
+	// it is a "did anything change" answer, not a log position to scan from.
 	GetLatestResourceVersion(ctx context.Context) (int64, error)
 
 	// ReclaimSpace returns up to maxPages of space freed by deleted rows to the
@@ -720,9 +723,10 @@ type Objects interface {
 	// returns ErrNotFound.
 	GetByName(ctx context.Context, gk GroupKind, name string) (*RawObject, error)
 
-	// GetForReconcile is the reconcile loop's opening read: the object
-	// with conditions, the store-wide write cursor as of the same statement,
-	// and whether it has dependencies. ErrNotFound if the row is gone.
+	// GetForReconcile is the reconcile loop's opening read: the object with
+	// conditions, the store-wide write cursor (see ReconcileLoad.Cursor for the
+	// order it must be sampled in), and whether it has dependencies. ErrNotFound
+	// if the row is gone.
 	GetForReconcile(ctx context.Context, id ObjectID) (ReconcileLoad, error)
 
 	// GetMeta is Get without the conditions query (Conditions is

@@ -84,14 +84,14 @@ system. The drift these lists could have with `objectColumns` is not a correctne
 risk: an unknown column fails at prepare, loudly, and each narrow read is pinned by a
 test that hides the columns it must not touch.
 
-The same rule applied to the version draw. `markForDeletion` used to call
-`nextResourceVersion` — an `UPDATE` on `resource_version_seq` — *before* the `IS NULL`
-guard decided whether anything would be stamped, so a repeat delete committed a
-counter write and its fsync to stamp nothing. It now reads `value + 1` inline in the
-`UPDATE` and advances the counter only once a row was stamped, making the
-already-pending path a pure read. That is safe because the two statements sit in the
-caller's transaction on a single connection, and because every `where` this helper
-takes keys on a unique column, so the subquery can never hand one value to two rows.
+The same rule applied to the version draw, and was later withdrawn.
+`markForDeletion` drew its version lazily — reading `value + 1` inline in the
+`UPDATE` and advancing the counter only once a row was stamped — so a repeat delete
+committed no counter write. [Version blocks](2026-08-20-reserve-resource-versions-in-blocks.md)
+make that unsound: the counter row holds the reservation's end rather than what has
+been handed out, so the inline read takes a version the allocator will hand out
+again. The draw moved back before the stamp, and a guarded mark burns a version.
+What paid for the reversal is that the draw itself is now free.
 
 **`Objects().UpdateSpec` loses its `changed` bool**, which is where the two halves of the
 rule pull against each other. It passes the derivability test — the returned row has
@@ -160,7 +160,7 @@ against holding it any longer.
 
 ## A cascade draws one version range, not one per child (2026-08-06)
 
-The lazy draw above is per call, and `deletionRequestsCreateFromOwner` called
+The draw above is per call, and `deletionRequestsCreateFromOwner` called
 `markForDeletion` per child. An N-child cascade therefore drew N versions, committed
 N counter writes and appended N log entries one statement at a time — the tail this
 ADR's sweep left open, and the last one.
@@ -198,9 +198,8 @@ by construction — an already-deleting level is a lone `SELECT` and never reach
 mark, which is also why the batch draws nothing on an empty candidate set.
 
 **The one-child row gets ~10% worse**, and is left that way. Delegating a lone
-candidate back to `markForDeletion` recovers it, and was tried: it buys 17 µs by making
-the draw lazy at N=1 and eager above it, so the helper acquires a second semantics —
-a guarded no-op draws nothing on one path and leaves a gap on the other. The fork is
+candidate back to `markForDeletion` recovers it, and was tried: it buys 17 µs at the
+cost of a second semantics in the helper. The fork is
 unreachable through the cascade, which filters pending children before it, so what it
 actually costs is a caveat in the doc comment and a test to pin a distinction nothing
 observes. One helper with one behaviour is worth more than 17 µs on the narrowest

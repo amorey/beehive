@@ -1,0 +1,83 @@
+# Resource versions are reserved in blocks
+
+- **Status:** Accepted
+- **Date:** 2026-08-20
+
+## Context
+
+Every write drew its resource version with a statement that dirties a page:
+
+```sql
+UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value
+```
+
+Measured on an arm64 sandbox, on disk, that draw is ~26 µs — the largest cost on
+the write path after the row write itself, and every write pays it once.
+
+Beehive is the store's only writer
+([ADR](2026-08-05-one-process-one-beehive-sole-writer.md)), so it can draw a block
+of versions once and hand them out from memory.
+
+## Decision
+
+`sqliteStore` holds a `versions` allocator (`sqlite/versions.go`). A draw takes
+from the reserved block where it fits and falls back to the statement above where
+it does not — a refused take spends the block, because the counter already holds
+the block's end and anything left behind the fallback would be handed out below
+what the fallback returned.
+
+Three rules make it sound.
+
+**The reservation runs where no transaction is open.** A reservation that rolls
+back leaves the allocator handing out versions the counter no longer covers, and a
+restart reuses them. It cannot run on the pool from inside a transaction either:
+the writer is one connection and the caller holds it, so the draw waits for a
+connection its own caller will not release — measured, a hang rather than an error.
+A second writer pool does not help, because `_txlock=immediate` means the ambient
+transaction holds SQLite's write lock. So the reservation runs at `open` and at the
+tail of the outermost `Within`, after `tx.Commit()` has returned the connection.
+Its failure is swallowed: the commit has already landed, so it cannot be reported,
+and the next draw raises it where a caller can act.
+
+**Versions are unique and increasing, never contiguous.** Every cursor in the
+system compares `>`, so a crash or a rollback burning the rest of a block costs
+nothing. This is what lets the reservation be coarse, and what lets a guarded
+`markForDeletion` draw a version it never stamps.
+
+**The cursor sites read the allocator, not the counter row.** Once a block is
+reserved that row holds the reservation's *end*, above what has been handed out.
+`GetForReconcile`'s cursor becomes `reconciled_against`, and `ListStaleSince`
+selects on `target.resource_version > reconciled_against`: a cursor above what was
+handed out puts every target write in the rest of the block under the watermark,
+and the dependent never learns. `GetLatestResourceVersion` bounds the
+stale-dependents sweep and strands the same range. Both read `published` — the
+highest version a committed transaction took — and `GetForReconcile` samples it
+*before* the row read, or a write committing in between would be both unobserved
+and at or below the watermark it stamps.
+
+`published` is a valid lower bound only because **every draw happens while the
+writer connection is held**: all draw sites run inside a `Within`, so two of them
+cannot interleave and everything below an open transaction's first draw is
+committed. `TestEveryDrawSiteIsInsideATransaction` pins the site list; a draw added
+outside one would autocommit, never publish, and freeze the cursor below live
+writes, silently.
+
+`blockSize` is 1024 and unexported. It sits above `markChunkSize` (128) by enough
+that a full deletion chunk usually fits — a chunk the block cannot cover takes the
+fallback and burns the remainder.
+
+## Consequences
+
+Measured against the real store, baseline and stubbed runs alternated so drift
+cancels: a status write in a `Within` is 17% faster, a spec write that changes the
+spec 14%.
+
+A restart leaves a gap of up to `blockSize`, which nothing observes.
+
+The counter row no longer tracks draws one for one, so a test counting draws reads
+the allocator (`handedOut`) rather than the row. The tests that exercise the
+fallback's error branch set `blockSize` to 0, which is the only way to reach it.
+
+This reverses the lazy draw in
+[store write shapes](2026-07-30-store-write-shapes.md): `markForDeletion` drew its
+version from the counter row inline, which a reserved block makes unsound.
