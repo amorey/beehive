@@ -8981,3 +8981,37 @@ func TestAReadTransactionRunsItsHooks(t *testing.T) {
 	}))
 	assert.Equal(t, 1, ran, "a hook queued inside a read transaction must run at its commit")
 }
+
+// The property the change exists for: a grouped read runs on the reader while a
+// write transaction holds the writer. On disk, since OpenMemory has one pool.
+func TestAGroupedReadRunsBesideAWriteTransaction(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	obj := newKindObject(t, store, testGK)
+
+	holding, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		assert.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+			_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
+			close(holding)
+			<-release
+			return err
+		}))
+	}()
+	<-holding
+
+	read := make(chan error, 1)
+	go func() {
+		_, _, err := store.ObjectWrites().ListSince(ctx, testGK, 0, 16)
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the grouped read is queued behind the open write transaction")
+	}
+	close(release)
+	<-done
+}

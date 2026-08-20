@@ -3253,7 +3253,7 @@ func (s sqliteObjectWrites) ListSince(ctx context.Context, gk storeapi.GroupKind
 	}
 	var writes []storeapi.ObjectWrite
 	var trimmed int64
-	err := s.Within(ctx, func(ctx context.Context) error {
+	err := s.withinRead(ctx, func(ctx context.Context) error {
 		var err error
 		if writes, trimmed, err = s.writeLogPage(ctx, gk, afterRV, limit); err != nil {
 			return err
