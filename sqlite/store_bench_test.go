@@ -250,12 +250,13 @@ func benchSpecWrite(b *testing.B, specKB, conds int, mode string) {
 // which is what the read pool exists for: the drivers scan on a cadence forever
 // and every one of those reads used to sit in the writers' queue.
 //
-// It is not the whole picture. BenchmarkWritesUnderWatch gets 11-15% WORSE on
-// the light-watch rows: a tailer's quiet tick moved to the reader, so its loop
-// is no longer paced by queueing behind writers and it issues more
-// ObjectWrites().ListSince calls — each of which self-wraps in Within and still
-// takes the writer. Moving those five grouped reads off Within is what turns
-// that around, and it belongs to the read-transaction spec.
+// BenchmarkWritesUnderWatch is unmoved at its default throttle and 11-15% worse
+// with the throttle at 0, which no embedder can set: a tailer's quiet tick moved
+// to the reader, so with its scan floor off the loop is paced by nothing and
+// issues more ObjectWrites().ListSince calls — each of which self-wraps in
+// Within and still takes the writer. What that row measures is the accidental
+// throttle connection contention used to provide, and what the read-transaction
+// spec stands to win.
 //
 // On disk, since OpenMemory has no read pool.
 func BenchmarkReadUnderWrites(b *testing.B) {
