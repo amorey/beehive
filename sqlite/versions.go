@@ -53,19 +53,29 @@ func (v *versions) take(n int) (int64, bool) {
 // next block both continue above it.
 func (v *versions) record(hi int64) { v.reserve(hi, 0) }
 
-// settle publishes everything handed out and reports whether a refill is owed.
-// One call, because publishing must precede the reservation: after it, next-1
-// names a version out of the new block that no write has taken.
-func (v *versions) settle() bool {
+// publish marks every version up to drawn as committed. drawn is the committing
+// transaction's own highest, never the allocator's: publication happens after the
+// commit released the write lock, by which point another writer may hold a version
+// out of the block and not yet have committed it. Monotonic, because two commits
+// can reach here out of order.
+func (v *versions) publish(drawn int64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.published = v.next - 1
+	if drawn > v.published {
+		v.published = drawn
+	}
+}
+
+// spent reports whether the block has nothing left, which is what asks for a refill.
+func (v *versions) spent() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	return v.next >= v.end
 }
 
 // latest is the highest version a committed write took. It lags a write by the
 // moment between its commit and its publish, which over-reports staleness — the
-// harmless direction. See the spec for why the sequence row cannot answer this.
+// harmless direction.
 func (v *versions) latest() int64 {
 	v.mu.Lock()
 	defer v.mu.Unlock()

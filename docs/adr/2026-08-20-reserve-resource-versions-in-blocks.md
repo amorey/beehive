@@ -65,12 +65,17 @@ highest version a committed transaction took — and `GetForReconcile` samples i
 *before* the row read, or a write committing in between would be both unobserved
 and at or below the watermark it stamps.
 
-`published` is a valid lower bound only because **every draw happens while the
-writer connection is held**: all draw sites run inside a `Within`, so two of them
-cannot interleave and everything below an open transaction's first draw is
-committed. `TestEveryDrawSiteIsInsideATransaction` pins the site list; a draw added
-outside one would autocommit, never publish, and freeze the cursor below live
-writes, silently.
+**A commit publishes its own draws, never the allocator's high water mark.**
+Publication happens at the tail of `Within`, after `Commit` released SQLite's write
+lock and after the `AfterCommit` hooks — a wide window, since a hook may itself
+open a transaction. Another writer can be mid-transaction by then, holding a
+version out of the block. Publishing `next - 1` would cover it, and a concurrent
+`GetForReconcile` would stamp a watermark past a write it never saw, which
+`ListStaleSince` then skips for good. So `txState` carries the highest version its
+transaction took, and that is what its commit publishes; it is monotonic, because
+two commits can reach the tail out of order. `TestEveryDrawSiteIsInsideATransaction`
+pins the site list: a draw outside a transaction never publishes, which stalls the
+cursor rather than overstating it, but stalls it silently.
 
 `blockSize` is 1024 and unexported. It sits above `markChunkSize` (128) by enough
 that a full deletion chunk usually fits — a chunk the block cannot cover takes the

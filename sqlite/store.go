@@ -230,6 +230,11 @@ type txState struct {
 	// transaction committed, so "over" and "over and durable" differ.
 	committed bool
 
+	// drawn is the highest resource version this transaction has taken, which is
+	// what its commit publishes. Nested frames share it, rolled-back draws
+	// included: a burned version belongs to no write, so publishing over it is safe.
+	drawn int64
+
 	// sealed latches just before the commit; pushSavepoint refuses on it. Not
 	// closed: a hook arriving between seal and drain must still queue and run.
 	sealed bool
@@ -579,8 +584,24 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	for _, hook := range hooks {
 		hook.fn()
 	}
-	s.settleVersions(ctx)
+	s.settleVersions(ctx, st.highestDraw())
 	return nil
+}
+
+// noteDraw records a resource version this transaction took.
+func (st *txState) noteDraw(rv int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if rv > st.drawn {
+		st.drawn = rv
+	}
+}
+
+// highestDraw is the highest version this transaction took, 0 if it took none.
+func (st *txState) highestDraw() int64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.drawn
 }
 
 // AfterCommit defers fn to the outermost transaction's commit. Outside a
@@ -627,14 +648,19 @@ func (s *sqliteStore) nextResourceVersion(ctx context.Context, c dbtx) (int64, e
 // drawn, so the range taken is [value-n+1, value]. n must be positive. Served
 // from the reserved block where it fits, and from the table otherwise.
 func (s *sqliteStore) advanceResourceVersion(ctx context.Context, c dbtx, n int) (int64, error) {
-	if hi, ok := s.versions.take(n); ok {
-		return hi, nil
+	hi, ok := s.versions.take(n)
+	if !ok {
+		var err error
+		if hi, err = drawResourceVersions(ctx, c, n); err != nil {
+			return 0, err
+		}
+		s.versions.record(hi)
 	}
-	hi, err := drawResourceVersions(ctx, c, n)
-	if err != nil {
-		return 0, err
+	// The transaction publishes its own draws at commit. A draw outside one is
+	// never published, which stalls the cursor rather than overstating it.
+	if st := liveTx(ctx); st != nil {
+		st.noteDraw(hi)
 	}
-	s.versions.record(hi)
 	return hi, nil
 }
 
@@ -655,8 +681,9 @@ func drawResourceVersions(ctx context.Context, c dbtx, n int) (int64, error) {
 //
 // The draw is outside the allocator's lock. It waits for the writer connection,
 // which a sibling transaction may hold while itself waiting to take a version.
-func (s *sqliteStore) settleVersions(ctx context.Context) {
-	if !s.versions.settle() || blockSize <= 0 {
+func (s *sqliteStore) settleVersions(ctx context.Context, drawn int64) {
+	s.versions.publish(drawn)
+	if blockSize <= 0 || !s.versions.spent() {
 		return
 	}
 	// Detached from the caller's deadline: a cancelled refill leaves the block
@@ -680,7 +707,8 @@ func (s *sqliteStore) seedVersions(ctx context.Context) error {
 		return err
 	}
 	s.versions.reserve(hi, n)
-	s.versions.settle()
+	// The counter's value before the draw: where the previous process left it.
+	s.versions.publish(hi - int64(n))
 	return nil
 }
 

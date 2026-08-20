@@ -396,9 +396,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   and the caller holds it. The counter row therefore holds the reservation's
   **end**, so the two cursor sites (`GetForReconcile`, `GetLatestResourceVersion`)
   read the allocator instead; a cursor above what was handed out strands every
-  write in the gap. `published` bounds them only because **every draw happens
-  while the writer connection is held**, pinned by
-  `TestEveryDrawSiteIsInsideATransaction`.
+  write in the gap. **A commit publishes its own draws, never the allocator's high
+  water mark**: publication happens after the commit released the write lock and
+  after the hooks, so another writer may hold a version by then, and covering it
+  would stamp a watermark past a write nobody saw. A draw outside a transaction
+  publishes nothing and silently stalls the cursor, which
+  `TestEveryDrawSiteIsInsideATransaction` pins against.
   → [ADR](docs/adr/2026-08-20-reserve-resource-versions-in-blocks.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration

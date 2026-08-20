@@ -59,19 +59,24 @@ func TestVersionBlockCoversWhatFits(t *testing.T) {
 	t.Run("record carries the fallback's draw", func(t *testing.T) {
 		v := versions{next: 1, end: 1}
 		v.record(40)
-		v.settle()
+		assert.True(t, v.spent())
+		v.publish(40)
 		assert.Equal(t, int64(40), v.latest())
 	})
 
-	t.Run("settle reports only what a commit took", func(t *testing.T) {
+	t.Run("publish reports only what a commit took", func(t *testing.T) {
 		v := versions{next: 1, end: 5}
-		v.settle()
-		assert.Equal(t, int64(0), v.latest(), "nothing has been handed out")
-
-		_, _ = v.take(2)
+		hi, _ := v.take(2)
 		assert.Equal(t, int64(0), v.latest(), "drawn, not committed")
-		v.settle()
+		v.publish(hi)
 		assert.Equal(t, int64(2), v.latest())
+	})
+
+	t.Run("publish never goes backwards", func(t *testing.T) {
+		v := versions{next: 1, end: 5}
+		v.publish(4)
+		v.publish(2) // a slower commit, reaching here after a later one
+		assert.Equal(t, int64(4), v.latest())
 	})
 }
 
@@ -142,6 +147,52 @@ func TestConcurrentWritersNeverGoBackwards(t *testing.T) {
 		assert.Greater(t, e.ResourceVersion, last, "the write log must not go backwards")
 		last = e.ResourceVersion
 	}
+}
+
+// The cursor must never cover a version a live transaction is still holding.
+// settleVersions runs after Commit released the write lock and after the hook loop,
+// so another writer can be mid-transaction by then; publishing the allocator's high
+// water mark would hand a reconcile load a cursor over a write it did not see, and
+// ListStaleSince would skip that write for good.
+//
+// The interleaving is forced through an AfterCommit hook, which runs inside the
+// window.
+func TestTheCursorNeverCoversALiveTransaction(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	first := newKindObject(t, store, testGK)
+	second := newKindObject(t, store, testGK)
+
+	drawn, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		if _, err := store.Objects().UpdateStatus(ctx, testGK, first.ID, []byte(`{"n":1}`), 0); err != nil {
+			return err
+		}
+		store.AfterCommit(ctx, func(context.Context) {
+			go func() {
+				defer close(done)
+				assert.NoError(t, store.Within(context.Background(), func(ctx context.Context) error {
+					_, err := store.Objects().UpdateStatus(ctx, testGK, second.ID, []byte(`{"n":1}`), 0)
+					close(drawn)
+					<-release
+					return err
+				}))
+			}()
+			<-drawn // the second writer has taken its version and is still open
+		})
+		return nil
+	}))
+
+	// The first writer has now settled, with the second's version still uncommitted.
+	cursor, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	close(release)
+	<-done
+
+	held, err := store.Objects().Get(ctx, second.ID)
+	require.NoError(t, err)
+	assert.Less(t, cursor, held.ResourceVersion,
+		"a cursor covering an uncommitted write stamps a watermark past it")
 }
 
 // withBlockSize sets the reservation size for one test.
