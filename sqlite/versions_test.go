@@ -16,7 +16,15 @@ package sqlite
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -178,4 +186,133 @@ func TestDeletionMarkTakesItsVersionFromTheBlock(t *testing.T) {
 func withoutVersionBlocks(t *testing.T) {
 	t.Helper()
 	withBlockSize(t, 0)
+}
+
+// A restart resumes above the previous process's whole block, not above the
+// versions it happened to use: the unused tail is burned, and gaps are free.
+func TestVersionsResumeAboveThePreviousProcess(t *testing.T) {
+	withBlockSize(t, 64)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "b.db")
+
+	first, err := Open(path)
+	require.NoError(t, err)
+	obj := newRefObject(t, first)
+	_, err = first.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
+	require.NoError(t, err)
+	reserved := seqValue(t, first)
+	require.NoError(t, first.Close())
+
+	second, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, second.Close()) })
+	_, err = second.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":2}`), 0)
+	require.NoError(t, err)
+	after, err := second.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Greater(t, after.ResourceVersion, reserved,
+		"a resumed process must start above the whole block, not above what it used")
+}
+
+// The refill runs after the commit, so its failure cannot be reported. The write
+// stands, and the next draw raises the error where a caller can act on it.
+func TestAFailedRefillLeavesTheWriteAlone(t *testing.T) {
+	withBlockSize(t, 1)
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
+	require.NoError(t, err)
+
+	_, err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
+	require.NoError(t, err, "the block still covered this write; the failed refill is not its problem")
+
+	_, err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":2}`), 0)
+	require.Error(t, err, "with the block spent the fallback must surface it")
+}
+
+// published is what the cursor sites read, so it must never cover a version an
+// open transaction has drawn but not committed.
+func TestAnOpenTransactionPublishesNothing(t *testing.T) {
+	withBlockSize(t, 64)
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	var inside int64
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		if _, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0); err != nil {
+			return err
+		}
+		var err error
+		inside, err = store.GetLatestResourceVersion(context.Background())
+		return err
+	}))
+
+	written, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Less(t, inside, written.ResourceVersion, "an uncommitted version must stay unpublished")
+
+	after, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, after, written.ResourceVersion, "...and be published once it commits")
+}
+
+// A rolled-back transaction burns its versions rather than publishing them.
+func TestARollbackPublishesNothing(t *testing.T) {
+	withBlockSize(t, 64)
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	before, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+
+	boom := errors.New("boom")
+	err = store.Within(ctx, func(ctx context.Context) error {
+		if _, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0); err != nil {
+			return err
+		}
+		return boom
+	})
+	require.ErrorIs(t, err, boom)
+
+	after, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+}
+
+// Every draw goes through the allocator, so the counter statement has one site.
+// A second one would draw behind the block and hand out a version twice.
+func TestTheCounterIsWrittenInOnePlace(t *testing.T) {
+	writesSeq := regexp.MustCompile(`(?is)UPDATE\s+resource_version_seq`)
+
+	var sites []string
+	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		var fn string
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				fn = node.Name.Name
+			case *ast.BasicLit:
+				if node.Kind == token.STRING && writesSeq.MatchString(node.Value) {
+					sites = append(sites, fn)
+				}
+			}
+			return true
+		})
+		return nil
+	}))
+	assert.Equal(t, []string{"drawResourceVersions"}, sites)
 }
