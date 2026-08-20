@@ -144,3 +144,31 @@ func TestReconcileCursorStaysAtWhatWasHandedOut(t *testing.T) {
 	require.NoError(t, err)
 	assert.Greater(t, after.ResourceVersion, load.Cursor)
 }
+
+// markForDeletion used to assign its version in SQL, from the counter row. With a
+// block reserved that row is the block's end, so the mark took a version outside
+// the block and a later write handed the same one out again.
+func TestDeletionMarkTakesItsVersionFromTheBlock(t *testing.T) {
+	withBlockSize(t, 64)
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	res, err := store.DeletionRequests().Create(ctx, testGK, obj.ID)
+	require.NoError(t, err)
+	require.True(t, res.Marked)
+
+	marked, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	latest, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, latest, marked.ResourceVersion,
+		"the mark must take the version the allocator handed out")
+
+	entries, _, err := store.ObjectWrites().ListSinceAll(ctx, marked.ResourceVersion-1, 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, marked.ResourceVersion, entries[0].ResourceVersion,
+		"the row and its write log entry must carry one version")
+}
+

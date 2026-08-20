@@ -2373,36 +2373,32 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 // the IS NULL. It reports only whether it stamped; requestDeletion's probe
 // disambiguates a zero-row result (guard, scope or missing).
 //
-// The version is drawn lazily — calling nextResourceVersion first would make
-// every repeat delete commit a counter write to stamp nothing. The inline
-// `value + 1` matches the later draw exactly: same transaction, one connection.
-// The subquery tolerates a multi-row match only because every where here keys on
-// a unique column.
+// The version is drawn before the stamp, so a mark blocked by the guard burns one.
+// Gaps are free — every cursor compares `>` — and reading the value back out of
+// the counter row is not: with a block reserved that row holds the reservation's
+// end rather than what was handed out.
 func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (storeapi.ObjectID, bool, error) {
 	c := s.conn(ctx)
+	rv, err := s.nextResourceVersion(ctx, c)
+	if err != nil {
+		return 0, false, err
+	}
 	now := toMillis(time.Now().UTC())
-	args := append([]any{now, now}, whereArgs...)
+	args := append([]any{now, rv, now}, whereArgs...)
 	// RETURNING, not RowsAffected: the write log entry needs the row's identity,
 	// and the where here is a predicate rather than a known id.
 	row := c.QueryRowContext(ctx, `
 		UPDATE objects
 		SET deletion_requested_at = ?,
-		    resource_version = (SELECT value + 1 FROM resource_version_seq WHERE id = 1),
+		    resource_version = ?,
 		    updated_at = ?
 		WHERE (`+where+`) AND deletion_requested_at IS NULL
-		RETURNING id, "group", kind, resource_version`, args...)
+		RETURNING id, "group", kind`, args...)
 	var id storeapi.ObjectID
 	var gk storeapi.GroupKind
-	var rv int64
-	err := row.Scan(&id, &gk.Group, &gk.Kind, &rv)
-	if errors.Is(err, sql.ErrNoRows) {
+	if err := row.Scan(&id, &gk.Group, &gk.Kind); errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	// Commit the value the row above just took; same transaction, same connection.
-	if _, err := s.nextResourceVersion(ctx, c); err != nil {
+	} else if err != nil {
 		return 0, false, err
 	}
 	// The soft delete is an update: the row is still live and readable.
