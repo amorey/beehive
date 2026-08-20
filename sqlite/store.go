@@ -617,6 +617,13 @@ func (st *txState) highestDraw() int64 {
 // reader pool's query_only pragma, not by the flag, so under OpenMemory, where
 // readDB is the writer, it succeeds instead.
 func (s *sqliteStore) withinRead(ctx context.Context, fn func(ctx context.Context) error) error {
+	// A nested call joins by running on the same ctx, not by taking a savepoint:
+	// a savepoint is a rollback boundary and a read has nothing to roll back.
+	// Nested in a Within it is therefore a write transaction, which is correct —
+	// that one holds the lock, and its uncommitted writes must be visible.
+	if st := liveTx(ctx); st != nil {
+		return fn(ctx)
+	}
 	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err

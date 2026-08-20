@@ -8940,3 +8940,27 @@ func TestAReadTransactionSeesOneSnapshot(t *testing.T) {
 	assert.Greater(t, after.ResourceVersion, second.ResourceVersion,
 		"...and the write must be visible once the transaction ends")
 }
+
+// A withinRead nested in a Within joins it rather than opening a second
+// transaction, so it sees the writes the outer one has not committed yet.
+func TestAReadTransactionJoinsAWriteTransaction(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	obj := newKindObject(t, store, testGK)
+
+	var seen *storeapi.RawObject
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		if _, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0); err != nil {
+			return err
+		}
+		return store.withinRead(ctx, func(ctx context.Context) error {
+			var err error
+			seen, err = store.Objects().Get(ctx, obj.ID)
+			return err
+		})
+	}))
+
+	require.NotNil(t, seen)
+	assert.JSONEq(t, `{"n":1}`, string(seen.Status),
+		"a read inside the write transaction must see its uncommitted write")
+}
