@@ -250,9 +250,12 @@ func benchSpecWrite(b *testing.B, specKB, conds int, mode string) {
 // which is what the read pool exists for: the drivers scan on a cadence forever
 // and every one of those reads used to sit in the writers' queue.
 //
-// BenchmarkWritesUnderWatch does not move on this change, and cannot: a watch
-// tailer reads through ObjectWrites().ListSince, which self-wraps in Within and
-// so still takes the writer. That is the grouped-read spec's to fix.
+// It is not the whole picture. BenchmarkWritesUnderWatch gets 11-15% WORSE on
+// the light-watch rows: a tailer's quiet tick moved to the reader, so its loop
+// is no longer paced by queueing behind writers and it issues more
+// ObjectWrites().ListSince calls — each of which self-wraps in Within and still
+// takes the writer. Moving those five grouped reads off Within is what turns
+// that around, and it belongs to the read-transaction spec.
 //
 // On disk, since OpenMemory has no read pool.
 func BenchmarkReadUnderWrites(b *testing.B) {

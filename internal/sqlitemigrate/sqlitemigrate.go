@@ -70,10 +70,10 @@ func OpenPool(path string, maxConns int) *sql.DB {
 //
 // No migrations run here: Apply targets the writer, before this pool opens.
 func OpenReadPool(path string, maxConns int) *sql.DB {
+	// No journal_mode or foreign_keys: the writer owns the journal, and foreign
+	// keys are enforced on write.
 	dsn := "file:" + path +
-		"?_pragma=journal_mode(WAL)" +
-		"&_pragma=busy_timeout(5000)" +
-		"&_pragma=foreign_keys(on)" +
+		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=query_only(true)"
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", dsn)
