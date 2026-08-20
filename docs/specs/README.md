@@ -27,8 +27,11 @@ been measured came back below its estimate, so price the rest before building
 them.
 
 1. [Cache prepared statements](2026-08-20-cache-prepared-statements.md) — ~2–6 µs
-   off every statement, so the widest of these. Unblocked: the read transaction
-   shipped unexported, which is what lets a statement inside one be cached.
+   off every statement, so the widest of these. The table serves the **read pool
+   only**: −63% on a bare read, the writer untouched. That is what settles the
+   question the spec used to turn on — the shared-cursor hazard lives inside a
+   transaction on the writer, and the pool rules it out on the reader. One
+   benchmark is owed before implementation; the spec says which.
 2. [Conclude a pass in one transaction](2026-08-20-conclude-a-pass-in-one-transaction.md)
    — proposed; ~20 µs a pass, and it changes three failure arguments. Unmeasured.
 
