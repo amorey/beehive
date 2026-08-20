@@ -100,6 +100,9 @@ type sqliteStore struct {
 	// the database cannot be opened twice (see OpenMemory).
 	readDB *sql.DB
 
+	// versions hands out resource versions from a reserved block.
+	versions versions
+
 	// txCount counts transactions begun; a nested Within (savepoint) does not add.
 	// Test-only, to assert a fast path answered without BEGIN IMMEDIATE.
 	txCount atomic.Int64
@@ -576,6 +579,10 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	for _, hook := range hooks {
 		hook.fn()
 	}
+	// Publish before refilling, or published names a version out of the new block
+	// that no write has taken. Both need the commit above and the connection back.
+	s.versions.publish()
+	s.refillVersions(ctx)
 	return nil
 }
 
@@ -615,20 +622,50 @@ const (
 )
 
 // nextResourceVersion advances and returns the global write cursor.
-func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
-	return advanceResourceVersion(ctx, c, 1)
+func (s *sqliteStore) nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
+	return s.advanceResourceVersion(ctx, c, 1)
 }
 
 // advanceResourceVersion advances the cursor by n and returns the highest value
-// drawn, so the range taken is [value-n+1, value]. n must be positive. A
-// standalone counter, not MAX(objects.resource_version): deleting the
+// drawn, so the range taken is [value-n+1, value]. n must be positive. Served
+// from the reserved block where it fits, and from the table otherwise.
+func (s *sqliteStore) advanceResourceVersion(ctx context.Context, c dbtx, n int) (int64, error) {
+	if hi, ok := s.versions.take(n); ok {
+		return hi, nil
+	}
+	hi, err := drawResourceVersions(ctx, c, n)
+	if err != nil {
+		return 0, err
+	}
+	s.versions.record(hi)
+	return hi, nil
+}
+
+// drawResourceVersions advances the counter by n and returns the highest value
+// drawn. A standalone counter, not MAX(objects.resource_version): deleting the
 // highest-versioned row must never regress the cursor and hand out a reused
 // version.
-func advanceResourceVersion(ctx context.Context, c dbtx, n int) (int64, error) {
+func drawResourceVersions(ctx context.Context, c dbtx, n int) (int64, error) {
 	var rv int64
 	err := c.QueryRowContext(ctx,
 		`UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value`, n).Scan(&rv)
 	return rv, err
+}
+
+// refillVersions reserves the next block. It must run where no transaction is
+// open: a reservation that rolls back leaves the allocator handing out versions
+// the counter no longer covers.
+func (s *sqliteStore) refillVersions(ctx context.Context) {
+	if blockSize <= 0 || !s.versions.spent() {
+		return
+	}
+	hi, err := drawResourceVersions(ctx, s.db, blockSize)
+	if err != nil {
+		// Swallowed: the commit already landed, so this cannot be reported. The
+		// block stays spent and the next draw raises it where a caller can act.
+		return
+	}
+	s.versions.reserve(hi, blockSize)
 }
 
 // scanWritten scans a mutator's RETURNING row and attaches its conditions,
@@ -668,7 +705,7 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	}
 	finalizers := marshalFinalizers(in.Finalizers)
 	c := s.conn(ctx)
-	rv, err := nextResourceVersion(ctx, c)
+	rv, err := s.nextResourceVersion(ctx, c)
 	if err != nil {
 		return nil, err
 	}
@@ -711,7 +748,7 @@ func (s *sqliteStore) recordObjectWrite(
 	id storeapi.ObjectID,
 	op int,
 ) (rv, now int64, err error) {
-	if rv, err = nextResourceVersion(ctx, c); err != nil {
+	if rv, err = s.nextResourceVersion(ctx, c); err != nil {
 		return 0, 0, err
 	}
 	now = toMillis(time.Now().UTC())
@@ -1977,7 +2014,7 @@ func (s sqliteEvents) Add(ctx context.Context, gk storeapi.GroupKind, id storeap
 		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
-		rv, err := nextResourceVersion(ctx, c)
+		rv, err := s.nextResourceVersion(ctx, c)
 		if err != nil {
 			return err
 		}
@@ -2364,7 +2401,7 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 		return 0, false, err
 	}
 	// Commit the value the row above just took; same transaction, same connection.
-	if _, err := nextResourceVersion(ctx, c); err != nil {
+	if _, err := s.nextResourceVersion(ctx, c); err != nil {
 		return 0, false, err
 	}
 	// The soft delete is an update: the row is still live and readable.
@@ -2392,7 +2429,7 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 	}
 	c := s.conn(ctx)
 	now := toMillis(time.Now().UTC())
-	end, err := advanceResourceVersion(ctx, c, len(ids))
+	end, err := s.advanceResourceVersion(ctx, c, len(ids))
 	if err != nil {
 		return nil, err
 	}
@@ -2650,7 +2687,7 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {
 		return err
 	}
-	rv, err := nextResourceVersion(ctx, c)
+	rv, err := s.nextResourceVersion(ctx, c)
 	if err != nil {
 		return err
 	}

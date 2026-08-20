@@ -18,7 +18,7 @@ import "sync"
 
 // blockSize is how many resource versions one reservation covers. A var so tests
 // can shrink it; 0 or less turns blocks off and sends every draw to the table.
-var blockSize = 256
+var blockSize = 0
 
 // versions hands out resource versions from a block reserved by a committed
 // write. Versions must be unique and increasing; they are not required to be

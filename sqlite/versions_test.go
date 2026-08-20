@@ -15,9 +15,12 @@
 package sqlite
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // A block covers takes that fit and refuses the one that does not, and a refused
@@ -64,4 +67,35 @@ func TestVersionBlockCoversWhatFits(t *testing.T) {
 		v.publish()
 		assert.Equal(t, int64(2), v.latest())
 	})
+}
+
+// withBlockSize sets the reservation size for one test.
+func withBlockSize(t *testing.T, n int) {
+	t.Helper()
+	prev := blockSize
+	blockSize = n
+	t.Cleanup(func() { blockSize = prev })
+}
+
+// Writes keep taking increasing versions across a block boundary, and the counter
+// page is written once a block rather than once a write — which is the whole point.
+func TestWritesDrawFromTheBlock(t *testing.T) {
+	withBlockSize(t, 4)
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	before := seqValue(t, store)
+	var last int64
+	for i := range 10 {
+		_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, fmt.Appendf(nil, `{"n":%d}`, i), 0)
+		require.NoError(t, err)
+		got, err := store.Objects().Get(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Greater(t, got.ResourceVersion, last, "versions must increase across a block boundary")
+		last = got.ResourceVersion
+	}
+
+	drawn := seqValue(t, store) - before
+	assert.Less(t, drawn, int64(10), "ten writes must not write the counter ten times")
 }

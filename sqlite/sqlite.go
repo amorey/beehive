@@ -99,12 +99,26 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	return &sqliteStore{
+	s := &sqliteStore{
 		db: db,
 		// Aliased until a caller opens a read pool, so read never branches.
 		readDB: db,
 		// Truncated to ms to match condition timestamps: a sub-ms processStart would
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
-	}, nil
+	}
+	// Seed the allocator above every version the previous process used, then
+	// reserve. Both belong here: open holds no transaction, so the reservation
+	// cannot be rolled back.
+	ctx := context.Background()
+	var seeded int64
+	if err := db.QueryRowContext(ctx,
+		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&seeded); err != nil {
+		db.Close()
+		return nil, err
+	}
+	s.versions.record(seeded)
+	s.versions.publish()
+	s.refillVersions(ctx)
+	return s, nil
 }
