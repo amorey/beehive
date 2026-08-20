@@ -2142,11 +2142,25 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
 }
 
-// seqValue reads the counter row directly. Tests use it to tell "this write
-// consumed a version" from "the row's version did not move", which the object row
-// alone cannot distinguish: a drawn-but-unused value leaves no trace on it. It
-// tracks draws one for one only under withoutVersionBlocks — otherwise the row
-// holds the reservation's end.
+// handedOut is the highest version the allocator has issued. Tests use it to tell
+// "this write consumed a version" from "the row's version did not move", which the
+// object row alone cannot distinguish: a drawn-but-unused value leaves no trace on
+// it. The counter row cannot answer it — that holds the reservation's end.
+func handedOut(store *sqliteStore) int64 {
+	store.versions.mu.Lock()
+	defer store.versions.mu.Unlock()
+	return store.versions.next - 1
+}
+
+// withoutVersionBlocks sends every draw to the counter row, which is the only way
+// to reach the fallback's error branch. Call it before the store is built: open
+// reserves a block.
+func withoutVersionBlocks(t *testing.T) {
+	t.Helper()
+	withBlockSize(t, 0)
+}
+
+// seqValue reads the counter row: the reservation's end, not what was handed out.
 func seqValue(t *testing.T, store *sqliteStore) int64 {
 	t.Helper()
 	var v int64
@@ -2162,19 +2176,18 @@ func seqValue(t *testing.T, store *sqliteStore) int64 {
 // A mark that reaches the stamp and is then blocked by the IS NULL guard does burn
 // one; gaps are free.
 func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
-	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	res, err := store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.True(t, res.Marked)
 
 	marked, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
-	after := seqValue(t, store)
+	after := handedOut(store)
 	assert.Equal(t, before+1, after, "a stamped mark consumes exactly one version")
 	assert.Equal(t, after, marked.ResourceVersion,
 		"the row carries the value the counter committed, not one beside it")
@@ -2183,12 +2196,12 @@ func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 	res, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.False(t, res.Marked)
-	assert.Equal(t, after, seqValue(t, store), "the probe answers before the draw")
+	assert.Equal(t, after, handedOut(store), "the probe answers before the draw")
 
 	// Same for a mark that matches no row at all, via the other keying.
 	_, err = store.DeletionRequests().CreateByName(ctx, testGK, "no-such-name")
 	require.ErrorIs(t, err, beehive.ErrNotFound)
-	assert.Equal(t, after, seqValue(t, store), "a mark that matches nothing draws none either")
+	assert.Equal(t, after, handedOut(store), "a mark that matches nothing draws none either")
 }
 
 // ObjectsGetMeta returns the same row as ObjectsGet but skips assembling
@@ -6299,7 +6312,6 @@ func TestDeletionRequestsCreateFromOwnerWritesInVersionOrder(t *testing.T) {
 // the range must be exactly as wide as the level — a draw of N that stamps N rows
 // leaves no gap for the waker to warn about.
 func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
-	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -6312,13 +6324,13 @@ func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
 		children = append(children, child)
 	}
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 	got, err := store.DeletionRequests().CreateFromOwner(ctx, owner)
 	require.NoError(t, err)
 	require.Len(t, got.Children, len(children))
 
-	assert.Equal(t, before+int64(len(children)), seqValue(t, store),
+	assert.Equal(t, before+int64(len(children)), handedOut(store),
 		"one draw of N, not N draws and not one value shared")
 
 	// The version on each child's row, and the version its log entry claims.
@@ -6339,7 +6351,6 @@ func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
 // A level wider than one chunk still numbers straight through: the draw is for
 // the whole level, so a chunk boundary must not restart or overlap the range.
 func TestCascadeNumbersChildrenAcrossMarkChunks(t *testing.T) {
-	withoutVersionBlocks(t)
 	defer func(n int) { markChunkSize = n }(markChunkSize)
 	markChunkSize = 2 // 5 children -> 3 chunks (2, 2, 1)
 
@@ -6352,7 +6363,7 @@ func TestCascadeNumbersChildrenAcrossMarkChunks(t *testing.T) {
 		require.NoError(t, addEdge(ctx, store, mk(), owner, beehive.RelationOwnedBy))
 	}
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 	got, err := store.DeletionRequests().CreateFromOwner(ctx, owner)
 	require.NoError(t, err)
@@ -6375,7 +6386,6 @@ func TestCascadeNumbersChildrenAcrossMarkChunks(t *testing.T) {
 // reach the log. Driven through the unexported call because the cascade filters
 // pending children out before it, so the guard is unreachable from above.
 func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
-	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -6383,7 +6393,7 @@ func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
 	_, err := store.DeletionRequests().Create(ctx, testGK, pending)
 	require.NoError(t, err)
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 
 	var marked map[storeapi.ObjectID]bool
@@ -6394,7 +6404,7 @@ func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
 
 	assert.False(t, marked[pending], "the IS NULL guard, not the caller's read, decides")
 	assert.True(t, marked[live])
-	assert.Equal(t, before+2, seqValue(t, store), "both candidates drew; only one stamped")
+	assert.Equal(t, before+2, handedOut(store), "both candidates drew; only one stamped")
 
 	w := probe.expectWrite()
 	assert.Equal(t, live, w.ID)
@@ -6407,7 +6417,6 @@ func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
 // rows, which is not valid SQL. The draw still happened, so the whole range is a
 // gap.
 func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
-	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -6419,7 +6428,7 @@ func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
 		pending = append(pending, id)
 	}
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 
 	var marked map[storeapi.ObjectID]bool
@@ -6430,7 +6439,7 @@ func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
 	}))
 
 	assert.Empty(t, marked, "the guard rejected every candidate")
-	assert.Equal(t, before+2, seqValue(t, store), "the range was drawn before the guard ran")
+	assert.Equal(t, before+2, handedOut(store), "the range was drawn before the guard ran")
 	assert.Empty(t, probe.writes(), "nothing stamped, nothing logged")
 }
 
@@ -6439,12 +6448,12 @@ func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
 func TestMarkManyForDeletionDrawsNothingForNoCandidates(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	before := seqValue(t, store)
+	before := handedOut(store)
 
 	marked, err := store.markManyForDeletion(ctx, nil)
 	require.NoError(t, err)
 	assert.Empty(t, marked)
-	assert.Equal(t, before, seqValue(t, store))
+	assert.Equal(t, before, handedOut(store))
 }
 
 // The cascade's own listing failure. Reached directly because the exported wrapper
@@ -7892,15 +7901,14 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 // carries it — the write log's delete entry does, and it needs a version to
 // order against every other entry.
 func TestObjectsDeleteDrawsAResourceVersion(t *testing.T) {
-	withoutVersionBlocks(t)
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	before := seqValue(t, store.(*sqliteStore))
+	before := handedOut(store.(*sqliteStore))
 
 	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
-	assert.Greater(t, seqValue(t, store.(*sqliteStore)), before)
+	assert.Greater(t, handedOut(store.(*sqliteStore)), before)
 }
 
 // The delete entry carries the object as it was, conditions included. Nothing
@@ -8652,8 +8660,33 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 	status := regexp.MustCompile(`\bstatus\b`)
 	writesObjects := regexp.MustCompile(`(?is)(INSERT\s+INTO\s+objects|UPDATE\s+objects)`)
 
+	sites := sqlSites(t, func(sql string) bool {
+		return writesObjects.MatchString(sql) && status.MatchString(sql)
+	})
+	assert.ElementsMatch(t, []string{"objectsCreate", "UpdateStatus"}, sites,
+		"objects.status is written by the create (as NULL) and UpdateStatus, and nowhere else")
+}
+
+// sqlSites names every function in this package holding a string literal that
+// match accepts. Blind to a statement built by concatenation and to SQL outside
+// this package.
+func sqlSites(t *testing.T, match func(sql string) bool) []string {
+	t.Helper()
 	var sites []string
-	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+	require.NoError(t, inspectPackage(t, func(fn string, n ast.Node) {
+		lit, ok := n.(*ast.BasicLit)
+		if ok && lit.Kind == token.STRING && match(lit.Value) {
+			sites = append(sites, fn)
+		}
+	}))
+	return sites
+}
+
+// inspectPackage walks this package's non-test files, calling visit with the name
+// of the enclosing function for every node.
+func inspectPackage(t *testing.T, visit func(fn string, n ast.Node)) error {
+	t.Helper()
+	return filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -8666,25 +8699,14 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 		}
 		var fn string
 		ast.Inspect(file, func(n ast.Node) bool {
-			switch node := n.(type) {
-			case *ast.FuncDecl:
-				fn = node.Name.Name
-			case *ast.BasicLit:
-				if node.Kind != token.STRING {
-					return true
-				}
-				sql := node.Value
-				if writesObjects.MatchString(sql) && status.MatchString(sql) {
-					sites = append(sites, fn)
-				}
+			if decl, ok := n.(*ast.FuncDecl); ok {
+				fn = decl.Name.Name
 			}
+			visit(fn, n)
 			return true
 		})
 		return nil
-	}))
-
-	assert.ElementsMatch(t, []string{"objectsCreate", "UpdateStatus"}, sites,
-		"objects.status is written by the create (as NULL) and UpdateStatus, and nowhere else")
+	})
 }
 
 // The changed report is what the layer above gates its wake on, so it tracks the

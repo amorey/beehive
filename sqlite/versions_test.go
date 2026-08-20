@@ -19,12 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/parser"
-	"go/token"
-	"io/fs"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -179,14 +175,6 @@ func TestDeletionMarkTakesItsVersionFromTheBlock(t *testing.T) {
 		"the row and its write log entry must carry one version")
 }
 
-// withoutVersionBlocks sends every draw to the counter row, which is what the
-// draw-failure and draw-accounting tests observe. Call it before the store is
-// built: open reserves a block.
-func withoutVersionBlocks(t *testing.T) {
-	t.Helper()
-	withBlockSize(t, 0)
-}
-
 // A restart resumes above the previous process's whole block, not above the
 // versions it happened to use: the unused tail is burned, and gaps are free.
 func TestVersionsResumeAboveThePreviousProcess(t *testing.T) {
@@ -286,34 +274,37 @@ func TestARollbackPublishesNothing(t *testing.T) {
 // A second one would draw behind the block and hand out a version twice.
 func TestTheCounterIsWrittenInOnePlace(t *testing.T) {
 	writesSeq := regexp.MustCompile(`(?is)UPDATE\s+resource_version_seq`)
-
-	var sites []string
-	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-		if err != nil {
-			return err
-		}
-		var fn string
-		ast.Inspect(file, func(n ast.Node) bool {
-			switch node := n.(type) {
-			case *ast.FuncDecl:
-				fn = node.Name.Name
-			case *ast.BasicLit:
-				if node.Kind == token.STRING && writesSeq.MatchString(node.Value) {
-					sites = append(sites, fn)
-				}
-			}
-			return true
-		})
-		return nil
-	}))
+	sites := sqlSites(t, writesSeq.MatchString)
 	assert.Equal(t, []string{"drawResourceVersions"}, sites)
+}
+
+// published is only a lower bound on committed versions because draws are ordered
+// by the writer connection: every draw site runs inside a Within, so two of them
+// cannot interleave. A draw added outside one would autocommit, never publish, and
+// freeze the cursor below live writes — silently. "No site draws outside a
+// transaction" is a claim over an open set, so this asserts the structure instead.
+func TestEveryDrawSiteIsInsideATransaction(t *testing.T) {
+	var sites []string
+	require.NoError(t, inspectPackage(t, func(fn string, n ast.Node) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && (sel.Sel.Name == "nextResourceVersion" || sel.Sel.Name == "advanceResourceVersion") {
+			sites = append(sites, fn)
+		}
+	}))
+
+	assert.ElementsMatch(t, []string{
+		"nextResourceVersion", // the one-version wrapper over advanceResourceVersion
+		"objectsCreate",
+		"recordObjectWrite",
+		"Add", // Events().Add
+		"markForDeletion",
+		"markManyForDeletion",
+		"objectsDelete",
+	}, sites, "a new draw site must run inside Within, or published stops bounding it")
 }
 
 // The seed read runs after the migrations, so a database whose migrations are
