@@ -172,3 +172,10 @@ func TestDeletionMarkTakesItsVersionFromTheBlock(t *testing.T) {
 		"the row and its write log entry must carry one version")
 }
 
+// withoutVersionBlocks sends every draw to the counter row, which is what the
+// draw-failure and draw-accounting tests observe. Call it before the store is
+// built: open reserves a block.
+func withoutVersionBlocks(t *testing.T) {
+	t.Helper()
+	withBlockSize(t, 0)
+}

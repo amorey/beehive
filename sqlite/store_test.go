@@ -717,6 +717,7 @@ func breakEventRowRead(t *testing.T, store *sqliteStore) {
 
 // EventsAdd surfaces store faults from each of its steps.
 func TestAddEventStoreErrors(t *testing.T) {
+	withoutVersionBlocks(t)
 	ctx := context.Background()
 	ev := storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}
 
@@ -2141,9 +2142,11 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
 }
 
-// seqValue reads the global write cursor's counter directly. Tests use it to tell
-// "this write consumed a version" from "the row's version did not move", which the
-// object row alone cannot distinguish: a drawn-but-unused value leaves no trace on it.
+// seqValue reads the counter row directly. Tests use it to tell "this write
+// consumed a version" from "the row's version did not move", which the object row
+// alone cannot distinguish: a drawn-but-unused value leaves no trace on it. It
+// tracks draws one for one only under withoutVersionBlocks — otherwise the row
+// holds the reservation's end.
 func seqValue(t *testing.T, store *sqliteStore) int64 {
 	t.Helper()
 	var v int64
@@ -2152,12 +2155,14 @@ func seqValue(t *testing.T, store *sqliteStore) int64 {
 	return v
 }
 
-// A mark stamps the row with exactly the version it then commits to the counter, and
-// a mark blocked by the IS NULL guard draws nothing at all. The second half is the
-// point: the version is drawn lazily, so the already-pending path — the steady state
-// for a controller that idempotently deletes a child — writes no counter page and
-// leaves no gap in the cursor.
+// A mark stamps the row with the version it drew, and a mark that never reaches the
+// stamp draws nothing. The second half is the point: the probe answers an
+// already-pending row — the steady state for a controller that idempotently deletes
+// a child — before markForDeletion draws, so that path leaves no gap in the cursor.
+// A mark that reaches the stamp and is then blocked by the IS NULL guard does burn
+// one; gaps are free.
 func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -2178,7 +2183,7 @@ func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 	res, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.False(t, res.Marked)
-	assert.Equal(t, after, seqValue(t, store), "a guard-blocked mark draws no version")
+	assert.Equal(t, after, seqValue(t, store), "the probe answers before the draw")
 
 	// Same for a mark that matches no row at all, via the other keying.
 	_, err = store.DeletionRequests().CreateByName(ctx, testGK, "no-such-name")
@@ -4164,6 +4169,7 @@ func TestDeleteFinalizerRefusesAnUndecodableList(t *testing.T) {
 // must roll the whole thing back rather than leaving a row stamped with a version the
 // cursor never committed.
 func TestDeletionRequestsCreateVersionDrawError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5650,6 +5656,7 @@ func TestConditionAssemblyError(t *testing.T) {
 // bump: when the bump fails, the condition change is rolled back rather than
 // left applied without a version bump or watch event.
 func TestConditionResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "rv-error")
@@ -5754,6 +5761,7 @@ func TestConditionsByIDsQueryError(t *testing.T) {
 // branch: the scoped read succeeds and the spec differs, then the version bump
 // fails because the sequence table is gone.
 func TestObjectsUpdateSpecResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5766,6 +5774,7 @@ func TestObjectsUpdateSpecResourceVersionError(t *testing.T) {
 // TestUpdateStatusResourceVersionError covers UpdateStatus's nextResourceVersion
 // branch (its first statement inside Within).
 func TestUpdateStatusResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5876,6 +5885,7 @@ func TestDeleteConditionDeleteExecError(t *testing.T) {
 // nextResourceVersion branch: a present finalizer is removed (a real change),
 // then the version bump fails.
 func TestDeleteFinalizerResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
@@ -5894,6 +5904,7 @@ func TestDeleteFinalizerResourceVersionError(t *testing.T) {
 // nextResourceVersion branch, reached via DeletionRequestsCreate on a live object whose
 // version bump fails.
 func TestDeletionRequestsCreateResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5916,6 +5927,7 @@ func TestDeletionRequestsCreateFromOwnerQueryError(t *testing.T) {
 // swallowed, and each leaves the level unstamped: a swallowed append in
 // particular is what would make a write invisible to every watch.
 func TestDeletionRequestsCreateFromOwnerMarkErrors(t *testing.T) {
+	withoutVersionBlocks(t)
 	for _, tc := range []struct {
 		name  string
 		block func(*testing.T, *sqliteStore)
@@ -6242,6 +6254,7 @@ func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
 // would have stamped is gone, so there is nothing left for a scan of the write
 // log to report — removals are derived from a row's absence, not from a version.
 func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
+	withoutVersionBlocks(t)
 	ctx := context.Background()
 	store := newRawStore(t)
 	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
@@ -6286,6 +6299,7 @@ func TestDeletionRequestsCreateFromOwnerWritesInVersionOrder(t *testing.T) {
 // the range must be exactly as wide as the level — a draw of N that stamps N rows
 // leaves no gap for the waker to warn about.
 func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -6325,6 +6339,7 @@ func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
 // A level wider than one chunk still numbers straight through: the draw is for
 // the whole level, so a chunk boundary must not restart or overlap the range.
 func TestCascadeNumbersChildrenAcrossMarkChunks(t *testing.T) {
+	withoutVersionBlocks(t)
 	defer func(n int) { markChunkSize = n }(markChunkSize)
 	markChunkSize = 2 // 5 children -> 3 chunks (2, 2, 1)
 
@@ -6360,6 +6375,7 @@ func TestCascadeNumbersChildrenAcrossMarkChunks(t *testing.T) {
 // reach the log. Driven through the unexported call because the cascade filters
 // pending children out before it, so the guard is unreachable from above.
 func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -6391,6 +6407,7 @@ func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
 // rows, which is not valid SQL. The draw still happened, so the whole range is a
 // gap.
 func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 
@@ -7875,6 +7892,7 @@ func TestObjectWritesRecordEveryVersionBump(t *testing.T) {
 // carries it — the write log's delete entry does, and it needs a version to
 // order against every other entry.
 func TestObjectsDeleteDrawsAResourceVersion(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -8492,6 +8510,7 @@ func TestReadImagesSurfacesADBError(t *testing.T) {
 // Collection needs a version for its log entry, so a store that cannot draw one
 // fails the delete rather than removing the row unrecorded.
 func TestObjectsDeleteFailsWithoutAVersionToDraw(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
