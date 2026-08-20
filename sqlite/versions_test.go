@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"sync"
 	"testing"
+	"time"
 
 	storeapi "github.com/amorey/beehive/internal/storeapi"
 	"github.com/stretchr/testify/assert"
@@ -203,6 +204,54 @@ func TestTheCursorNeverCoversALiveTransaction(t *testing.T) {
 	require.NoError(t, err)
 	assert.Less(t, cursor, held.ResourceVersion,
 		"a cursor covering an uncommitted write stamps a watermark past it")
+}
+
+// A commit must not be held by whatever else is using the writer connection. An
+// AfterCommit hook may leave a sibling transaction open, and the refill needs the
+// one connection that transaction is holding; unbounded, the commit waits out its
+// whole life.
+func TestARefillDoesNotWaitOutASiblingTransaction(t *testing.T) {
+	withBlockSize(t, 1) // spent after every write, so every commit refills
+	prev := refillTimeout
+	refillTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { refillTimeout = prev })
+
+	ctx := context.Background()
+	store := newDiskStore(t)
+	first := newKindObject(t, store, testGK)
+	second := newKindObject(t, store, testGK)
+
+	holding, release, sibling := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	returned := make(chan error, 1)
+	go func() {
+		returned <- store.Within(ctx, func(ctx context.Context) error {
+			if _, err := store.Objects().UpdateStatus(ctx, testGK, first.ID, []byte(`{"n":1}`), 0); err != nil {
+				return err
+			}
+			store.AfterCommit(ctx, func(context.Context) {
+				go func() {
+					defer close(sibling)
+					assert.NoError(t, store.Within(context.Background(), func(ctx context.Context) error {
+						_, err := store.Objects().UpdateStatus(ctx, testGK, second.ID, []byte(`{"n":1}`), 0)
+						close(holding)
+						<-release
+						return err
+					}))
+				}()
+				<-holding
+			})
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-returned:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the commit is waiting on a connection the sibling transaction holds")
+	}
+	close(release)
+	<-sibling
 }
 
 // withBlockSize sets the reservation size for one test.

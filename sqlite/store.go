@@ -678,6 +678,11 @@ func drawResourceVersions(ctx context.Context, c dbtx, n int) (int64, error) {
 	return rv, err
 }
 
+// refillVersions waits no longer than this for the writer connection. Matches the
+// DSN's busy_timeout, which bounds the lock wait but not the pool wait. Expiring
+// costs one fallback draw. A var so tests can shrink it.
+var refillTimeout = 5 * time.Second
+
 // refillVersions reserves the next block. It must run where no transaction is
 // open: a reservation that rolls back leaves the allocator handing out versions
 // the counter no longer covers.
@@ -688,9 +693,13 @@ func (s *sqliteStore) refillVersions(ctx context.Context) {
 	if blockSize <= 0 || !s.versions.spent() {
 		return
 	}
-	// Detached from the caller's deadline: a cancelled refill leaves the block
-	// spent, putting every later write back on the fallback draw.
-	hi, err := drawResourceVersions(context.WithoutCancel(ctx), s.db, blockSize)
+	// Detached from the caller's deadline, since a cancelled refill leaves the block
+	// spent and puts every later write back on the fallback draw — but bounded, or a
+	// hook that left a sibling transaction open holds this commit for that
+	// transaction's whole life waiting on the one writer connection.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refillTimeout)
+	defer cancel()
+	hi, err := drawResourceVersions(ctx, s.db, blockSize)
 	if err != nil {
 		// Swallowed: the commit already landed, so this cannot be reported. The
 		// block stays spent and the next draw raises it where a caller can act.
