@@ -307,21 +307,6 @@ func (st *txState) pushSavepoint(depth int, caller int64) (name int64, err error
 	return st.savepoints, nil
 }
 
-// frameUsable reports whether the ctx's frame may still be used, by the test
-// pushSavepoint admits a nested frame with — but without taking one. A read
-// joining an ambient transaction takes no savepoint, so this is what stands in.
-func (st *txState) frameUsable(depth int, caller int64) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.poisoned != nil {
-		return st.poisoned
-	}
-	if st.sealed || depth != st.height || st.deadLocked(caller) {
-		return storeapi.ErrStaleTxContext
-	}
-	return nil
-}
-
 // sealForCommit closes the transaction to new frames and reports whether
 // committing is safe — both under the lock that admits frames, so nothing slips
 // between the check and the commit. A live frame here can only belong to another
@@ -669,14 +654,12 @@ func (st *txState) highestDraw() int64 {
 // reader pool's query_only pragma, not by the flag, so under OpenMemory, where
 // readDB is the writer, it succeeds instead.
 func (s *sqliteStore) withinRead(ctx context.Context, fn func(ctx context.Context) error) error {
-	// Joins an ambient transaction on its ctx: a read has nothing to roll back, so
-	// there is no savepoint to take. The frame is still checked — taking one is
-	// what used to reject a ctx captured from an unwound frame.
+	// Nested, a read joins on a savepoint like any other frame. Not for the
+	// rollback — a read has nothing to roll back — but because the frame is what
+	// records that this read is running: without it the outer transaction seals
+	// and commits from under a sibling goroutine's grouped read.
 	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
-		if err := fr.st.frameUsable(fr.depth, fr.id); err != nil {
-			return err
-		}
-		return fn(ctx)
+		return fr.st.nested(ctx, fr.depth, fr.id, fn)
 	}
 	// No settle: a read draws no version, and the refill would be a write on the
 	// connection this call exists to stay off.

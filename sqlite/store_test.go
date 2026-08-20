@@ -3449,14 +3449,6 @@ func TestTxStateSealForCommit(t *testing.T) {
 		assert.ErrorIs(t, st.sealForCommit(), assert.AnError)
 	})
 
-	t.Run("frameUsable surfaces poison too", func(t *testing.T) {
-		st := &txState{}
-		st.poison(assert.AnError)
-
-		assert.ErrorIs(t, st.frameUsable(0, 0), assert.AnError)
-		require.NoError(t, (&txState{}).frameUsable(0, 0), "a fresh frame is usable")
-	})
-
 	// Here rather than in runTx: outside this lock a sibling goroutine can draw
 	// between the check and the seal.
 	t.Run("refuses a read frame that drew", func(t *testing.T) {
@@ -9195,6 +9187,35 @@ func TestAReadTransactionSettlesNoVersions(t *testing.T) {
 
 // withinRead's two error paths: fn's own, and a frame a sibling goroutine left
 // open, which is refused for the same reason Within refuses it.
+// A grouped read running on a sibling goroutine holds its outer transaction open.
+// The savepoint is what records it: without one the outer seals and commits while
+// the read is between its statements, and the read's promised single snapshot is
+// gone along with the transaction.
+func TestAReadTransactionHoldsItsOuterOpen(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	_ = newKindObject(t, store, testGK)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	err := store.Within(ctx, func(outer context.Context) error {
+		go func() {
+			done <- store.withinRead(outer, func(context.Context) error {
+				close(entered)
+				<-release
+				return nil
+			})
+		}()
+		<-entered
+		return nil // returns while the sibling's read is still running
+	})
+	assert.ErrorIs(t, err, beehive.ErrConcurrentNestedTx,
+		"committing under a live grouped read must be refused")
+
+	close(release)
+	<-done // its own outcome is the outer's business, not this test's
+}
+
 // A ctx captured from a frame that has since unwound is refused, as it was when
 // these reads took a savepoint to join. An ungrouped read on the same ctx still
 // answers from the outer transaction — that asymmetry predates the read
