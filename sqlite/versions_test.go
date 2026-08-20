@@ -119,3 +119,28 @@ func TestLatestResourceVersionStaysAtWhatWasHandedOut(t *testing.T) {
 		"the cursor must be the last version a write took, not the block's end")
 	assert.Less(t, latest, seqValue(t, store), "...which is below the reservation")
 }
+
+// GetForReconcile's cursor becomes reconciled_against, and ListStaleSince selects
+// on target.resource_version > it. Above what was handed out, every target write
+// in the rest of the block sits under the watermark and the dependent never learns.
+func TestReconcileCursorStaysAtWhatWasHandedOut(t *testing.T) {
+	withBlockSize(t, 64)
+	ctx := context.Background()
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	_, err := store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":1}`), 0)
+	require.NoError(t, err)
+
+	load, err := store.Objects().GetForReconcile(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Equal(t, load.Object.ResourceVersion, load.Cursor,
+		"the cursor must not run ahead of the write it just read")
+
+	// A write after the load must land above the cursor, or the sweep skips it.
+	_, err = store.Objects().UpdateStatus(ctx, testGK, obj.ID, []byte(`{"n":2}`), 0)
+	require.NoError(t, err)
+	after, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Greater(t, after.ResourceVersion, load.Cursor)
+}

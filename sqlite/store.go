@@ -910,17 +910,19 @@ func (s sqliteObjects) Get(ctx context.Context, id storeapi.ObjectID) (*storeapi
 }
 
 // Objects().GetForReconcile is the reconcile loop's opening read (see the contract
-// on storeapi.Store). The cursor and the dependency flag are correlated
-// subqueries, riding the row read rather than adding round trips.
+// on storeapi.Store). The dependency flag is a correlated subquery, riding the row
+// read rather than adding a round trip.
+//
+// The cursor is read before the row, never after: a write committing in between
+// would be both unobserved by this load and at or below the watermark it stamps.
 func (s sqliteObjects) GetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
-	var load storeapi.ReconcileLoad
+	load := storeapi.ReconcileLoad{Cursor: s.versions.latest()}
 	row := s.read(ctx).QueryRowContext(ctx, `
 		SELECT `+objectColumns+`,
-		       (SELECT value FROM resource_version_seq WHERE id = 1),
 		       EXISTS (SELECT 1 FROM edges
 		                WHERE from_id = objects.id AND relation = 'depends_on')
 		  FROM objects WHERE id = ?`, id)
-	obj, err := scanObject(row, &load.Cursor, &load.HasDependencies)
+	obj, err := scanObject(row, &load.HasDependencies)
 	if err != nil {
 		return storeapi.ReconcileLoad{}, err
 	}
