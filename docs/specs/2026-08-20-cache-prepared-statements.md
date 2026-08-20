@@ -262,6 +262,12 @@ objects, seventeen columns by primary key (`BenchmarkResidencyToll`):
 statements, and sixteen times more adds almost nothing. Whatever the set grows
 to, the toll does not.
 
+**The magnitude is run-dependent; the shape is not.** A second run on a busier
+machine put the unprepared step at +6% rather than +25%, with the same
+saturation by fifteen. Compare within a run, never across. Two resident
+statements cost under 1%, so a partly migrated store pays almost nothing — it
+simply has not collected the win yet.
+
 **Preparing is not the escape, but it is most of one**: +0.3 µs (+4%) against
 +5.4 µs (+25%), fifteen times the cost unprepared. This is the "+7% residual a
 cached statement pays on a busy connection" an earlier draft carried, re-measured.
