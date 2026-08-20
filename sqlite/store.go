@@ -498,9 +498,9 @@ type dbtx interface {
 // stand in: inside a transaction read hands back that transaction, where a
 // write would commit on the writer and look correct.
 //
-// It is not airtight: a DELETE or UPDATE with RETURNING is issued through
-// QueryContext, which this interface keeps. What holds those on conn is
-// trimWriteLog, which takes the connection and passes it down. conn is where a
+// It is not airtight: a write with RETURNING is issued through QueryContext or
+// QueryRowContext, which this interface keeps, and several writes are — the
+// create, the spec write and both deletion marks among them. conn is where a
 // write is actually refused; this type only keeps the ordinary ones off the
 // reader at compile time.
 type roDBTX interface {
@@ -1602,6 +1602,12 @@ func (s *sqliteStore) updateSpec(
 	var result *storeapi.RawObject
 	var changed bool
 	err := s.Within(ctx, func(ctx context.Context) error {
+		// Before the converged return below: this reports a programming error, and
+		// a write that happens to be converged must not swallow it.
+		c, err := s.conn(ctx)
+		if err != nil {
+			return err
+		}
 		obj, err := resolve(ctx)
 		if err != nil {
 			return err
@@ -1628,10 +1634,6 @@ func (s *sqliteStore) updateSpec(
 			return err // changed stays false: nothing was written
 		}
 		gk := storeapi.GroupKind{Group: obj.Group, Kind: obj.Kind}
-		c, err := s.conn(ctx)
-		if err != nil {
-			return err
-		}
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, obj.ID, writeOpUpdate)
 		if err != nil {
 			return err
@@ -1729,6 +1731,11 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 	var changed bool
 	// Within keeps the read-compare-write atomic.
 	err := s.Within(ctx, func(ctx context.Context) error {
+		// Before the no-op compare below: see updateSpec.
+		c, err := s.conn(ctx)
+		if err != nil {
+			return err
+		}
 		// Scoped read enforces the kind boundary while doubling as the compare's
 		// load — two columns, not the row.
 		var (
@@ -1750,10 +1757,6 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		// in-memory skip a subset, or it starts dropping writes this would make.
 		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
 			return nil // no version bump, so no watch diff and no wake
-		}
-		c, err := s.conn(ctx)
-		if err != nil {
-			return err
 		}
 		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
 		if err != nil {
@@ -1994,6 +1997,11 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 	}
 	// Within keeps the condition writes and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
+		// Before the no-op return below: see updateSpec.
+		c, err := s.conn(ctx)
+		if err != nil {
+			return err
+		}
 		// One read: a metadata-only gate — clean ErrNotFound/ErrWrongKind instead of
 		// an FK violation, no blob decoded — joined to the stored conditions of the
 		// types being written, since no-op suppression needs them and all key on the
@@ -2010,10 +2018,6 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 		}
 		if len(changed) == 0 {
 			return nil
-		}
-		c, err := s.conn(ctx)
-		if err != nil {
-			return err
 		}
 		if err := s.upsertConditions(ctx, c, id, changed); err != nil {
 			return err

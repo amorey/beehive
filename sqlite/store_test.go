@@ -8666,7 +8666,7 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 	sites := sqlSites(t, func(sql string) bool {
 		return writesObjects.MatchString(sql) && status.MatchString(sql)
 	})
-	assert.ElementsMatch(t, []string{"objectsCreate", "UpdateStatus"}, sites,
+	assert.ElementsMatch(t, []string{"sqliteStore.objectsCreate", "sqliteObjects.UpdateStatus"}, sites,
 		"objects.status is written by the create (as NULL) and UpdateStatus, and nowhere else")
 }
 
@@ -8676,10 +8676,10 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 func sqlSites(t *testing.T, match func(sql string) bool) []string {
 	t.Helper()
 	var sites []string
-	require.NoError(t, inspectPackage(t, func(fn, _ string, n ast.Node) {
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
 		lit, ok := n.(*ast.BasicLit)
 		if ok && lit.Kind == token.STRING && match(lit.Value) {
-			sites = append(sites, fn)
+			sites = append(sites, qualify(recv, fn))
 		}
 	}))
 	return sites
@@ -8719,14 +8719,6 @@ func receiverName(decl *ast.FuncDecl) string {
 		return id.Name
 	}
 	return ""
-}
-
-// bareName drops a receiver qualifier, so callSites and sqlSites results compare.
-func bareName(fn string) string {
-	if i := strings.LastIndex(fn, "."); i >= 0 {
-		return fn[i+1:]
-	}
-	return fn
 }
 
 func qualify(recv, fn string) string {
@@ -9110,17 +9102,19 @@ func TestTheGroupedReadsAreTheOnesThatMoved(t *testing.T) {
 func TestNoWriteBypassesConn(t *testing.T) {
 	writesData := regexp.MustCompile(`(?is)\b(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
 
-	// Both helpers report the enclosing function; callSites qualifies it by
-	// receiver and sqlSites does not, so compare on the bare name.
+	// Receiver-qualified on both sides: Add, Delete, Set and Sweep each name a
+	// write on more than one sub-API, so a bare name would let a new one pass on
+	// an existing one's behalf.
 	takesConn := map[string]bool{}
 	for _, fn := range callSites(t, "conn") {
-		takesConn[bareName(fn)] = true
+		takesConn[fn] = true
 	}
 	// Helpers handed a dbtx by a caller that did take one from conn.
 	for _, fn := range []string{
 		"drawResourceVersions", "appendWriteLog", "appendWriteLogUpdates",
-		"appendWriteLogDelete", "bumpObject", "upsertConditions",
-		"deleteWriteLogRows", "markManyForDeletionChunk",
+		"appendWriteLogDelete", "sqliteStore.bumpObject",
+		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
+		"sqliteStore.markManyForDeletionChunk",
 		"reconcileOwedSweepQuery", // builds a string, executes nothing
 	} {
 		takesConn[fn] = true
@@ -9128,11 +9122,34 @@ func TestNoWriteBypassesConn(t *testing.T) {
 
 	var bypass []string
 	for _, fn := range sqlSites(t, writesData.MatchString) {
-		if !takesConn[bareName(fn)] {
+		if !takesConn[fn] {
 			bypass = append(bypass, fn)
 		}
 	}
 	assert.Empty(t, bypass, "a write here takes its connection from somewhere conn cannot refuse")
+}
+
+// The transaction handle is reachable only through conn and read, plus the
+// savepoint statements. That is what leaves conn the one place a data write can
+// be refused: a statement issued on st.tx directly would never reach it.
+func TestTheTransactionHandleHasThreeUsers(t *testing.T) {
+	seen := map[string]bool{}
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		sel, ok := n.(*ast.SelectorExpr)
+		if ok && sel.Sel.Name == "tx" {
+			seen[qualify(recv, fn)] = true
+		}
+	}))
+	users := make([]string, 0, len(seen))
+	for fn := range seen {
+		users = append(users, fn)
+	}
+
+	assert.ElementsMatch(t, []string{
+		"sqliteStore.conn", // hands it to writes, and refuses a read frame
+		"sqliteStore.read", // hands it to reads
+		"txState.nested",   // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
+	}, users, "a fourth user of st.tx is a write conn cannot refuse")
 }
 
 // A write inside a read transaction is refused before any statement runs, in both
@@ -9153,6 +9170,21 @@ func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
 		got, err := store.Objects().Get(ctx, obj.ID)
 		require.NoError(t, err)
 		assert.Empty(t, got.Status)
+	})
+
+	// A converged write is refused too. It writes nothing either way, so the guard
+	// is the only thing that reports the programming error.
+	t.Run("even when the write would be a no-op", func(t *testing.T) {
+		store := newRawStore(t)
+		obj := newKindObject(t, store, testGK)
+		require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
+			storeapi.Condition{Type: "Ready", Status: "True"}))
+
+		err := store.withinRead(ctx, func(ctx context.Context) error {
+			return store.Conditions().Set(ctx, testGK, obj.ID,
+				storeapi.Condition{Type: "Ready", Status: "True"}) // identical: a no-op
+		})
+		assert.ErrorIs(t, err, errWroteInReadTx)
 	})
 
 	// A nested frame a sibling goroutine opened and closed during fn is refused

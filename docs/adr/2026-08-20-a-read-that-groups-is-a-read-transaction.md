@@ -42,10 +42,20 @@ run, so the pragma cannot be the guard.
 **`conn` is.** It returns `(dbtx, error)` and refuses a read frame outright, so no
 statement is issued at all. That works because of a property the package already
 had: **every data write takes its connection from `conn`**, and the only direct
-uses of `st.tx` are the savepoint statements. `TestNoWriteBypassesConn` holds that
-structurally — it lists the functions carrying write SQL and asserts each takes
-its connection from `conn` or from a caller that did. A roster of verbs could not:
-a verb added without going through `conn` is also a verb nobody adds to a roster.
+uses of `st.tx` are the savepoint statements. Two structural tests hold that.
+`TestNoWriteBypassesConn` lists the functions carrying write SQL and asserts each
+takes its connection from `conn` or from a caller that did; both sides are
+receiver-qualified, because `Add`, `Delete`, `Set` and `Sweep` each name a write
+on more than one sub-API and a bare name would let a new one pass on an existing
+one's behalf. `TestTheTransactionHandleHasThreeUsers` covers the way around
+`conn`: `st.tx` is reachable from `conn`, `read` and the savepoint statements, and
+nowhere else. A roster of verbs could hold neither — a verb added without going
+through `conn` is also a verb nobody adds to a roster.
+
+**`conn` is taken before a write's no-op early return**, not at first use. Several
+writes compare first and return without writing when nothing changed; acquiring
+after that would report success for a write misplaced inside a read transaction,
+in exactly the case where the mistake is hardest to notice.
 
 Note what this is and is not bought by. On disk the pragma is already total —
 `query_only` rejects a write whatever Go method issued it, `UPDATE … RETURNING`
