@@ -482,10 +482,15 @@ type dbtx interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// roDBTX is dbtx without ExecContext, and read returns it so that routing a
-// write onto the reader does not compile. A runtime check could not stand in:
-// inside a transaction read hands back that transaction, where a write would
-// commit on the writer and look correct.
+// roDBTX is dbtx without ExecContext, and read returns it so a write issued the
+// ordinary way does not compile onto the reader. A runtime check could not
+// stand in: inside a transaction read hands back that transaction, where a
+// write would commit on the writer and look correct.
+//
+// It is not airtight. A DELETE or UPDATE with RETURNING is issued through
+// QueryContext, which this interface keeps — deleteWriteLogRows is the one such
+// caller, and its comment is what holds it on conn. Adding a second means
+// reading that, not leaning on the type.
 type roDBTX interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
