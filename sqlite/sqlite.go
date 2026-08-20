@@ -74,6 +74,11 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	// After open: migrations run on the writer, and a reader opened first would
 	// hold a schema that does not exist yet.
 	s.readDB = sqlitemigrate.OpenReadPool(path, o.readConns)
+	// After readDB: a statement prepared before it binds to the writer.
+	if err := s.prepareStatements(context.Background()); err != nil {
+		s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -91,7 +96,16 @@ func OpenMemory() (*sqliteStore, error) {
 	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)&_pragma=auto_vacuum(incremental)")
 	db.SetMaxOpenConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
-	return open(db)
+	s, err := open(db)
+	if err != nil {
+		return nil, err
+	}
+	// readDB is aliased to db here, so this is the pool both sets get.
+	if err := s.prepareStatements(context.Background()); err != nil {
+		s.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 func open(db *sql.DB) (*sqliteStore, error) {

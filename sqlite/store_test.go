@@ -8671,18 +8671,59 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 }
 
 // sqlSites names every function in this package holding a string literal that
-// match accepts. Blind to a statement built by concatenation and to SQL outside
-// this package.
+// match accepts, or naming a prepared statement whose text it accepts. The
+// second is what keeps these tripwires keyed to the function issuing the SQL
+// once the text has moved into stmtSQL. Blind to a statement built by
+// concatenation and to SQL outside this package.
 func sqlSites(t *testing.T, match func(sql string) bool) []string {
 	t.Helper()
+	prepared := preparedSQL(t)
 	var sites []string
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
-		lit, ok := n.(*ast.BasicLit)
-		if ok && lit.Kind == token.STRING && match(lit.Value) {
-			sites = append(sites, qualify(recv, fn))
+		switch n := n.(type) {
+		// fn is empty outside any function, which is where stmtSQL holds the text
+		// of every prepared statement. Those are attributed through the id below,
+		// at the function that names it.
+		case *ast.BasicLit:
+			if fn != "" && n.Kind == token.STRING && match(n.Value) {
+				sites = append(sites, qualify(recv, fn))
+			}
+		case *ast.Ident:
+			if fn != "" && match(prepared[n.Name]) {
+				sites = append(sites, qualify(recv, fn))
+			}
 		}
 	}))
 	return sites
+}
+
+// preparedSQL maps each stmtID to the text stmtSQL gives it, so a site naming
+// the id is attributed the statement it issues. Concatenated pieces are joined,
+// which is as blind to the join as sqlSites is elsewhere.
+func preparedSQL(t *testing.T) map[string]string {
+	t.Helper()
+	texts := map[string]string{}
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		kv, ok := n.(*ast.KeyValueExpr)
+		if !ok {
+			return
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok || !strings.HasPrefix(key.Name, "stmt") {
+			return
+		}
+		var text strings.Builder
+		ast.Inspect(kv.Value, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				text.WriteString(lit.Value)
+			}
+			return true
+		})
+		if text.Len() > 0 {
+			texts[key.Name] = text.String()
+		}
+	}))
+	return texts
 }
 
 // callSites names every function calling any of methods, qualified by receiver
@@ -9106,7 +9147,9 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	// write on more than one sub-API, so a bare name would let a new one pass on
 	// an existing one's behalf.
 	takesConn := map[string]bool{}
-	for _, fn := range callSites(t, "conn") {
+	// stmtFor beside conn: it refuses a write in a read frame the same way, and a
+	// prepared write reaches its connection through it.
+	for _, fn := range callSites(t, "conn", "stmtFor") {
 		takesConn[fn] = true
 	}
 	// Helpers handed a dbtx by a caller that did take one from conn.
@@ -9129,10 +9172,10 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	assert.Empty(t, bypass, "a write here takes its connection from somewhere conn cannot refuse")
 }
 
-// The transaction handle is reachable only through conn and read, plus the
-// savepoint statements. That is what leaves conn the one place a data write can
-// be refused: a statement issued on st.tx directly would never reach it.
-func TestTheTransactionHandleHasThreeUsers(t *testing.T) {
+// The transaction handle is reachable only through conn, read and stmtFor, plus
+// the savepoint statements. Those three are where a write into a read frame is
+// refused: a statement issued on st.tx directly would reach none of them.
+func TestTheTransactionHandleHasFourUsers(t *testing.T) {
 	seen := map[string]bool{}
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
 		sel, ok := n.(*ast.SelectorExpr)
@@ -9146,10 +9189,11 @@ func TestTheTransactionHandleHasThreeUsers(t *testing.T) {
 	}
 
 	assert.ElementsMatch(t, []string{
-		"sqliteStore.conn", // hands it to writes, and refuses a read frame
-		"sqliteStore.read", // hands it to reads
-		"txState.nested",   // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
-	}, users, "a fourth user of st.tx is a write conn cannot refuse")
+		"sqliteStore.conn",    // hands it to writes, and refuses a read frame
+		"sqliteStore.read",    // hands it to reads
+		"sqliteStore.stmtFor", // binds a prepared statement to it, refusing the same
+		"txState.nested",      // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
+	}, users, "a fifth user of st.tx is a write nothing can refuse")
 }
 
 // A write inside a read transaction is refused before any statement runs, in both
@@ -9447,4 +9491,76 @@ func TestEveryWriteVerbRefusesAReadTransaction(t *testing.T) {
 			assert.ErrorIs(t, err, errWroteInReadTx)
 		})
 	}
+}
+
+// A read is prepared on both pools, because a read issued inside a write
+// transaction must run on the writer's connection. A write is prepared on the
+// writer alone: the reader accepts the preparation and fails only on execution,
+// so a nil slot is the only representation Open can check.
+func TestStatementsFillTheSetsTheirPoolAllows(t *testing.T) {
+	store := newDiskStore(t)
+
+	assert.NotNil(t, store.readStmts[stmtGetObjectRow], "a read is prepared on the reader")
+	assert.NotNil(t, store.writeStmts[stmtGetObjectRow], "and on the writer, for case 3")
+	assert.Nil(t, store.readStmts[stmtIncrementOwed], "a write is never prepared on the reader")
+	assert.NotNil(t, store.writeStmts[stmtIncrementOwed], "only on the writer")
+}
+
+// Case 3: a read inside a write transaction runs on the writer's connection, so
+// it sees that transaction's own uncommitted writes. Running the read pool's
+// preparation here would answer from before them, silently.
+func TestAPreparedReadSeesItsWriteTransaction(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		owed := sqliteReconcileOwed{store}
+		if err := owed.Increment(ctx, obj.ID); err != nil {
+			return err
+		}
+		got, err := store.Objects().GetMeta(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), got.ReconcileOwed, "the read joins the transaction that wrote")
+		return nil
+	}))
+}
+
+// Case 2: a read inside a read transaction runs on that transaction's own
+// connection, so it keeps one snapshot. Running the pool's preparation would
+// take a second connection and see the write that landed after it opened.
+func TestAPreparedReadKeepsItsSnapshot(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	require.NoError(t, store.withinRead(ctx, func(txCtx context.Context) error {
+		before, err := store.Objects().GetMeta(txCtx, obj.ID)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), before.ReconcileOwed)
+
+		// Committed on the writer while this read transaction is open.
+		require.NoError(t, sqliteReconcileOwed{store}.Increment(ctx, obj.ID))
+
+		after, err := store.Objects().GetMeta(txCtx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), after.ReconcileOwed, "the snapshot does not move under the read")
+		return nil
+	}))
+}
+
+// The wiring, not the answer: the two tests above pass whether or not the site
+// reaches stmtFor, so this is what fails while a call site still carries its own
+// SQL.
+func TestTheseSitesIssuePreparedStatements(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	before := store.stmtUses.Load()
+	_, err := store.Objects().GetMeta(ctx, obj.ID)
+	require.NoError(t, err)
+	require.NoError(t, sqliteReconcileOwed{store}.Increment(ctx, obj.ID))
+
+	assert.Equal(t, int64(2), store.stmtUses.Load()-before, "a read and a write, both prepared")
 }

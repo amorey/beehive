@@ -103,6 +103,15 @@ type sqliteStore struct {
 	// versions hands out resource versions from a reserved block.
 	versions versions
 
+	// readStmts and writeStmts hold every constant statement, prepared once per
+	// pool. Filled by prepareStatements, read only through stmtFor.
+	readStmts  stmtSet
+	writeStmts stmtSet
+
+	// stmtUses counts statements taken from stmtFor. Test-only, to assert a site
+	// issues a prepared statement rather than its own SQL.
+	stmtUses atomic.Int64
+
 	// txCount counts transactions begun; a nested Within (savepoint) does not add.
 	// Test-only, to assert a fast path answered without BEGIN IMMEDIATE.
 	txCount atomic.Int64
@@ -117,11 +126,12 @@ type sqliteStore struct {
 func (s *sqliteStore) Close() error {
 	// Readers first: they hold snapshots the writer's checkpoint waits on. The
 	// writer closes whatever happened above it, so a failed reader cannot leak it.
-	var readErr error
+	// Statements first: closing them frees the driver's compiled programs.
+	err := s.closeStatements()
 	if s.readDB != s.db {
-		readErr = s.readDB.Close()
+		err = errors.Join(err, s.readDB.Close())
 	}
-	return errors.Join(readErr, s.db.Close())
+	return errors.Join(err, s.db.Close())
 }
 
 // Drain floor: release only past both an absolute size and a share of the file.
@@ -996,9 +1006,11 @@ func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKi
 
 // getObjectRow reads the objects row without assembling conditions.
 func (s *sqliteStore) getObjectRow(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
-	row := s.read(ctx).QueryRowContext(ctx,
-		`SELECT `+objectColumns+` FROM objects WHERE id = ?`, id)
-	return scanObject(row)
+	ps, err := s.stmtFor(ctx, stmtGetObjectRow)
+	if err != nil {
+		return nil, err
+	}
+	return scanObject(ps.QueryRowContext(ctx, id))
 }
 
 // getObjectRowScoped loads id's bare row (no conditions) and confirms it belongs
@@ -1273,12 +1285,11 @@ func (s sqliteReconcileOwed) Sweep(ctx context.Context, keep []storeapi.GroupKin
 // from Edges().Add, whose stamp must be indivisible from the edge insert, and from
 // ReconcileOwed().Stamp. It stays here so tests can seed a count.
 func (s sqliteReconcileOwed) Increment(ctx context.Context, id storeapi.ObjectID) error {
-	c, err := s.conn(ctx)
+	ps, err := s.stmtFor(ctx, stmtIncrementOwed)
 	if err != nil {
 		return err
 	}
-	_, err = c.ExecContext(ctx,
-		`UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`, id)
+	_, err = ps.ExecContext(ctx, id)
 	return err
 }
 

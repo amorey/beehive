@@ -1,0 +1,114 @@
+// Copyright 2026 Andres Morey
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+)
+
+// stmtID names a statement whose text is constant. A call site names the id, not
+// a preparation of it: which preparation runs depends on the ctx, which the site
+// has not passed yet. See stmtFor.
+type stmtID int
+
+const (
+	stmtGetObjectRow stmtID = iota
+	stmtIncrementOwed
+
+	numStmts
+)
+
+// stmtSQL is every prepared statement's text, indexed by stmtID.
+var stmtSQL = [numStmts]string{
+	stmtGetObjectRow:  `SELECT ` + objectColumns + ` FROM objects WHERE id = ?`,
+	stmtIncrementOwed: `UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`,
+}
+
+// stmtWrites marks the ids that write, which are prepared on the writer alone.
+// Preparing one on the read pool succeeds and fails only on execution, so the
+// nil slot is the only representation open can check.
+var stmtWrites = [numStmts]bool{
+	stmtIncrementOwed: true,
+}
+
+// stmtSet is one pool's preparations.
+type stmtSet [numStmts]*sql.Stmt
+
+// stmtFor returns id bound to the connection ctx selects: the transaction's own
+// connection while one is live, else the pool the statement was prepared on. A
+// nil slot is a routing bug and is reported here, not at execution.
+func (s *sqliteStore) stmtFor(ctx context.Context, id stmtID) (*sql.Stmt, error) {
+	s.stmtUses.Add(1)
+	st := liveTx(ctx)
+	switch {
+	case st == nil:
+		if stmtWrites[id] {
+			return s.writeStmts[id], nil
+		}
+		return s.readStmts[id], nil
+	case st.readOnly:
+		// As conn does, and for the same reason: refused before any statement runs.
+		if stmtWrites[id] {
+			return nil, errWroteInReadTx
+		}
+		return st.tx.StmtContext(ctx, s.readStmts[id]), nil
+	default:
+		return st.tx.StmtContext(ctx, s.writeStmts[id]), nil
+	}
+}
+
+// prepareStatements fills both sets. It must run after the migrations, and after
+// s.readDB is assigned: a statement prepared before either names a schema or a
+// pool that is not there yet.
+func (s *sqliteStore) prepareStatements(ctx context.Context) error {
+	for id := stmtID(0); id < numStmts; id++ {
+		ps, err := s.db.PrepareContext(ctx, stmtSQL[id])
+		if err != nil {
+			return fmt.Errorf("prepare %d on the writer: %w", id, err)
+		}
+		s.writeStmts[id] = ps
+
+		if stmtWrites[id] {
+			continue
+		}
+		if s.readDB == s.db {
+			s.readStmts[id] = ps
+			continue
+		}
+		if s.readStmts[id], err = s.readDB.PrepareContext(ctx, stmtSQL[id]); err != nil {
+			return fmt.Errorf("prepare %d on the reader: %w", id, err)
+		}
+	}
+	return nil
+}
+
+// closeStatements releases both sets, freeing the driver's compiled programs.
+// Idempotent, as Close is; a set aliased to the other is closed once.
+func (s *sqliteStore) closeStatements() error {
+	var err error
+	for id := stmtID(0); id < numStmts; id++ {
+		if s.readStmts[id] != nil && s.readStmts[id] != s.writeStmts[id] {
+			err = errors.Join(err, s.readStmts[id].Close())
+		}
+		if s.writeStmts[id] != nil {
+			err = errors.Join(err, s.writeStmts[id].Close())
+		}
+		s.readStmts[id], s.writeStmts[id] = nil, nil
+	}
+	return err
+}
