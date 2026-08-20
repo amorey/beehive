@@ -316,3 +316,18 @@ func TestTheCounterIsWrittenInOnePlace(t *testing.T) {
 	}))
 	assert.Equal(t, []string{"drawResourceVersions"}, sites)
 }
+
+// The seed read runs after the migrations, so a database whose migrations are
+// recorded but whose counter row is gone fails at open rather than handing out
+// versions from zero.
+func TestOpenReportsAMissingCounter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+	first, err := Open(path)
+	require.NoError(t, err)
+	_, err = first.db.ExecContext(context.Background(), `DROP TABLE resource_version_seq`)
+	require.NoError(t, err)
+	require.NoError(t, first.Close())
+
+	_, err = Open(path)
+	require.Error(t, err)
+}
