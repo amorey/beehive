@@ -8781,26 +8781,37 @@ func TestAReadOutsideATransactionDoesNotWaitOrSeeIt(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	seen := make(chan []byte, 1)
+	// The read's outcome travels back on the channel rather than being asserted
+	// where it runs: require in a spawned goroutine calls Goexit, which would
+	// leave the receive below with nothing to receive.
+	type read struct {
+		status []byte
+		err    error
+	}
+	reads := make(chan read, 1)
+
+	var seen read
 	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
 		_, err := store.Objects().UpdateStatus(txCtx, testGK, obj.ID, []byte(`{"a":1}`), 0)
 		require.NoError(t, err)
 
-		done := make(chan struct{})
 		go func() {
-			defer close(done)
 			got, err := store.Objects().GetMeta(ctx, obj.ID) // ctx, not txCtx
-			require.NoError(t, err)
-			seen <- got.Status
+			if err != nil {
+				reads <- read{err: err}
+				return
+			}
+			reads <- read{status: got.Status}
 		}()
 		select {
-		case <-done:
+		case seen = <-reads:
 		case <-time.After(10 * time.Second):
 			return errors.New("a read outside the transaction blocked on the writer")
 		}
 		return nil
 	}))
-	assert.Empty(t, <-seen, "the reader must not see an uncommitted write")
+	require.NoError(t, seen.err)
+	assert.Empty(t, seen.status, "the reader must not see an uncommitted write")
 
 	got, err := store.Objects().GetMeta(ctx, obj.ID)
 	require.NoError(t, err)
@@ -8842,7 +8853,7 @@ func TestTheReaderKeepsItsConnections(t *testing.T) {
 			defer wg.Done()
 			for range 20 {
 				_, err := store.Objects().GetMeta(ctx, id)
-				require.NoError(t, err)
+				assert.NoError(t, err)
 			}
 		}()
 	}
