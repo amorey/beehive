@@ -108,6 +108,13 @@ type sqliteStore struct {
 	readStmts  stmtSet
 	writeStmts stmtSet
 
+	// readConns is the read pool's size, which the warm-up needs: an exhausted
+	// pool blocks in Conn rather than reporting itself full.
+	readConns int
+
+	// stmtWarmed counts reader connections the warm-up compiled on. Test-only.
+	stmtWarmed int
+
 	// stmtUses counts statements taken from stmtFor. Test-only, to assert a site
 	// issues a prepared statement rather than its own SQL.
 	stmtUses atomic.Int64

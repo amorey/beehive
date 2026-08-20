@@ -9564,3 +9564,19 @@ func TestTheseSitesIssuePreparedStatements(t *testing.T) {
 
 	assert.Equal(t, int64(2), store.stmtUses.Load()-before, "a read and a write, both prepared")
 }
+
+// Preparing compiles on one connection of the pool; the reader's others compile
+// at first use. The warm-up is what pays those parses at startup, and it has to
+// hold every connection at once or the pool hands back the one just released.
+func TestTheWarmUpReachesEveryReaderConnection(t *testing.T) {
+	store := newDiskStore(t, WithReadConnections(3))
+	assert.Equal(t, 3, store.stmtWarmed, "one warmed connection per reader")
+}
+
+// The writer prepares on its only connection, so there is nothing left to warm.
+func TestTheWarmUpSkipsTheWriter(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	assert.Equal(t, 0, store.stmtWarmed, "one pool, one connection, already compiled")
+}

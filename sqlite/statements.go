@@ -94,6 +94,48 @@ func (s *sqliteStore) prepareStatements(ctx context.Context) error {
 			return fmt.Errorf("prepare %d on the reader: %w", id, err)
 		}
 	}
+	return s.warmReadStatements(ctx)
+}
+
+// warmReadStatements compiles every read statement on the reader's other
+// connections: PrepareContext compiled each on one already, and the rest compile
+// at first use otherwise. The writer is one connection, so it is skipped.
+//
+// Every connection is held until the last is out, or the pool hands back the one
+// just released and a single connection is warmed N times. The count comes from
+// readConns: an exhausted pool blocks in Conn rather than reporting itself full.
+//
+// Arguments are not passed. The statement compiles before the argument count is
+// checked, and that error is not ErrBadConn, so nothing retries — which is what
+// keeps this from needing an argument list per statement. Reads only: an argless
+// write binding no placeholders would run.
+func (s *sqliteStore) warmReadStatements(ctx context.Context) error {
+	if s.readDB == s.db {
+		return nil
+	}
+	held := make([]*sql.Conn, 0, s.readConns)
+	defer func() {
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	for range s.readConns {
+		conn, err := s.readDB.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("warm the read pool: %w", err)
+		}
+		held = append(held, conn)
+		for id := stmtID(0); id < numStmts; id++ {
+			if stmtWrites[id] {
+				continue
+			}
+			// The bind fails; the compile it is preceded by is the point.
+			if rows, err := conn.QueryContext(ctx, stmtSQL[id]); err == nil {
+				rows.Close()
+			}
+		}
+		s.stmtWarmed++
+	}
 	return nil
 }
 
