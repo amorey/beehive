@@ -609,6 +609,31 @@ func (st *txState) highestDraw() int64 {
 	return st.drawn
 }
 
+// withinRead runs fn inside a read transaction on the read pool: every read fn
+// makes sees one snapshot, and no write lock is taken.
+//
+// ReadOnly is what makes the BEGIN deferred — modernc applies the DSN's _txlock
+// only when it is false — and nothing more. A write inside fn is refused by the
+// reader pool's query_only pragma, not by the flag, so under OpenMemory, where
+// readDB is the writer, it succeeds instead.
+func (s *sqliteStore) withinRead(ctx context.Context, fn func(ctx context.Context) error) error {
+	tx, err := s.readDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	st := &txState{tx: tx}
+	defer st.close()
+	ctx = context.WithValue(ctx, txKey{}, &txFrame{st: st})
+	defer tx.Rollback()
+	if err := fn(ctx); err != nil {
+		return err
+	}
+	if err := st.sealForCommit(); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // AfterCommit defers fn to the outermost transaction's commit. Outside a
 // transaction — or once the commit has drained the queue — fn runs inline:
 // "after the commit" is satisfied by running now.

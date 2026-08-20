@@ -8904,3 +8904,39 @@ func TestTheReaderKeepsItsConnections(t *testing.T) {
 	assert.Zero(t, stats.MaxIdleClosed, "a returned connection was closed over the idle count")
 	assert.Zero(t, stats.MaxIdleTimeClosed, "a returned connection was reaped on a timer")
 }
+
+// A read transaction groups its reads on one snapshot: a write landing between
+// them is not seen. On disk, because OpenMemory aliases the reader to the writer.
+func TestAReadTransactionSeesOneSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	obj := newKindObject(t, store, testGK)
+
+	var first, second *storeapi.RawObject
+	require.NoError(t, store.withinRead(ctx, func(ctx context.Context) error {
+		var err error
+		if first, err = store.Objects().Get(ctx, obj.ID); err != nil {
+			return err
+		}
+		// The write runs on its own ctx, so it takes the writer rather than
+		// joining this frame.
+		wrote := make(chan error, 1)
+		go func() {
+			_, err := store.Objects().UpdateStatus(
+				context.Background(), testGK, obj.ID, []byte(`{"n":1}`), 0)
+			wrote <- err
+		}()
+		require.NoError(t, <-wrote)
+
+		second, err = store.Objects().Get(ctx, obj.ID)
+		return err
+	}))
+
+	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
+		"the second read must answer from the snapshot the first took")
+
+	after, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.Greater(t, after.ResourceVersion, second.ResourceVersion,
+		"...and the write must be visible once the transaction ends")
+}
