@@ -1,9 +1,10 @@
 # A read-only transaction
 
-- **Status:** Proposed, not decided. Measured twice — it is worth 2-8% on
-  writes that have a watch attached, and **nothing at all** on how fast a watch
-  delivers. See *What it is worth*, then decide whether that earns a place ahead
-  of the rest of the list. The prototype is not kept; git holds it.
+- **Status:** Ready to build. Measured three times, most recently against the
+  shipped read pool and version blocks. **The case has moved**: the writer-side
+  win it was first justified by is gone at the shipping throttle, and the
+  grouped read's own latency — which nobody had measured — is where the change
+  pays. See *What it is worth*. The prototype is not kept; git holds it.
 - **Date:** 2026-08-20
 - **Depends on:** the read pool, which shipped
   ([ADR](../adr/2026-08-20-reads-get-their-own-connections.md)). A grouped read
@@ -16,11 +17,11 @@ Five places group two or more reads so they describe one instant. They do it
 with `Within`, and the DSN sets `_txlock=immediate`, so **a read takes the write
 lock**:
 
-- `Events().Snapshot` (`sqlite/store.go:2059`) — the runs and the position.
-- `Events().ListSince` (`:2083`) — the page, the horizon and the existence probe.
-- `ObjectWrites().ListSince` (`:3120`) — the page, the horizon and the row images.
-- `snapshot` (`:3319`) — a listing and the write log's mark.
-- `Events().Sweep`'s candidate scan (`:2172`, via `overCapTimelines` at `:2221`).
+- `Events().Snapshot` (`sqlite/store.go:2153`) — the runs and the position.
+- `Events().ListSince` (`:2177`) — the page, the horizon and the existence probe.
+- `ObjectWrites().ListSince` (`:3208`) — the page, the horizon and the row images.
+- `snapshot` (`:3407`) — a listing and the write log's mark.
+- `Events().Sweep`'s candidate scan (`:2266`, via `overCapTimelines` at `:2315`).
 
 The third is every watch tailer's page read, on every drain.
 
@@ -40,48 +41,70 @@ reader, and the reader is opened `query_only(true)`, which refuses a write lock 
 so `IMMEDIATE` there does not work at all. This is what lets those call sites move.
 
 `modernc.org/sqlite` gives us the deferred begin for free: `newTx` applies the
-DSN's `_txlock` only when `opts.ReadOnly` is false (`tx.go:22-25`). So
+DSN's `_txlock` only when `opts.ReadOnly` is false (`tx.go:18-31`). So
 `BeginTx(ctx, &sql.TxOptions{ReadOnly: true})` is a plain `BEGIN` with no DSN
 change.
 
+The reader's DSN omits `_txlock` anyway, so `beginMode` is empty there and the
+begin would be deferred without the flag. Pass it regardless: it is what states
+the intent, and it is what keeps this true if the reader's DSN ever gains one.
+
 ## What it is worth, measured
 
-A prototype — `withinRead` over the four read-only sites, on disk, medians of
-three runs of 300. `BenchmarkWritesUnderWatch`, ns/op:
+A prototype — `withinRead` over the four read-only sites — passed the whole suite
+unchanged, so what follows is the real behaviour rather than an approximation.
+On disk, medians of alternating runs a side.
 
-| | pre-split | + read pool | + this | net |
-|---|---|---|---|---|
-| no-watcher | 177 | 176 | 178 | +0% |
-| one-watcher | 180 | 180 | 169 | **−6%** |
-| 64-watchers-one-kind | 180 | 178 | 170 | **−5%** |
-| 16-kinds-one-watcher-each | 189 | 178 | 174 | **−8%** |
-| one-owner-scoped-watcher | 180 | 177 | 177 | −2% |
+### The grouped read stops queueing behind writers
 
-That is the shipping throttle. **The win is real and modest** — do not go in
-expecting the read pool's 10× on bare reads.
+This is the measurement nobody had taken, and it is the case for the change.
+`ObjectWrites().ListSince` — every object tailer's drain read — with writers in
+flight:
 
-The same benchmark with the tailer's scan floor at 0 — `withWatchScanMinInterval`,
-unexported, so unreachable — is where the effect is large, because the floor is
-what otherwise caps the drain rate:
-
-| | pre-split | + read pool | + this |
+| writers | now | with `withinRead` | |
 |---|---|---|---|
-| one-watcher | 223 | 246 | 226 |
-| 64-watchers-one-kind | 230 | 261 | 239 |
-| 16-kinds-one-watcher-each | 334 | 305 | **228 (−32%)** |
-| one-owner-scoped-watcher | 220 | 251 | 230 |
+| 0 | 43.4 µs | 42.3 µs | −2% |
+| 1 | 169.7 µs | 119.6 µs | **−30%** |
+| 4 | 380.4 µs | 119.8 µs | **−68%** |
 
-Two things to read off it. This change **reverses the regression the read pool
-introduced there** — the tailer's page read stops taking the writer, which is
-what that regression was. And the light-watch rows still land 1–5% above
-pre-split, so it does not fully pay that back; only the 16-kind row, where
-sixteen tailers were contending, comes out clearly ahead.
+The percentages matter less than the shape. Today the read's cost **scales with
+write pressure**, because `BEGIN IMMEDIATE` puts it in the writers' queue for the
+one connection. On the reader it is **flat** — 119.6 µs against 119.8 µs at one
+writer and at four. That is the property being bought, and it does not degrade as
+a deployment gets busier.
+
+### The writer side is now worth nothing
+
+`BenchmarkWritesUnderWatch` at the shipping throttle, which is what an embedder
+actually runs:
+
+| | now | with `withinRead` |
+|---|---|---|
+| no-watcher | 155.6 µs | +1% |
+| one-watcher | 157.5 µs | +0% |
+| 64-watchers-one-kind | 157.1 µs | +1% |
+| 16-kinds-one-watcher-each | 163.3 µs | **−3%** |
+| one-owner-scoped-watcher | 157.0 µs | −0% |
+
+**An earlier draft of this spec claimed 2–8% here. It does not reproduce.** That
+figure was measured before version blocks shipped, against a more expensive write.
+Only the 16-kind row moves at all, and 3% is at the edge of this sandbox's noise.
+
+The reason is the scan floor: `defaultWatchScanMinInterval` caps a tailer at ten
+drains a second, so even a 380 µs drain is 3.8 ms of the connection per tailer per
+second. Sixteen tailers is 6% of it, and that 6% is the whole of what this change
+can give a writer back. Do not build this expecting the write path to move.
+
+With the floor at 0 — `withWatchScanMinInterval`, unexported, so unreachable by an
+embedder — the same benchmark moves −7% to −25%. That row is what the writer side
+would be worth if drains were not paced, and it is here only to explain the one
+above it.
 
 ### It does not make watches faster
 
-Both tables above are the *writer's* side: a tailer stops making writers wait.
 Delivery latency — commit to the watcher seeing it — is set by the tailer's scan
-floor and nothing else. Measured separately, 50 iterations, on disk:
+floor and nothing else. Measured with the earlier prototype, 50 iterations, and
+not re-run: the mechanism is the floor, and this change does not touch it.
 
 | throttle | kinds | before | + this |
 |---|---|---|---|
@@ -90,15 +113,8 @@ floor and nothing else. Measured separately, 50 iterations, on disk:
 | 0 | 1 | 0.33ms | 0.34ms |
 | 0 | 16 | 5.35ms | 3.90ms |
 
-At the default, sixteen concurrent tailers deliver as fast as one:
-`defaultWatchScanMinInterval` paces them long before the connection does, so
-there is no contention left here to remove.
-
-With the floor off there is — sixteen kinds cost sixteen times one, which is
-near-perfect serialisation on the writer. This change recovers about a quarter of
-that, and no more, because the read pool defaults to four connections and sixteen
-tailers still queue four at a time. Anyone who wants faster delivery should be
-looking at the floor, not at this.
+At the default, sixteen concurrent tailers deliver as fast as one. Anyone who
+wants faster delivery should be looking at the floor, not at this.
 
 ## The change
 
@@ -116,11 +132,18 @@ A sibling of `Within`, unexported on `sqliteStore` (see *Exported, or not*):
 func (s *sqliteStore) withinRead(ctx context.Context, fn func(ctx context.Context) error) error
 ```
 
-Implementation is `Within` with three differences: it begins on `s.readDB`,
+Implementation is `Within` with four differences: it begins on `s.readDB`,
 `BeginTx` gets `&sql.TxOptions{ReadOnly: true}` (which is what makes it a
 deferred `BEGIN` — `modernc` applies the DSN's `_txlock` only when `ReadOnly` is
-false), and `txCount` is not incremented, since it counts write transactions and
-a test asserts a fast path took none.
+false), `txCount` is not incremented, since it counts write transactions and a
+test asserts a fast path took none, and **the version allocator is not settled**.
+
+That last one is newer than this spec and easy to copy in by accident. `Within`
+ends with `s.versions.publish(...)` and `s.refillVersions(ctx)`
+([ADR](../adr/2026-08-20-reserve-resource-versions-in-blocks.md)). A read
+transaction draws no version, so the publish is a no-op — but the refill is a
+*write*, on `s.db`, and putting it at the end of a read is both wrong and a way
+to make a read block on the writer connection it was moved off. Leave both out.
 
 **A nested call joins by running `fn` on the same ctx, not by taking a
 savepoint.** A savepoint is a rollback boundary, and a read has nothing to roll
@@ -155,21 +178,26 @@ the one thing the grouping exists to prevent.
 
 ## Is it worth building
 
-Against the rest of the list, this is the weakest measured case in its group:
-2-8% on watched writes, and nothing on delivery. What it also buys, and what
-may matter more:
+Yes, on three grounds, none of which is the one this spec was first written on:
 
-- It settles the export question that
-  [cache prepared statements](2026-08-20-cache-prepared-statements.md) turns on.
-- It is the right shape regardless. Four pure reads taking `BEGIN IMMEDIATE` on
-  the writer is wrong on its face, and stays wrong however little it costs
-  today — the cost grows with write pressure, where a read-pool read is flat.
+- **The grouped read stops scaling with write pressure.** −30% at one writer,
+  −68% at four, and flat thereafter. A busier deployment gets more of this, not
+  less, which is the opposite of every other item on the list.
+- **It settles the export question that
+  [cache prepared statements](2026-08-20-cache-prepared-statements.md) turns on**,
+  and that spec is the widest win in the set and blocked until this one decides.
+- **It is the right shape.** Four pure reads taking `BEGIN IMMEDIATE` on the
+  writer is wrong on its face and stays wrong however little it costs.
 
-Neither is urgent, and both of the specs that outranked it are gone: resource
-version blocks [shipped](../adr/2026-08-20-reserve-resource-versions-in-blocks.md),
-and folding the spec write's read into its `UPDATE` was
-[measured and declined](../adr/2026-08-20-a-spec-write-reads-before-it-writes.md).
-That leaves this first, which the README now reflects.
+What it is **not** worth building for: the write path, which does not move at the
+shipping throttle, and watch delivery latency, which is floor-bound. Both were
+claimed by earlier drafts of this spec and neither survives measurement.
+
+Both specs that outranked it are gone — resource version blocks
+[shipped](../adr/2026-08-20-reserve-resource-versions-in-blocks.md), and folding
+the spec write's read into its `UPDATE` was
+[measured and declined](../adr/2026-08-20-a-spec-write-reads-before-it-writes.md) —
+so this is first, which the README reflects.
 
 ## Exported, or not
 
@@ -215,13 +243,20 @@ with it — record that dependency in both ADRs rather than in one.
   (`:1253`) is deliberately not on the list above. Say so where it is not, or
   someone will add it for symmetry.
 
-- **A read transaction pins the WAL**, which is this change's real operational
-  cost and is measured in [`TODO.md`](../TODO.md): with autocommit reads only,
-  2000 inserts peak at 4.1MB and a checkpoint truncates to nothing; with one open
-  read transaction, 25.8MB and the checkpoint comes back busy. `ListSince` pages
-  under a budget already — check the budget bounds the transaction and not just
-  the rows, and decide there whether `journal_size_limit` earns its place now
-  that something finally holds a snapshot.
+- **A read transaction pins the WAL**, and this is the change's real operational
+  cost, measured in [`TODO.md`](../TODO.md): with autocommit reads only, 2000
+  inserts peak at 4.1MB and a checkpoint truncates to nothing; with one open read
+  transaction, 25.8MB and the checkpoint comes back busy.
+
+  It is smaller here than that table suggests. **The tailer's drain calls
+  `ObjectWrites().ListSince` once per page** (`objectswatch.go:600`), and each call
+  is its own transaction, so a snapshot is held for one page read — 120 µs
+  measured, not the length of a drain. Do not restructure the drain to hold one
+  transaction across its pages; that is what would turn this into the table above.
+
+  `snapshot` (`:3407`) is the exception and the one to watch: it lists a whole kind
+  and reads the mark in one transaction, so its hold grows with the kind. If any
+  site earns `journal_size_limit`, it is that one.
 
 ## Tests
 
@@ -246,6 +281,13 @@ In `sqlite/store_test.go`:
 - The waker's `ListSinceAll` is still ungrouped, so a commit wake mid-scan is
   seen. Without this the next reader groups it for symmetry and the waker's only
   backstop becomes the 60s pass.
+- `withinRead` settles no versions: a read transaction neither publishes nor
+  refills. Cheapest form is a structural one — `refillVersions` has exactly one
+  caller.
+
+Everything above except the last two already exists for `Within` and passed
+unchanged against the prototype, so a red suite during the build is a signal, not
+a rewrite. The prototype's own gap was the hook queue, which it dropped.
 
 ## On ship
 
@@ -254,5 +296,12 @@ matters for later readers — `Within` means "I intend to write", and choosing i
 for a read is now a mistake rather than a style. Note the modernc detail, because
 the whole thing rests on it and it is invisible in our code.
 
+Record the grouped-read table, and record that the writer-side figure an earlier
+draft carried did not survive re-measurement: the next person to reach for this
+shape will reach for it expecting the write path to move.
+
 The read-pool ADR and this one describe one boundary from two sides; cross-link
-them rather than restating either.
+them rather than restating either. `CLAUDE.md`'s reads bullet says "a grouped read
+still takes the writer, because the five that self-wrap in `Within` have not
+moved" — four of the five move here, and that sentence becomes the record of which
+one did not.

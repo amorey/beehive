@@ -26,9 +26,11 @@ spec names are the real constraint.
 now that measurement has settled the rest: two of the four have been priced with a
 prototype, and both came back below their estimate.
 
-1. [A read-only transaction](2026-08-20-a-read-only-transaction.md) — measured at
-   2–8% on watched writes and nothing on delivery latency, which is floor-bound.
-   Worth it for the shape, and because it settles the export question 2 turns on.
+1. [A read-only transaction](2026-08-20-a-read-only-transaction.md) — **ready to
+   build**. The grouped read stops queueing behind writers: −30% at one writer,
+   −68% at four, and flat thereafter instead of scaling with write pressure. The
+   writer-side figure an earlier draft carried does not reproduce. Also settles
+   the export question 2 turns on.
 2. [Cache prepared statements](2026-08-20-cache-prepared-statements.md) — ~2–6 µs
    off every statement, so the widest of these. Blocked until 1 decides how a
    statement inside a transaction becomes safe to cache.
