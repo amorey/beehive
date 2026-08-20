@@ -1,6 +1,9 @@
 # A spec write writes before it reads
 
-- **Status:** Planned.
+- **Status:** Measured, and **recommended for decline**. It saves 7 µs on a spec
+  write that changes something and costs 62 µs on one that does not, and the
+  converged write is the steady state. See *What it is worth*. The prototype is
+  not kept; git holds it.
 - **Date:** 2026-08-20
 - **Depends on:** nothing.
 
@@ -23,6 +26,43 @@ This is the mirror of the probe that was
 That one added a read in front of writes that happen anyway, and lost. This one
 removes a read from writes that happen, and pays for itself whenever a write
 changes something.
+
+## What it is worth, measured
+
+A prototype of the one-statement path over the id-keyed resolver, on disk, medians
+of fifteen alternating runs a side. It passed the whole suite bar the draw-site
+list, so the semantics below are the real ones, not an approximation:
+
+| `BenchmarkConvergedSpecWrite`, `spec=0KB/conditions=0` | now | write-first | |
+|---|---|---|---|
+| `changed` — the write happens | 148.9 µs | 141.6 µs | **−5%** |
+| `txn` — converged, nothing written | 41.4 µs | 103.7 µs | **+151%** |
+
+The parts, measured separately inside a transaction against the real schema:
+
+| | |
+|---|---|
+| empty `Within` | 5.2 µs |
+| the row read this removes | +20.4 µs |
+| an `UPDATE` that matches no row | +52.4 µs |
+
+**A write statement that changes nothing is two and a half times the cost of the
+read it replaces.** That is the whole result. The read is cheap because it runs on
+the writer's warm page cache inside the transaction — far cheaper than the 36 µs a
+standalone `Objects().Get` costs on the read pool, which is the figure that made
+this look worth doing.
+
+So the trade is 7.3 µs saved per changed write against 62.3 µs added per converged
+one: it pays only where changed writes outnumber converged ones by more than
+**8.5 to 1**. Beehive is built for the opposite ratio. A controller re-applying its
+own spec is the steady state, and the byte compare skipping it is
+[what stops that waking the controller forever](../adr/2026-08-18-beehive-owns-the-generation-handshake.md).
+
+Nothing rescues it. The converged path cannot skip the `UPDATE` without the read
+that the change exists to remove, and no caller signals which case it is in — a
+`ControllerClient` holds a status baseline it can compare in memory
+([ADR](../adr/2026-08-19-a-pass-skips-a-status-write-it-can-see-is-a-no-op.md)),
+but `UpdateSpec`'s callers are clients and hold nothing.
 
 ## The change
 
@@ -93,10 +133,15 @@ against the new one:
 Add: a changed write issues one `UPDATE` and no preceding `SELECT`. Count
 statements through a store seam, or the point of the change is untested.
 
-## On ship
+## On decline
 
-ADR: **a spec write writes before it reads**, as a companion to
-[the declined probe](../adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md)
-rather than a replacement — that ADR's decision (take the transaction
-unconditionally) still stands, and this changes only what happens inside it.
-Record the new `BenchmarkConvergedSpecWrite` numbers in both.
+ADR: **a spec write reads before it writes**, recording the measurement above
+beside its sibling,
+[the declined probe](../adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md).
+The pair says the same thing from both directions: that probe added a read in
+front of writes that happen anyway and lost; this removes a read from writes that
+happen and loses on the writes that do not. The number worth keeping is the one
+that will tempt the next reader — an `UPDATE` matching no row costs more than the
+`SELECT` it would replace.
+
+If it is built anyway, everything below still applies.
