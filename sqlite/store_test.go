@@ -9580,3 +9580,22 @@ func TestTheWarmUpSkipsTheWriter(t *testing.T) {
 	t.Cleanup(func() { store.Close() })
 	assert.Equal(t, 0, store.stmtWarmed, "one pool, one connection, already compiled")
 }
+
+// Preparing eagerly is what turns a typo on a cold path into a startup error.
+// The reopen is what stands in for "no pool leaked": a leaked writer would hold
+// the file's write lock.
+func TestOpenFailsOnAStatementItCannotPrepare(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+
+	restore := stmtSQL[stmtGetObjectRow]
+	stmtSQL[stmtGetObjectRow] = `SELECT nonexistent FROM objects WHERE id = ?`
+	store, err := Open(path)
+	stmtSQL[stmtGetObjectRow] = restore
+
+	require.Error(t, err)
+	assert.Nil(t, store)
+
+	reopened, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { reopened.Close() })
+}
