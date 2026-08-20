@@ -948,7 +948,7 @@ func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ..
 	if err != nil {
 		return nil, err
 	}
-	// scanObjects closes rows, freeing the single connection for the conditions query.
+	// scanObjects closes rows, releasing their connection before the conditions query.
 	out, err := scanObjects(rows)
 	if err != nil {
 		return nil, err
@@ -988,7 +988,8 @@ func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.Object
 }
 
 // conditionsByIDsChunk runs one chunk, merging rows into out; it closes its
-// result set so the next chunk can run on the single connection.
+// result set so the next chunk reuses that connection rather than taking
+// another from the read pool.
 func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, out map[storeapi.ObjectID][]storeapi.Condition) error {
 	args := make([]any, len(ids))
 	placeholders := make([]string, len(ids))
@@ -1709,7 +1710,7 @@ func (s *sqliteStore) loadForConditionSet(
 }
 
 // loadForConditionSetChunk runs one chunk, merging rows into out; it closes its
-// result set so the next chunk can run on the single connection.
+// result set so the next chunk can run on the transaction's connection.
 func (s *sqliteStore) loadForConditionSetChunk(
 	ctx context.Context,
 	gk storeapi.GroupKind,
@@ -2840,7 +2841,8 @@ func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, r
 }
 
 // edgesByIDsChunk runs one chunk, merging rows into out; it closes its result
-// set so the next chunk can run on the single connection.
+// set so the next chunk reuses that connection rather than taking another from
+// the read pool.
 func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
 	args := make([]any, 0, len(ids)+1)
 	placeholders := make([]string, len(ids))
@@ -3238,7 +3240,7 @@ func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, 
 
 // deleteWriteLogRows deletes the entries matching where and reports the highest
 // version removed per kind, with the total. Closes its rows before returning, so
-// the horizon writes that follow get the single connection back.
+// the horizon writes that follow get the transaction's connection back.
 func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, where string, args ...any) (map[storeapi.GroupKind]int64, int, error) {
 	// conn, not read: a DELETE ... RETURNING is a write however it is issued.
 	rows, err := s.conn(ctx).QueryContext(ctx,
