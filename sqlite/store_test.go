@@ -9035,3 +9035,109 @@ func TestAGroupedReadRunsBesideAWriteTransaction(t *testing.T) {
 		})
 	}
 }
+
+// Which reads moved to the reader, structurally. Two must not: Events().Sweep,
+// whose scan and trim are one transaction on the writer, and the waker's
+// ListSinceAll, which is ungrouped so a commit wake mid-scan is still seen.
+func TestTheGroupedReadsAreTheOnesThatMoved(t *testing.T) {
+	var sites []string
+	require.NoError(t, inspectPackage(t, func(fn string, n ast.Node) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "withinRead" {
+			sites = append(sites, fn)
+		}
+	}))
+
+	assert.ElementsMatch(t, []string{
+		"Snapshot",  // Events().Snapshot
+		"ListSince", // Events().ListSince
+		"ListSince", // ObjectWrites().ListSince
+		"snapshot",  // the object listing's
+	}, sites, "a fifth grouped read on the reader needs its own argument")
+}
+
+// The refusal comes from the reader pool's query_only pragma, not from
+// sql.TxOptions.ReadOnly, which only picks the begin verb. On disk: OpenMemory
+// aliases the reader to the writer, where the same write succeeds.
+func TestAWriteInsideAReadTransactionIsRefused(t *testing.T) {
+	ctx := context.Background()
+	store := newDiskStore(t)
+	obj := newKindObject(t, store, testGK)
+
+	err := store.withinRead(ctx, func(ctx context.Context) error {
+		_, err := store.conn(ctx).ExecContext(ctx,
+			`UPDATE objects SET updated_at = updated_at + 1 WHERE id = ?`, obj.ID)
+		return err
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "readonly database")
+}
+
+// A read draws no version, and the refill is a write on the connection this call
+// exists to stay off. Neither belongs in its tail.
+func TestAReadTransactionSettlesNoVersions(t *testing.T) {
+	withBlockSize(t, 4)
+	ctx := context.Background()
+	store := newDiskStore(t)
+	obj := newKindObject(t, store, testGK)
+
+	// Spend the block, or the refill this guards against would no-op and the
+	// guard would pass against a tail that does settle.
+	_, ok := store.versions.take(1 << 20)
+	require.False(t, ok)
+
+	txs := store.txCount.Load()
+	published, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	reserved := seqValue(t, store)
+
+	require.NoError(t, store.withinRead(ctx, func(ctx context.Context) error {
+		_, err := store.Objects().Get(ctx, obj.ID)
+		return err
+	}))
+
+	assert.Equal(t, txs, store.txCount.Load(), "a read transaction is not a write transaction")
+	after, err := store.GetLatestResourceVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, published, after)
+	assert.Equal(t, reserved, seqValue(t, store), "the tail must not draw a block")
+}
+
+// withinRead's two error paths: fn's own, and a frame a sibling goroutine left
+// open, which is refused for the same reason Within refuses it.
+func TestAReadTransactionRefusesToCommitBadly(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("fn's error is returned", func(t *testing.T) {
+		store := newDiskStore(t)
+		boom := errors.New("boom")
+		assert.ErrorIs(t, store.withinRead(ctx, func(context.Context) error { return boom }), boom)
+	})
+
+	t.Run("an open sibling frame is refused", func(t *testing.T) {
+		store := newDiskStore(t)
+		entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+
+		err := store.withinRead(ctx, func(readCtx context.Context) error {
+			go func() {
+				defer close(done)
+				// Errors here are the point, not a failure of it: this frame
+				// outlives its transaction.
+				_ = store.Within(readCtx, func(nested context.Context) error {
+					close(entered)
+					<-release
+					return errors.New("too late to matter")
+				})
+			}()
+			<-entered
+			return nil // returns while the child's frame is still open
+		})
+
+		close(release)
+		<-done
+		assert.ErrorIs(t, err, beehive.ErrConcurrentNestedTx)
+	})
+}
