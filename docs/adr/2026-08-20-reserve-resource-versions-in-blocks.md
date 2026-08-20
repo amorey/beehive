@@ -39,6 +39,16 @@ tail of the outermost `Within`, after `tx.Commit()` has returned the connection.
 Its failure is swallowed: the commit has already landed, so it cannot be reported,
 and the next draw raises it where a caller can act.
 
+**A reservation that lands late is burned.** `settleVersions` runs after `Commit`
+has released the connection, so two committing goroutines can both find the block
+spent and both draw; a fallback draw inside a transaction can also land between a
+refill's draw and its install. The block installed last is therefore not always the
+block drawn last, and applying a stale one would hand out a version below one
+already taken. `reserve` discards any block starting below `next`, which is the
+whole of the fix: uniqueness was never at risk — no two reservations overlap —
+only order. Serializing the draws would additionally save the redundant statement
+when two collide, and is not worth a second lock for something this rare.
+
 **Versions are unique and increasing, never contiguous.** Every cursor in the
 system compares `>`, so a crash or a rollback burning the rest of a block costs
 nothing. This is what lets the reservation be coarse, and what lets a guarded

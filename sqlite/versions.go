@@ -72,9 +72,17 @@ func (v *versions) latest() int64 {
 	return v.published
 }
 
-// reserve claims the block a draw of n ending at hi covers.
+// reserve claims the block a draw of n ending at hi covers, unless the allocator
+// has already moved past it. next never decreases: two refills can be in flight at
+// once, and a fallback draw can land between a refill's draw and its install, so
+// the block installed last is not the block drawn last. A stale one is burned
+// rather than applied — it would hand out a version below one already taken.
 func (v *versions) reserve(hi int64, n int) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.next, v.end = hi-int64(n)+1, hi+1
+	lo := hi - int64(n) + 1
+	if lo < v.next {
+		return
+	}
+	v.next, v.end = lo, hi+1
 }

@@ -21,8 +21,10 @@ import (
 	"go/ast"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"testing"
 
+	storeapi "github.com/amorey/beehive/internal/storeapi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -71,6 +73,75 @@ func TestVersionBlockCoversWhatFits(t *testing.T) {
 		v.settle()
 		assert.Equal(t, int64(2), v.latest())
 	})
+}
+
+// A reservation that lands after the allocator has moved past it is discarded.
+// Two refills can be in flight at once — and a fallback draw can land between a
+// refill's draw and its install — so the block installed last is not the block
+// drawn last.
+func TestAStaleReservationIsDiscarded(t *testing.T) {
+	t.Run("a later refill installed first", func(t *testing.T) {
+		var v versions
+		v.reserve(3072, 1024) // the higher block, installed first
+		hi, ok := v.take(1)
+		require.True(t, ok)
+
+		v.reserve(2048, 1024) // the lower block, drawn first, landing late
+		next, ok := v.take(1)
+		require.True(t, ok)
+		assert.Greater(t, next, hi, "a version must never be handed out below one already taken")
+	})
+
+	t.Run("a fallback draw landed first", func(t *testing.T) {
+		var v versions
+		v.record(2049) // a fallback draw took the counter past the pending block
+
+		v.reserve(2048, 1024)
+		_, ok := v.take(1)
+		assert.False(t, ok, "the stale block must not resurrect versions below the fallback")
+	})
+}
+
+// End to end, with a block small enough that most writes refill. Not the guard for
+// the reordering above — the window between a refill's draw and its install is too
+// narrow to hit on demand, and removing the guard does not fail this. It catches a
+// duplicate or a backwards version from any cause. On disk and under -race,
+// because OpenMemory's single connection hides the overlap.
+func TestConcurrentWritersNeverGoBackwards(t *testing.T) {
+	withBlockSize(t, 2)
+	ctx := context.Background()
+	store := newDiskStore(t)
+
+	const writers, each = 8, 20
+	objs := make([]*storeapi.RawObject, writers)
+	for i := range objs {
+		objs[i] = newKindObject(t, store, testGK)
+	}
+
+	var wg sync.WaitGroup
+	for w := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range each {
+				_, err := store.Objects().UpdateStatus(ctx, testGK, objs[w].ID, fmt.Appendf(nil, `{"n":%d}`, i), 0)
+				assert.NoError(t, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	entries, _, err := store.ObjectWrites().ListSinceAll(ctx, 0, writers*each*2)
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+	seen := make(map[int64]bool, len(entries))
+	var last int64
+	for _, e := range entries {
+		assert.False(t, seen[e.ResourceVersion], "version %d handed out twice", e.ResourceVersion)
+		seen[e.ResourceVersion] = true
+		assert.Greater(t, e.ResourceVersion, last, "the write log must not go backwards")
+		last = e.ResourceVersion
+	}
 }
 
 // withBlockSize sets the reservation size for one test.
