@@ -459,3 +459,69 @@ func benchResidencyToll(b *testing.B, resident int, prep bool) {
 		require.NoError(b, rows.Close())
 	}
 }
+
+// The two ends of the JSON binding: the object listing at the batch sizes the
+// watch tail runs at, and the one converted read that traded a plan for a
+// preparation.
+func BenchmarkListByIDs(b *testing.B) {
+	for _, batch := range []int{1, 64} {
+		b.Run(fmt.Sprintf("batch=%d", batch), func(b *testing.B) { benchListByIDs(b, batch) })
+	}
+}
+
+func benchListByIDs(b *testing.B, batch int) {
+	ctx := context.Background()
+
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	ids := make([]storeapi.ObjectID, 0, batch)
+	for i := range 1000 {
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
+			Name: fmt.Sprintf("bench-%d", i),
+			Spec: []byte(`{"a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`),
+		})
+		require.NoError(b, err)
+		if len(ids) < batch {
+			ids = append(ids, obj.ID)
+		}
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		out, err := store.Objects().ListByIDs(ctx, testGK, ids)
+		require.NoError(b, err)
+		require.Len(b, out, batch)
+	}
+}
+
+// One id, which is what a client delete passes: the case whose rendered form
+// folded into an equality the index could sort on.
+func BenchmarkUnblockedTargets(b *testing.B) {
+	ctx := context.Background()
+
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	source, err := store.Objects().Create(ctx, testGK,
+		beehive.ObjectsCreateInput{Name: "source", Spec: []byte(`{}`)})
+	require.NoError(b, err)
+	for i := range 8 {
+		target, err := store.Objects().Create(ctx, testGK,
+			beehive.ObjectsCreateInput{Name: fmt.Sprintf("target-%d", i), Spec: []byte(`{}`)})
+		require.NoError(b, err)
+		_, err = store.Edges().Add(ctx, source.ID, target.ID, storeapi.RelationDependsOn)
+		require.NoError(b, err)
+		_, err = store.DeletionRequests().Create(ctx, testGK, target.ID)
+		require.NoError(b, err)
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		out, err := store.unblockedTargets(ctx, []storeapi.ObjectID{source.ID})
+		require.NoError(b, err)
+		require.Len(b, out, 8)
+	}
+}
