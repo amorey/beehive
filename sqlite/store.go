@@ -2419,9 +2419,9 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, stmt stmtID, whereArg
 	return id, true, nil
 }
 
-// markChunkSize bounds the ids bound per batched deletion mark: a measured
-// optimum, and the mark still renders a tuple per id. A var so tests can shrink
-// it. See docs/adr/2026-07-30-store-write-shapes.md.
+// markChunkSize bounds the ids per batched deletion mark: a measured optimum for
+// the write, never a parameter ceiling. A var so tests can shrink it.
+// See docs/adr/2026-07-30-store-write-shapes.md.
 var markChunkSize = 128
 
 // markManyForDeletion is markForDeletion over a set: it stamps every id whose

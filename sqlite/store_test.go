@@ -9151,13 +9151,12 @@ func TestNoWriteBypassesConn(t *testing.T) {
 		takesConn[fn] = true
 	}
 	// Functions that name a write without issuing it: helpers handed a dbtx by a
-	// caller that took one from conn, callers that hand a statement id to a helper
-	// that does, and the two builders that only return SQL.
+	// caller that took one from conn, and callers that hand a statement id to a
+	// helper that does.
 	for _, fn := range []string{
-		"appendWriteLogUpdates", "sqliteStore.bumpObject",
+		"sqliteStore.bumpObject",
 		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
 		"sqliteEvents.Sweep", "sqliteStore.trimEventsToCap",
-		"reconcileOwedSweepQuery", // builds a string, executes nothing
 	} {
 		takesConn[fn] = true
 	}
@@ -9618,10 +9617,9 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 		"SQL inside a function must be rendered from a runtime count; everything else is a field")
 }
 
-// renderedSQLSites is the twelve functions holding SQL whose text varies with
-// data. Each
-// renders an IN list, a VALUES tuple set or an optional predicate, so one
-// statement per arity would fill the table with single-use entries.
+// renderedSQLSites is the functions still holding SQL whose text varies with
+// data: a VALUES tuple set and an assembled WHERE, so one statement per arity or
+// per predicate combination would fill the table with single-use entries.
 var renderedSQLSites = []string{
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
