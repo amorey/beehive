@@ -463,11 +463,14 @@ func claimStore(bh *Beehive) error {
 	return nil
 }
 
-// releaseStore drops bh's claim.
+// releaseStore drops bh's claim, and only bh's: a Beehive that never started
+// still reaches this, and a bare delete would evict a running one.
 func releaseStore(bh *Beehive) {
 	runningStores.mu.Lock()
 	defer runningStores.mu.Unlock()
-	delete(runningStores.m, bh.store)
+	if runningStores.m[bh.store] == bh {
+		delete(runningStores.m, bh.store)
+	}
 }
 
 // New creates a control plane backed by store s. Register controllers on the

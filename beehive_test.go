@@ -780,3 +780,21 @@ func TestStartAbortReleasesTheStore(t *testing.T) {
 	require.NoError(t, err, "the aborted start released the store")
 	assert.NoError(t, stop(context.Background()))
 }
+
+// A Beehive releases its own claim and nobody else's. A never-started one
+// reaches the release — running is false, so it skips the drain and falls
+// through — and must leave a running Beehive's registration alone.
+func TestStopLeavesAnotherBeehivesRegistration(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	running := newTestBeehive(t, store)
+	stop, err := running.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(ctx)) })
+
+	require.NoError(t, newTestBeehive(t, store).stop(ctx))
+
+	_, err = newTestBeehive(t, store).Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse, "the never-started stop evicted a live claim")
+}
