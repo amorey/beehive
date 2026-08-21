@@ -44,14 +44,6 @@ writer's set is filled in `open`, before the version seed draws through it; the
 reader's once `Open` has assigned a real read pool, since a statement prepared
 before that binds to the writer. `OpenMemory` aliases both to one pool.
 
-**`open` then warms the reader's other connections.** `PrepareContext` compiles
-on the connection it grabs and records it, so the rest would compile at first
-use — during a process's startup pass. The warm-up holds every reader connection
-at once, because the pool otherwise hands back the one just released, and calls
-each statement with **no arguments**: the compile lands before the argument count
-is checked, and that error is not `ErrBadConn`, so nothing retries. Reads only —
-an argless write binding no placeholders would run.
-
 **Text rendered from a runtime count is not a field.** One statement per arity
 would fill the set with single-use entries, and a batch already amortises one
 preparation over every row it binds. Thirteen sites render an `IN` list, a
@@ -114,15 +106,26 @@ in `runTx`'s settle — after the commit but before `flush` latches the frame
 closed — so routing by ctx would draw on a transaction that was already over. It
 passed a pool handle explicitly before, which hid the question.
 
-**Nine `conn` calls survive for their refusal alone.** A write inside a read
-frame has to be refused before a no-op early return, which is the one thing
-`stmtFor` cannot stand in for: it is only reached when a statement is actually
-issued.
+**`refuseWriteInReadFrame` is taken for its refusal alone**, at eight sites. A
+write inside a read frame has to be refused before a no-op early return, and
+that is the one thing `stmtFor` cannot stand in for: it is only reached once a
+statement is actually issued.
 
-The cost at startup is one preparation per statement per pool plus the warm-up,
-a few milliseconds paid by a process that may run none of them, and the resident
+The cost at startup is one preparation per statement per pool, a few
+milliseconds paid by a process that may run none of them, and the resident
 compiled programs scale with statements × connections for the life of the
 process.
+
+**A warm-up cannot be written through `Conn.QueryContext`, and one was.**
+`PrepareContext` compiles on the connection it grabs, so the read pool's other
+connections compile at first use. Running the statement's *text* on each
+connection looks like it would pay that cost early, but `Conn.QueryContext`
+compiles a throwaway driver statement and finalizes it: `sql.Stmt.css` is
+appended only by `prepareOnConnLocked`, reached from `Stmt.connStmt` and
+`Tx.StmtContext` (`database/sql/sql.go:2460, 2759`). The version that shipped in
+review cost ~0.7 ms per reader connection at `Open` and prevented nothing. The
+lazy per-connection compile stands: one parse per statement per connection,
+once.
 
 ## Not done
 

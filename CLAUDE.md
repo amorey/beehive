@@ -390,9 +390,10 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   writes. A write's reader slot stays **nil** — preparing one against `query_only`
   succeeds and fails only on execution, so nil is the only representation `Open`
   can check. The writer's set is filled in `open`, before the version seed draws
-  through it; the reader's once `Open` has a read pool, and the reader's other
-  connections are then warmed argless, since preparing compiles on one connection
-  only. **Text rendered from a runtime count is not a field** — thirteen sites,
+  through it; the reader's once `Open` has a read pool. Preparing compiles on the
+  one connection it grabs, so the reader's others compile at first use — a
+  warm-up through `Conn.QueryContext` cannot change that and was removed.
+  **Text rendered from a runtime count is not a field** — thirteen sites,
   pinned by `TestOnlyRenderedSQLLivesInAFunction`, which fails on SQL left inside
   a function. Nothing new is promised about concurrency: a transaction ctx already
   belongs to one goroutine. → [ADR](docs/adr/2026-08-21-prepare-every-constant-statement.md)

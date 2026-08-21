@@ -74,7 +74,6 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	// After open: migrations run on the writer, and a reader opened first would
 	// hold a schema that does not exist yet.
 	s.readDB = sqlitemigrate.OpenReadPool(path, o.readConns)
-	s.readConns = o.readConns
 	// After readDB: a statement prepared before it binds to the writer.
 	if err := s.prepareReadStatements(context.Background()); err != nil {
 		s.Close()

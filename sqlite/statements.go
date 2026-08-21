@@ -81,7 +81,6 @@ const (
 	stmtWriteLogPage
 	stmtEventPage
 	stmtEventHorizon
-	stmtEventHorizonByCategory
 	stmtRaiseWriteLogHorizon
 	// trimEvents runs two statements over one predicate: the horizon raise, then
 	// the delete. One pair per predicate, kept adjacent so an edit cannot split
@@ -259,8 +258,9 @@ var stmtSQL = [numStmts]string{
 		  FROM events
 		 WHERE object_id = ?1 AND resource_version > ?3
 		 ORDER BY resource_version LIMIT ?4`,
-	stmtEventHorizon:           `SELECT MAX(trimmed_through) FROM events_horizon WHERE object_id = ?`,
-	stmtEventHorizonByCategory: `SELECT MAX(trimmed_through) FROM events_horizon WHERE object_id = ? AND category = ?`,
+	// The optional category rides a numbered parameter, as stmtEventPage's does.
+	stmtEventHorizon: `SELECT MAX(trimmed_through) FROM events_horizon
+		 WHERE object_id = ?1 AND (?2 IS NULL OR category = ?2)`,
 	stmtRaiseWriteLogHorizon: `
 			INSERT INTO object_writes_horizon ("group", kind, trimmed_through)
 			VALUES (?, ?, ?)
@@ -413,23 +413,68 @@ type stmtSet [numStmts]*sql.Stmt
 // connection while one is live, else the pool the statement was prepared on. A
 // nil slot is a routing bug and is reported here, not at execution.
 func (s *sqliteStore) stmtFor(ctx context.Context, id stmtID) (*sql.Stmt, error) {
-	s.stmtUses.Add(1)
 	st := liveTx(ctx)
 	switch {
+	case st == nil && stmtWrites[id]:
+		return bindStmt(ctx, st, id, s.writeStmts[id])
 	case st == nil:
-		if stmtWrites[id] {
-			return s.writeStmts[id], nil
-		}
-		return s.readStmts[id], nil
+		return bindStmt(ctx, st, id, s.readStmts[id])
 	case st.readOnly:
-		// As conn does, and for the same reason: refused before any statement runs.
+		// Refused before any statement runs, as conn does and for the same reason.
 		if stmtWrites[id] {
 			return nil, errWroteInReadTx
 		}
-		return st.tx.StmtContext(ctx, s.readStmts[id]), nil
+		return bindStmt(ctx, st, id, s.readStmts[id])
 	default:
-		return st.tx.StmtContext(ctx, s.writeStmts[id]), nil
+		return bindStmt(ctx, st, id, s.writeStmts[id])
 	}
+}
+
+// exec, query and queryRow issue id on the connection ctx selects. They are the
+// shapes every call site wants; stmtFor is for the few that need the statement
+// itself, to hoist it out of a loop.
+func (s *sqliteStore) exec(ctx context.Context, id stmtID, args ...any) (sql.Result, error) {
+	ps, err := s.stmtFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return ps.ExecContext(ctx, args...)
+}
+
+func (s *sqliteStore) query(ctx context.Context, id stmtID, args ...any) (*sql.Rows, error) {
+	ps, err := s.stmtFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return ps.QueryContext(ctx, args...)
+}
+
+// queryRow returns a scanner rather than (*sql.Row, error), so a routing failure
+// surfaces at Scan exactly as a query failure already does.
+func (s *sqliteStore) queryRow(ctx context.Context, id stmtID, args ...any) scanner {
+	ps, err := s.stmtFor(ctx, id)
+	if err != nil {
+		return errScanner{err}
+	}
+	return ps.QueryRowContext(ctx, args...)
+}
+
+// errScanner carries a routing failure to the Scan that was going to happen.
+type errScanner struct{ err error }
+
+func (e errScanner) Scan(...any) error { return e.err }
+
+// bindStmt binds ps to st's connection, or hands back the pool's own where there
+// is no transaction. A nil slot means the id reached a pool that did not prepare
+// it; reported here rather than dereferenced at the call site.
+func bindStmt(ctx context.Context, st *txState, id stmtID, ps *sql.Stmt) (*sql.Stmt, error) {
+	if ps == nil {
+		return nil, fmt.Errorf("beehive/sqlite: statement %d is not prepared on this pool", id)
+	}
+	if st == nil {
+		return ps, nil
+	}
+	return st.tx.StmtContext(ctx, ps), nil
 }
 
 // prepareWriteStatements fills the writer's set, reads included: a read issued
@@ -463,48 +508,6 @@ func (s *sqliteStore) prepareReadStatements(ctx context.Context) error {
 		if s.readStmts[id], err = s.readDB.PrepareContext(ctx, stmtSQL[id]); err != nil {
 			return fmt.Errorf("prepare %d on the reader: %w", id, err)
 		}
-	}
-	return s.warmReadStatements(ctx)
-}
-
-// warmReadStatements compiles every read statement on the reader's other
-// connections: PrepareContext compiled each on one already, and the rest compile
-// at first use otherwise. The writer is one connection, so it is skipped.
-//
-// Every connection is held until the last is out, or the pool hands back the one
-// just released and a single connection is warmed N times. The count comes from
-// readConns: an exhausted pool blocks in Conn rather than reporting itself full.
-//
-// Arguments are not passed. The statement compiles before the argument count is
-// checked, and that error is not ErrBadConn, so nothing retries — which is what
-// keeps this from needing an argument list per statement. Reads only: an argless
-// write binding no placeholders would run.
-func (s *sqliteStore) warmReadStatements(ctx context.Context) error {
-	if s.readDB == s.db {
-		return nil
-	}
-	held := make([]*sql.Conn, 0, s.readConns)
-	defer func() {
-		for _, c := range held {
-			c.Close()
-		}
-	}()
-	for range s.readConns {
-		conn, err := s.readDB.Conn(ctx)
-		if err != nil {
-			return fmt.Errorf("warm the read pool: %w", err)
-		}
-		held = append(held, conn)
-		for id := stmtID(0); id < numStmts; id++ {
-			if stmtWrites[id] {
-				continue
-			}
-			// The bind fails; the compile it is preceded by is the point.
-			if rows, err := conn.QueryContext(ctx, stmtSQL[id]); err == nil {
-				rows.Close()
-			}
-		}
-		s.stmtWarmed++
 	}
 	return nil
 }
