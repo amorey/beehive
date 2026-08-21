@@ -832,13 +832,10 @@ type nonComparableStore struct {
 
 // The registry keys on the Store, so a non-comparable one would panic on the
 // lookup. Refusing says which store and why; panicking says neither.
-func TestStartRefusesANonComparableStore(t *testing.T) {
-	bh := newTestBeehive(t, nonComparableStore{Store: &fakeStore{}})
+func TestNewRefusesANonComparableStore(t *testing.T) {
+	_, err := New(nonComparableStore{Store: &fakeStore{}})
+	require.ErrorContains(t, err, "is not comparable")
 
-	_, err := bh.Start(context.Background())
-	require.ErrorContains(t, err, "cannot be compared")
-
-	// stop reaches the release whether or not the start took, so it meets the
-	// same key.
-	assert.NoError(t, bh.stop(context.Background()))
+	_, err = New(nil)
+	require.ErrorContains(t, err, "is not comparable")
 }

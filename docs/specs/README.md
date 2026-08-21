@@ -16,7 +16,7 @@ work we have decided to do.
 
 ## In flight
 
-Seventeen. Sixteen came from one audit of what the
+Sixteen. Thirteen came from one audit of what the
 [sole-writer constraint](../adr/2026-08-05-one-process-one-beehive-sole-writer.md)
 buys and the code does not yet spend; three follow on from the JSON id lists.
 Each is one PR. They are grouped by what they have in common, not by the order they must land in; the dependencies each
@@ -38,7 +38,7 @@ changed. One shared mechanism, then five small gates.
    and the owed pass as its first consumer.
 4. [Gate the stale-dependents pass](2026-08-20-gate-the-stale-dependents-pass.md)
 5. [The tail answers its floor tick from memory](2026-08-20-the-tail-answers-its-floor-tick-from-memory.md)
-    — superseded by 14; do one or the other.
+    — superseded by 13; do one or the other.
 6. [Hold the deletion-pending set in memory](2026-08-20-hold-the-deletion-pending-set-in-memory.md)
 7. [Gate the owed-count reclaim](2026-08-20-gate-the-owed-count-reclaim.md) — the
     only write an idle beehive makes.
@@ -55,20 +55,20 @@ now enforced within the process, and keeping a second process off the database i
 the embedder's — see
 [the sole-writer ADR](../adr/2026-08-05-one-process-one-beehive-sole-writer.md).
 
-11. [A reverse dependency index](2026-08-20-a-reverse-dependency-index.md)
-12. [A repeat AddDependency writes nothing](2026-08-20-a-repeat-add-dependency-writes-nothing.md)
-13. [Cache the latest event run](2026-08-20-cache-the-latest-event-run.md)
+10. [A reverse dependency index](2026-08-20-a-reverse-dependency-index.md)
+11. [A repeat AddDependency writes nothing](2026-08-20-a-repeat-add-dependency-writes-nothing.md)
+12. [Cache the latest event run](2026-08-20-cache-the-latest-event-run.md)
 
 **A commit publishes what it wrote.** The largest structural change, and the one
 that makes the steady state store-free.
 
-14. [A commit signal carries its writes](2026-08-20-a-commit-signal-carries-its-writes.md)
-15. [An event signal carries its run](2026-08-20-an-event-signal-carries-its-run.md)
-16. [The waker wakes from memory](2026-08-20-the-waker-wakes-from-memory.md)
+13. [A commit signal carries its writes](2026-08-20-a-commit-signal-carries-its-writes.md)
+14. [An event signal carries its run](2026-08-20-an-event-signal-carries-its-run.md)
+15. [The waker wakes from memory](2026-08-20-the-waker-wakes-from-memory.md)
 
 **Cleanup.**
 
-17. [Collect without a transaction it does not need](2026-08-20-collect-without-a-transaction-it-does-not-need.md)
+16. [Collect without a transaction it does not need](2026-08-20-collect-without-a-transaction-it-does-not-need.md)
 
 Three things the audit found and deliberately left without a spec: a name-to-id
 map, an object row cache, and dropping the conditions read from a spec write's

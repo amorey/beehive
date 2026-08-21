@@ -97,8 +97,8 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
-	// path is the absolute path this store holds in openPaths, empty for a
-	// memory store, which has no file to collide on.
+	// path is the claim this store holds in openPaths, empty once released and
+	// for a memory store, which has no file to collide on.
 	path string
 
 	// readDB serves reads that are not inside a transaction. Aliased to db where
@@ -126,12 +126,9 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
-	// Deferred, so a failed close still releases the path — but not before the
-	// closes, or a concurrent Open could begin migrating while these pools are
-	// still open.
-	if s.path != "" {
-		defer releasePath(s.path, s)
-	}
+	// Deferred, so a failed close still releases — but not before the closes, or
+	// a concurrent Open could begin migrating over pools still shutting down.
+	defer s.releasePath()
 	// Readers first: they hold snapshots the writer's checkpoint waits on. The
 	// writer closes whatever happened above it, so a failed reader cannot leak it.
 	// Statements first: closing them frees the driver's compiled programs.
@@ -140,6 +137,16 @@ func (s *sqliteStore) Close() error {
 		err = errors.Join(err, s.readDB.Close())
 	}
 	return errors.Join(err, s.db.Close())
+}
+
+// releasePath drops this store's claim. Clearing path is what makes a second
+// Close a no-op rather than a release of whatever reopened the file.
+func (s *sqliteStore) releasePath() {
+	if s.path == "" {
+		return
+	}
+	dropPath(s.path)
+	s.path = ""
 }
 
 // Drain floor: release only past both an absolute size and a share of the file.

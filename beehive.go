@@ -212,7 +212,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 
 	// Before the first store read, and returned bare: abort frames a start that
 	// began work, and this one never did.
-	if err := claimStore(bh); err != nil {
+	if err := bh.claimStore(); err != nil {
 		return nil, err
 	}
 
@@ -227,7 +227,7 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		cancel()
 		// bh.state is not set here, so the caller may retry — which needs the
 		// store back.
-		releaseStore(bh)
+		bh.releaseStore()
 		return fmt.Errorf("beehive: start aborted: %w", err)
 	}
 	if err := startCtx.Err(); err != nil {
@@ -430,17 +430,17 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// allows: the racing send either publishes or answers ErrClosed, never both
 	// and never partially. Which one wins is unspecified and nothing here needs
 	// it pinned, since every stream is ending.
-	// After the drain, or a second Start could take the store while these loops
-	// are still running. A blown deadline releases anyway — bh.cancel has run, so
-	// the loops are ending — but that is the one case where the sole-writer
-	// guarantee lapses, so it is announced.
+	bh.kindWriteHub.Close()
+	bh.eventWriteHub.Close()
+
+	// Last, so nothing this Beehive owns is still live when another may claim
+	// the store. A blown deadline releases anyway — bh.cancel has run, so the
+	// loops are ending — and announces itself, being the one case where the
+	// sole-writer guarantee lapses.
 	if drainErr != nil {
 		bh.log().Warn("store released before its loops drained", "err", drainErr)
 	}
-	releaseStore(bh)
-
-	bh.kindWriteHub.Close()
-	bh.eventWriteHub.Close()
+	bh.releaseStore()
 
 	// The watch tailers are not counted in wg: each ends with its own last
 	// subscriber, or with the hub close above. WatchSchedule streams
@@ -457,17 +457,13 @@ var runningStores struct {
 	m  map[Store]*Beehive
 }
 
-// claimStore reserves bh.store for bh.
-func claimStore(bh *Beehive) error {
-	// Before the lookup: a non-comparable Store panics as a map key, and a panic
-	// names neither the store nor the reason.
-	if !reflect.TypeOf(bh.store).Comparable() {
-		return fmt.Errorf("beehive: store %T cannot be compared, so it cannot be tracked as the store of a running Beehive", bh.store)
-	}
+// claimStore reserves bh.store for bh. New rejects a store that cannot key the
+// map, so the lookup here cannot panic.
+func (bh *Beehive) claimStore() error {
 	runningStores.mu.Lock()
 	defer runningStores.mu.Unlock()
-	if held, running := runningStores.m[bh.store]; running {
-		return fmt.Errorf("%w (running %p)", ErrStoreInUse, held)
+	if _, running := runningStores.m[bh.store]; running {
+		return ErrStoreInUse
 	}
 	if runningStores.m == nil {
 		runningStores.m = make(map[Store]*Beehive)
@@ -476,13 +472,9 @@ func claimStore(bh *Beehive) error {
 	return nil
 }
 
-// releaseStore drops bh's claim, and only bh's: a Beehive that never started
-// still reaches this, and a bare delete would evict a running one. A store
-// claimStore refused is not in the map and never keys it.
-func releaseStore(bh *Beehive) {
-	if !reflect.TypeOf(bh.store).Comparable() {
-		return
-	}
+// releaseStore drops bh's claim. Identity, not presence: a Beehive that never
+// started also reaches this, and must not evict a running one.
+func (bh *Beehive) releaseStore() {
 	runningStores.mu.Lock()
 	defer runningStores.mu.Unlock()
 	if runningStores.m[bh.store] == bh {
@@ -493,6 +485,11 @@ func releaseStore(bh *Beehive) {
 // New creates a control plane backed by store s. Register controllers on the
 // returned Beehive before calling Start.
 func New(s Store, opts ...Option) (*Beehive, error) {
+	// Here rather than at Start: a store that cannot be a map key cannot be
+	// tracked as a running one, and a map index would panic rather than say so.
+	if t := reflect.TypeOf(s); t == nil || !t.Comparable() {
+		return nil, fmt.Errorf("beehive: store %T is not comparable, so it cannot be tracked as a running store", s)
+	}
 	bh := &Beehive{
 		store:                   s,
 		startupFullPass:         defaultStartupFullPass,
