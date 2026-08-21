@@ -25,6 +25,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -325,7 +326,21 @@ type (
 type fakeStore struct {
 	mu     sync.Mutex
 	closed bool
+	id     int64
 }
+
+// Identity is per value, since two fakeStores are two databases. Lazy so the
+// zero value works: every fixture builds one with &fakeStore{}.
+func (s *fakeStore) Identity() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.id == 0 {
+		s.id = fakeStoreIDs.Add(1)
+	}
+	return "fake:" + strconv.FormatInt(s.id, 10)
+}
+
+var fakeStoreIDs atomic.Int64
 
 func (s *fakeStore) Close() error {
 	s.mu.Lock()

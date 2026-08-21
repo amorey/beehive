@@ -409,6 +409,10 @@ type Store interface {
 	// Events is the per-object event log, aggregated into runs.
 	Events() Events
 
+	// Identity names the database behind this store, so two stores over one
+	// database report one string. Stable for the store's lifetime.
+	Identity() string
+
 	// ObjectWrites is the append-only object write log.
 	ObjectWrites() ObjectWrites
 

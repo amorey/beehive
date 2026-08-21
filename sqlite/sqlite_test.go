@@ -217,3 +217,24 @@ func TestOpenMemoryStoresDoNotCollide(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, second.Close()) })
 }
+
+// A disk store is named by its file and a memory store by a token, since every
+// file::memory: is a database of its own. Two stores over one database report
+// one identity, which is what the control plane keys its claim on.
+func TestIdentityNamesTheDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+	store, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+	assert.Equal(t, path, store.Identity(), "t.TempDir is absolute already")
+
+	first, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, first.Close()) })
+	second, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, second.Close()) })
+
+	assert.NotEqual(t, first.Identity(), second.Identity())
+	assert.NotEmpty(t, first.Identity())
+}

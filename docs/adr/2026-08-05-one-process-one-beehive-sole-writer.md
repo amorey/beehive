@@ -73,10 +73,15 @@ generation bump, `reconcile_owed`, `dependency_watermarks.reconciled_against`,
 the write log. The constraint is on *concurrent* access, not on succession.
 
 **Enforcement is split by what beehive can see.** Within the process it is
-checked: `Start` claims its store and a second `Beehive` over it is
+checked: `Start` claims its store's database and a second `Beehive` over it is
 `ErrStoreInUse`; `sqlite.Open` claims its path and a second open is
-`ErrAlreadyOpen`. Both are registries keyed on the store and on the path — a map
-and a mutex, no lock file and nothing durable.
+`ErrAlreadyOpen`. Both are `internal/claim` sets — a map and a mutex, no lock
+file and nothing durable.
+
+Both key on `Store.Identity` — the database's absolute path, or a token for a
+memory store, whose `file::memory:` genuinely is a database of its own. The
+identity member is what the enforcement rests on, and it is why a decorator
+wrapping a store claims what it wraps rather than itself.
 
 Across processes it stays documented, and the embedder arranges it. Any lock
 beehive could take rests on `fcntl`, which needs a working lock daemon over NFS

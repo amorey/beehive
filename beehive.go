@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"reflect"
 	"sync"
 	"time"
 
@@ -177,8 +176,8 @@ type Beehive struct {
 	tailers map[GroupKind]*objectTailer
 
 	state beehiveState
-	// claimed records that this Beehive holds runningStores[store], so a release
-	// drops its own claim and never a successor's.
+	// claimed records that this Beehive holds its store's claim, so a release
+	// drops its own and never a successor's.
 	claimed bool
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
@@ -453,15 +452,16 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	return drainErr
 }
 
-// runningStores is the stores with a running Beehive, so one store has one
-// control plane. Only this process is covered: isolating the process from
-// another is the embedder's, and README.md says so. New rejects a store that
-// cannot key it.
-var runningStores claim.Set[Store]
+// beehiveClaims is the databases with a running Beehive, so one database has
+// one control plane. Keyed on Store.Identity rather than the store value, so a
+// decorator wrapping a store claims what it wraps. Only this process is
+// covered: isolating the process from another is the embedder's, and README.md
+// says so.
+var beehiveClaims claim.Set[string]
 
-// claimStore reserves bh.store for bh.
+// claimStore reserves bh.store's database for bh.
 func (bh *Beehive) claimStore() error {
-	if !runningStores.Take(bh.store) {
+	if !beehiveClaims.Take(bh.store.Identity()) {
 		return ErrStoreInUse
 	}
 	bh.claimed = true
@@ -475,17 +475,12 @@ func (bh *Beehive) releaseStore() {
 		return
 	}
 	bh.claimed = false
-	runningStores.Drop(bh.store)
+	beehiveClaims.Drop(bh.store.Identity())
 }
 
 // New creates a control plane backed by store s. Register controllers on the
 // returned Beehive before calling Start.
 func New(s Store, opts ...Option) (*Beehive, error) {
-	// Here rather than at Start: a store that cannot be a map key cannot be
-	// tracked as a running one, and a map index would panic rather than say so.
-	if t := reflect.TypeOf(s); t == nil || !t.Comparable() {
-		return nil, fmt.Errorf("beehive: store %T is not comparable, so it cannot be tracked as a running store", s)
-	}
 	bh := &Beehive{
 		store:                   s,
 		startupFullPass:         defaultStartupFullPass,

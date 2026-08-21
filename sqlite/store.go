@@ -97,9 +97,14 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
-	// path is the claim this store holds in openPaths, empty once released and
-	// for a memory store, which has no file to collide on.
-	path string
+	// identity names the database: the absolute path, or a token for a memory
+	// store, whose file::memory: genuinely is a database of its own.
+	identity string
+
+	// claimed records that this store holds storeClaims[identity], so a release
+	// drops its own claim and never a successor's. False for a memory store,
+	// which claims nothing.
+	claimed bool
 
 	// readDB serves reads that are not inside a transaction. Aliased to db where
 	// the database cannot be opened twice (see OpenMemory).
@@ -139,15 +144,18 @@ func (s *sqliteStore) Close() error {
 	return errors.Join(err, s.db.Close())
 }
 
-// releasePath drops this store's claim. Clearing path is what makes a second
-// Close a no-op rather than a release of whatever reopened the file.
+// releasePath drops this store's claim, and only its own: a second Close would
+// otherwise release whatever reopened the file.
 func (s *sqliteStore) releasePath() {
-	if s.path == "" {
+	if !s.claimed {
 		return
 	}
-	openPaths.Drop(s.path)
-	s.path = ""
+	s.claimed = false
+	storeClaims.Drop(s.identity)
 }
+
+// Identity is the absolute path, or a token for a memory store.
+func (s *sqliteStore) Identity() string { return s.identity }
 
 // Drain floor: release only past both an absolute size and a share of the file.
 // Free pages are what the next inserts would have reused, so draining a small

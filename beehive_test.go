@@ -824,18 +824,18 @@ func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
 	assert.NoError(t, stop2(context.Background()))
 }
 
-// nonComparableStore is a Store whose dynamic value cannot be a map key.
-type nonComparableStore struct {
-	Store
-	_ []int
-}
+// A decorator reports what it wraps, so two beehives over one store through two
+// wrappers meet the same claim. Keying on the store value would miss this.
+func TestStartRefusesAStoreReachedThroughADecorator(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
 
-// The registry keys on the Store, so a non-comparable one would panic on the
-// lookup. Refusing says which store and why; panicking says neither.
-func TestNewRefusesANonComparableStore(t *testing.T) {
-	_, err := New(nonComparableStore{Store: &fakeStore{}})
-	require.ErrorContains(t, err, "is not comparable")
+	first := newTestBeehive(t, &seedProbe{Store: store, mark: 500})
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(ctx)) })
 
-	_, err = New(nil)
-	require.ErrorContains(t, err, "is not comparable")
+	second := newTestBeehive(t, &seedProbe{Store: store, mark: 500})
+	_, err = second.Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse)
 }

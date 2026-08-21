@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/amorey/beehive/internal/claim"
@@ -44,9 +46,13 @@ var ErrAlreadyOpen = errors.New("beehive/sqlite: database is already open in thi
 // abs is filepath.Abs, swapped by the test that covers an unresolvable path.
 var abs = filepath.Abs
 
-// openPaths is the paths open in this process, so one process opens a database
-// once. A store records its own claim in sqliteStore.path.
-var openPaths claim.Set[string]
+// storeClaims is the databases open in this process, so one process opens a
+// database once. A store records its own claim in sqliteStore.claimed.
+var storeClaims claim.Set[string]
+
+// memoryStores numbers the memory stores, since each file::memory: is its own
+// database and so cannot share an identity with another.
+var memoryStores atomic.Int64
 
 // defaultReadConnections is a guess: one connection already keeps reads out of
 // the writers' queue, and more helps only readers that genuinely overlap.
@@ -87,7 +93,7 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 		return nil, err
 	}
 	// Before open, so the claim covers the migrations and the version seed.
-	if !openPaths.Take(full) {
+	if !storeClaims.Take(full) {
 		return nil, fmt.Errorf("%w: %s", ErrAlreadyOpen, full)
 	}
 	// The reader opens after the migrations, which run on the writer: one opened
@@ -97,10 +103,10 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	})
 	if err != nil {
 		// open's unwinds close the pool directly, so the release belongs here.
-		openPaths.Drop(full)
+		storeClaims.Drop(full)
 		return nil, err
 	}
-	s.path = full
+	s.identity, s.claimed = full, true
 	return s, nil
 }
 
@@ -123,7 +129,12 @@ func OpenMemory() (*sqliteStore, error) {
 	db.SetMaxIdleConns(1)
 	// No read pool: file::memory: is per-connection, so a second would be a
 	// different and empty database. Both statement sets are the one pool's.
-	return open(db, nil)
+	s, err := open(db, nil)
+	if err != nil {
+		return nil, err
+	}
+	s.identity = "memory:" + strconv.FormatInt(memoryStores.Add(1), 10)
+	return s, nil
 }
 
 // open builds a store on db, and on the read pool openRead returns — nil where
