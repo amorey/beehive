@@ -382,6 +382,20 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md),
   [ADR](docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md),
   [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
+- **Every statement whose text is constant is prepared at startup**, into a named
+  slot per pool (`sqlite/statements.go`). A call site names a `stmtID`, never a
+  preparation: `stmtFor` picks the pool's own statement outside a transaction and
+  `tx.StmtContext` inside one, for reads as well as writes, because a read-pool
+  statement inside a write transaction reads from before that transaction's own
+  writes. A write's reader slot stays **nil** — preparing one against `query_only`
+  succeeds and fails only on execution, so nil is the only representation `Open`
+  can check. The writer's set is filled in `open`, before the version seed draws
+  through it; the reader's once `Open` has a read pool, and the reader's other
+  connections are then warmed argless, since preparing compiles on one connection
+  only. **Text rendered from a runtime count is not a field** — thirteen sites,
+  pinned by `TestOnlyRenderedSQLLivesInAFunction`, which fails on SQL left inside
+  a function. Nothing new is promised about concurrency: a transaction ctx already
+  belongs to one goroutine. → [ADR](docs/adr/2026-08-21-prepare-every-constant-statement.md)
 - **Reads run on their own connections.** The writer is one connection; reads
   that are not inside a transaction run on a read-only pool of
   `WithReadConnections` (4 by default), so they no longer queue behind writes.
