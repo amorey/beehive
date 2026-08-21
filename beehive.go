@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"reflect"
 	"sync"
 	"time"
 
@@ -456,9 +457,13 @@ var runningStores struct {
 	m  map[Store]*Beehive
 }
 
-// claimStore reserves bh.store for bh. A non-comparable Store would panic as a
-// key; every implementation is a pointer.
+// claimStore reserves bh.store for bh.
 func claimStore(bh *Beehive) error {
+	// Before the lookup: a non-comparable Store panics as a map key, and a panic
+	// names neither the store nor the reason.
+	if !reflect.TypeOf(bh.store).Comparable() {
+		return fmt.Errorf("beehive: store %T cannot be compared, so it cannot be tracked as the store of a running Beehive", bh.store)
+	}
 	runningStores.mu.Lock()
 	defer runningStores.mu.Unlock()
 	if held, running := runningStores.m[bh.store]; running {
@@ -472,8 +477,12 @@ func claimStore(bh *Beehive) error {
 }
 
 // releaseStore drops bh's claim, and only bh's: a Beehive that never started
-// still reaches this, and a bare delete would evict a running one.
+// still reaches this, and a bare delete would evict a running one. A store
+// claimStore refused is not in the map and never keys it.
 func releaseStore(bh *Beehive) {
+	if !reflect.TypeOf(bh.store).Comparable() {
+		return
+	}
 	runningStores.mu.Lock()
 	defer runningStores.mu.Unlock()
 	if runningStores.m[bh.store] == bh {

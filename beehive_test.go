@@ -823,3 +823,22 @@ func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
 	require.NoError(t, err, "a blown deadline must not lock the store out")
 	assert.NoError(t, stop2(context.Background()))
 }
+
+// nonComparableStore is a Store whose dynamic value cannot be a map key.
+type nonComparableStore struct {
+	Store
+	_ []int
+}
+
+// The registry keys on the Store, so a non-comparable one would panic on the
+// lookup. Refusing says which store and why; panicking says neither.
+func TestStartRefusesANonComparableStore(t *testing.T) {
+	bh := newTestBeehive(t, nonComparableStore{Store: &fakeStore{}})
+
+	_, err := bh.Start(context.Background())
+	require.ErrorContains(t, err, "cannot be compared")
+
+	// stop reaches the release whether or not the start took, so it meets the
+	// same key.
+	assert.NoError(t, bh.stop(context.Background()))
+}
