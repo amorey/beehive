@@ -99,12 +99,18 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		db.Close()
 		return nil, err
 	}
-	return &sqliteStore{
+	s := &sqliteStore{
 		db: db,
 		// Aliased until a caller opens a read pool, so read never branches.
 		readDB: db,
 		// Truncated to ms to match condition timestamps: a sub-ms processStart would
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
-	}, nil
+	}
+	// Here because open holds no transaction, so the reservation cannot be rolled back.
+	if err := s.seedVersions(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
 }

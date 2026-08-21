@@ -56,6 +56,8 @@ for the mapping.
 - [Reclaim a client-only object's reconcile_owed count](2026-08-05-reclaim-a-client-only-owed-count.md)
 - [edges WITHOUT ROWID](2026-07-26-edges-without-rowid.md)
 - [auto_vacuum=INCREMENTAL, drained by the GC sweeper](2026-07-29-auto-vacuum-incremental.md)
+- [Reads get their own connections](2026-08-20-reads-get-their-own-connections.md)
+- [Resource versions are reserved in blocks](2026-08-20-reserve-resource-versions-in-blocks.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
 - [The driver cadences are configurable, because every trigger pushes at commit](2026-08-06-driver-cadences-are-configurable.md)
 - [The startup full pass may be depended on; the periodic one may not](2026-08-07-the-startup-pass-may-be-depended-on.md)

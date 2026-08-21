@@ -87,10 +87,14 @@ graph and the cursor saves nothing.
 `TestDependencies().ListStaleSinceDrivesFromTheVersionIndex` holds that.
 
 Each sweep reads a mark **before** it scans, and scans no higher. The mark comes
-from `GetLatestResourceVersion`, which reads `resource_version_seq`. It must not
-come from `ObjectWrites().MaxVersionAll`: retention lowers that value, and an idle
-store past its retention window reads 0. A mark that falls compares wrongly
-against a stored position.
+from `GetLatestResourceVersion`, which reports the highest version a committed
+write took — never a table's `MAX`. It must not come from
+`ObjectWrites().MaxVersionAll`: retention lowers that value, and an idle store past
+its retention window reads 0. A mark that falls compares wrongly against a stored
+position. It must not read `resource_version_seq` either, for the opposite reason:
+once versions are reserved in blocks that row holds the reservation's end, and a
+mark above what was handed out strands every write in the gap.
+→ [ADR](2026-08-20-reserve-resource-versions-in-blocks.md)
 
 The mark also makes a sweep finite. A store that takes writes faster than the
 caller pages would never reach a short page, so the sweep would never end and the

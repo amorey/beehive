@@ -50,7 +50,7 @@ which returns the stored row with `changed=false`.
 - **The version draw moves.** The version has to be drawn before the `UPDATE`
   that uses it, so a converged write now draws a version it does not use. That is
   a gap in the sequence, which is already allowed
-  ([blocks](2026-08-20-reserve-resource-versions-in-blocks.md)), and the write log
+  ([blocks](../adr/2026-08-20-reserve-resource-versions-in-blocks.md)), and the write log
   entry must be appended *after* the `UPDATE` reports a row — not before, or a
   converged write logs a write that never happened. This inverts the current
   order in `recordObjectWrite`, so this path cannot use it.
