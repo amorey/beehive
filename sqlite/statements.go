@@ -46,6 +46,7 @@ const (
 	// The multi-row object reads.
 	stmtListObjects
 	stmtListObjectsByIncomingEdge
+	stmtListObjectsByIDs
 
 	// The object writes.
 	stmtInsertObject
@@ -65,8 +66,11 @@ const (
 	// reconcile_owed.
 	stmtListOwedIDs
 	stmtDecrementOwed
+	stmtStampOwed
 
 	stmtLoadConditions
+	stmtConditionsByIDs
+	stmtConditionSetLoad
 	stmtDeleteCondition
 
 	stmtGetDriverCursor
@@ -79,6 +83,7 @@ const (
 	stmtWriteLogTrimmedThrough
 	stmtWriteLogKinds
 	stmtWriteLogPage
+	stmtWriteLogImages
 	stmtAppendWriteLog
 	stmtAppendWriteLogDelete
 	stmtRaiseWriteLogHorizon
@@ -107,6 +112,10 @@ const (
 	stmtEdgesListIncoming
 	stmtEdgesListOutgoing
 	stmtEdgesListOutgoingByRelation
+	// The batched edge lookups, one per direction.
+	stmtEdgesGroupIncoming
+	stmtEdgesGroupOutgoing
+	stmtUnblockedTargets
 	stmtListOwnedChildren
 	stmtEdgesHasIncoming
 	stmtEdgesDeleteFinalizingDependsOn
@@ -170,6 +179,9 @@ var stmtSQL = [numStmts]string{
 	stmtListObjectsByIncomingEdge: listObjectsSQL(`
 		 WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
 		   AND o."group" = ? AND o.kind = ?`),
+	stmtListObjectsByIDs: listObjectsSQL(`
+		 WHERE o.id IN (SELECT value FROM json_each(?))
+		   AND o."group" = ? AND o.kind = ?`),
 
 	stmtInsertObject: `
 		INSERT INTO objects
@@ -224,12 +236,32 @@ var stmtSQL = [numStmts]string{
 		UPDATE objects
 		   SET reconcile_owed = max(reconcile_owed - ?, 0)
 		 WHERE id = ? AND "group" = ? AND kind = ?`,
+	stmtStampOwed: `
+		UPDATE objects
+		   SET reconcile_owed = reconcile_owed + 1
+		 WHERE id IN (SELECT value FROM json_each(?))`,
 
 	stmtLoadConditions: `
 		SELECT ` + conditionColumns + `
 		  FROM conditions
 		 WHERE object_id = ?
 		 ORDER BY type`,
+	// Conditions().Set's kind gate and its no-op comparisons, keyed on the same
+	// object. The condition columns are NULL when the object holds none of the
+	// types; status is NOT NULL wherever a row exists, so it marks presence.
+	// transitioned_at is absent deliberately: the upsert decides it in SQL.
+	stmtConditionSetLoad: `
+		SELECT o."group", o.kind, c.type, c.status, c.reason, c.message, c.liveness, c.updated_at
+		  FROM objects o
+		  LEFT JOIN conditions c
+		         ON c.object_id = o.id
+		        AND c.type IN (SELECT value FROM json_each(?))
+		 WHERE o.id = ?`,
+	stmtConditionsByIDs: `
+		SELECT ` + conditionColumns + `
+		  FROM conditions
+		 WHERE object_id IN (SELECT value FROM json_each(?))
+		 ORDER BY object_id, type`,
 	stmtDeleteCondition: `
 		DELETE FROM conditions
 		 WHERE object_id = ? AND type = ?`,
@@ -273,6 +305,9 @@ var stmtSQL = [numStmts]string{
 		  FROM object_writes
 		 WHERE "group" = ? AND kind = ? AND resource_version > ?
 		 ORDER BY resource_version LIMIT ?`,
+	stmtWriteLogImages: `
+		SELECT resource_version, final FROM object_writes
+		 WHERE resource_version IN (SELECT value FROM json_each(?))`,
 	stmtAppendWriteLog: `
 		INSERT INTO object_writes (` + objectWritesColumns + `)
 		VALUES (?, ?, ?, ?, ?, ?)`,
@@ -347,6 +382,24 @@ var stmtSQL = [numStmts]string{
 		SELECT o.id, o."group", o.kind
 		  FROM edges r JOIN objects o ON o.id = r.to_id
 		 WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget,
+	stmtEdgesGroupIncoming: `
+		SELECT r.to_id, o.id, o."group", o.kind
+		  FROM edges r JOIN objects o ON o.id = r.from_id
+		 WHERE r.to_id IN (SELECT value FROM json_each(?)) AND r.relation = ?
+		 ORDER BY r.to_id, r.from_id`,
+	stmtEdgesGroupOutgoing: `
+		SELECT r.from_id, o.id, o."group", o.kind
+		  FROM edges r JOIN objects o ON o.id = r.to_id
+		 WHERE r.from_id IN (SELECT value FROM json_each(?)) AND r.relation = ?
+		 ORDER BY r.from_id, r.to_id`,
+	// This one sorts: its ORDER BY does not lead with the column the IN list
+	// constrains, so no index delivers it. See TestTheUnblockedTargetsReadSorts.
+	stmtUnblockedTargets: `
+		SELECT o.id, o."group", o.kind
+		  FROM edges r JOIN objects o ON o.id = r.to_id
+		 WHERE r.from_id IN (SELECT value FROM json_each(?)) AND r.relation = ?
+		   AND o.deletion_requested_at IS NOT NULL
+		   AND o.id <> r.from_id` + edgeOrderByTarget,
 	stmtListOwnedChildren: `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		  FROM edges r JOIN objects o ON o.id = r.from_id
@@ -400,8 +453,7 @@ var stmtSQL = [numStmts]string{
 		RETURNING value`,
 }
 
-// listObjectsSQL builds the shared multi-row object read. Objects().ListByIDs
-// renders its own tail and cannot be prepared, so it keeps listObjectsWhere.
+// listObjectsSQL builds the shared multi-row object read: one field per tail.
 func listObjectsSQL(tail string) string {
 	return `
 		SELECT ` + objectColumns + `
@@ -478,6 +530,7 @@ var stmtWrites = [numStmts]bool{
 
 	stmtEdgesDeleteFinalizingDependsOn: true,
 	stmtDecrementOwed:                  true,
+	stmtStampOwed:                      true,
 	stmtWatermarkSet:                   true,
 	stmtStampOwedForNewEdge:            true,
 	stmtClearWatermarkForNewEdge:       true,

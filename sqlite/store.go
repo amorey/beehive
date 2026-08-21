@@ -26,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"modernc.org/sqlite"
@@ -1092,19 +1093,8 @@ func (s sqliteObjects) ListByIncomingEdge(ctx context.Context, gk storeapi.Group
 		toID, string(relation), gk.Group, gk.Kind)
 }
 
-// listObjectsWhere is the shared multi-row object read: rows matching tail,
-// ordered by id, conditions attached. tail is a fixed internal fragment, never
-// user input; only its bound arguments come from the caller.
-func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ...any) ([]*storeapi.RawObject, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, listObjectsSQL(tail), args...)
-	if err != nil {
-		return nil, err
-	}
-	return s.attachConditionsToRows(ctx, rows)
-}
-
-// listObjects is listObjectsWhere over a prepared statement, for the callers
-// whose tail is constant.
+// listObjects is the shared multi-row object read: rows matching stmt's tail,
+// ordered by id, conditions attached.
 func (s *sqliteStore) listObjects(ctx context.Context, stmt stmtID, args ...any) ([]*storeapi.RawObject, error) {
 	ps := s.readStmt(ctx, stmt)
 	rows, err := ps.QueryContext(ctx, args...)
@@ -1159,16 +1149,7 @@ func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.Object
 // result set so the next chunk reuses that connection rather than taking
 // another from the read pool.
 func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, out map[storeapi.ObjectID][]storeapi.Condition) error {
-	args := make([]any, len(ids))
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT `+conditionColumns+` FROM conditions
-		 WHERE object_id IN (`+strings.Join(placeholders, ",")+`)
-		 ORDER BY object_id, type`, args...)
+	rows, err := s.query(ctx, stmtConditionsByIDs, jsonList(ids))
 	if err != nil {
 		return err
 	}
@@ -1229,17 +1210,11 @@ func (s sqliteReconcileOwed) Stamp(ctx context.Context, refs []storeapi.ObjectRe
 	if len(refs) == 0 {
 		return nil
 	}
-	args := make([]any, len(refs))
+	ids := make([]storeapi.ObjectID, len(refs))
 	for i, ref := range refs {
-		args[i] = ref.ID
+		ids[i] = ref.ID
 	}
-	c, err := s.conn(ctx)
-	if err != nil {
-		return err
-	}
-	_, err = c.ExecContext(ctx,
-		`UPDATE objects SET reconcile_owed = reconcile_owed + 1
-		  WHERE id IN (`+placeholders(len(refs))+`)`, args...)
+	_, err := s.exec(ctx, stmtStampOwed, jsonList(ids))
 	return err
 }
 
@@ -1457,7 +1432,9 @@ func writeLogPageCap(limit int) int { return min(limit, 1024) }
 // nothing when the page has none. op identifies them without reading the blob,
 // which is why it is in the covering index.
 func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWrite) error {
-	var deletes []any
+	// Nil until a delete turns up: a page holds none in the common case, and
+	// this runs on every page both the waker and the tailers read.
+	var deletes []int64
 	for _, w := range page {
 		if w.Op == storeapi.WriteDelete {
 			deletes = append(deletes, w.ResourceVersion)
@@ -1481,10 +1458,8 @@ func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWr
 }
 
 // readImages decodes the row images stored against the given versions.
-func (s *sqliteStore) readImages(ctx context.Context, versions []any) (map[int64]*storeapi.RawObject, error) {
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT resource_version, final FROM object_writes
-		  WHERE resource_version IN (`+placeholders(len(versions))+`)`, versions...)
+func (s *sqliteStore) readImages(ctx context.Context, versions []int64) (map[int64]*storeapi.RawObject, error) {
+	rows, err := s.query(ctx, stmtWriteLogImages, jsonList(versions))
 	if err != nil {
 		return nil, err
 	}
@@ -1808,20 +1783,7 @@ func (s *sqliteStore) attachConditions(ctx context.Context, obj *storeapi.RawObj
 	return obj, nil
 }
 
-// conditionSetLoad answers Conditions().Set's kind gate and its no-op comparisons
-// in one statement, keyed on the same object. The condition columns are NULL when
-// the object holds none of the types; status is NOT NULL wherever a row exists, so
-// it marks presence. transitioned_at is absent deliberately: the upsert decides it
-// in SQL.
-func conditionSetLoad(types int) string {
-	return `
-	SELECT o."group", o.kind, c.type, c.status, c.reason, c.message, c.liveness, c.updated_at
-	  FROM objects o
-	  LEFT JOIN conditions c ON c.object_id = o.id AND c.type IN (` + placeholders(types) + `)
-	 WHERE o.id = ?`
-}
-
-// loadForConditionSet runs conditionSetLoad over the conditions being written:
+// loadForConditionSet runs stmtConditionSetLoad over the conditions being written:
 // the scope error, then whichever of their types are stored, keyed by type.
 // Stored truth, undowngraded — see downgradeLiveness. Chunked under
 // conditionChunkSize, like the upsert it feeds.
@@ -1850,12 +1812,11 @@ func (s *sqliteStore) loadForConditionSetChunk(
 	conds []storeapi.Condition,
 	out map[string]storeapi.Condition,
 ) error {
-	args := make([]any, 0, len(conds)+1)
-	for _, cond := range conds {
-		args = append(args, cond.Type)
+	types := make([]string, len(conds))
+	for i, cond := range conds {
+		types[i] = cond.Type
 	}
-	args = append(args, id)
-	rows, err := s.read(ctx).QueryContext(ctx, conditionSetLoad(len(conds)), args...)
+	rows, err := s.query(ctx, stmtConditionSetLoad, conditionTypeList(types), id)
 	if err != nil {
 		return err
 	}
@@ -1938,6 +1899,11 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 	}
 	seen := make(map[string]bool, len(conds))
 	for _, cond := range conds {
+		// The type is a lookup key, and conditionTypeList cannot carry one that
+		// is not text.
+		if !utf8.ValidString(cond.Type) {
+			return fmt.Errorf("%w: %q", storeapi.ErrInvalidConditionType, cond.Type)
+		}
 		if seen[cond.Type] {
 			return fmt.Errorf("%w: %q", storeapi.ErrDuplicateConditionType, cond.Type)
 		}
@@ -2492,8 +2458,8 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, stmt stmtID, whereArg
 }
 
 // markChunkSize bounds the ids bound per batched deletion mark: a measured
-// optimum, not a parameter-limit ceiling like idChunkSize. A var so tests can
-// shrink it. See docs/adr/2026-07-30-store-write-shapes.md.
+// optimum, and the mark still renders a tuple per id. A var so tests can shrink
+// it. See docs/adr/2026-07-30-store-write-shapes.md.
 var markChunkSize = 128
 
 // markManyForDeletion is markForDeletion over a set: it stamps every id whose
@@ -2631,17 +2597,8 @@ func (s *sqliteStore) unblockedTargets(ctx context.Context, fromIDs []storeapi.O
 }
 
 func (s *sqliteStore) unblockedTargetsChunk(ctx context.Context, fromIDs []storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
-	args := make([]any, 0, len(fromIDs)+1)
-	for _, id := range fromIDs {
-		args = append(args, id)
-	}
-	args = append(args, string(storeapi.RelationDependsOn))
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id IN (`+placeholders(len(fromIDs))+`) AND r.relation = ?
-		  AND o.deletion_requested_at IS NOT NULL
-		  AND o.id <> r.from_id`+edgeOrderByTarget, args...)
+	rows, err := s.query(ctx, stmtUnblockedTargets,
+		jsonList(fromIDs), string(storeapi.RelationDependsOn))
 	if err != nil {
 		return nil, err
 	}
@@ -2915,22 +2872,23 @@ func (s sqliteEdges) ListIncoming(ctx context.Context, toID storeapi.ObjectID, r
 // bucketed by target id — the incoming twin of Edges().GroupOutgoingByID. It routes
 // by r.to_id and joins the source side (r.from_id).
 func (s sqliteEdges) GroupIncomingByID(ctx context.Context, toIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
-	return s.edgesByIDs(ctx, toIDs, relation, "to_id", "from_id")
+	return s.edgesByIDs(ctx, toIDs, relation, stmtEdgesGroupIncoming)
 }
 
-// idChunkSize bounds the ids bound per batched query, under SQLite's
-// SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc). A var so tests can shrink it to
-// exercise the multi-chunk merge.
+// idChunkSize bounds the ids a batched query carries. The ids are one JSON
+// parameter now, so what it bounds is the array built and the rows returned, not
+// a parameter count. A var so tests can shrink it to exercise the multi-chunk
+// merge.
 var idChunkSize = 30000
 
-// edgesByIDs is the shared batched edge lookup: edges filtered by routeCol IN
-// (ids), joined on joinCol, bucketed by routeCol. The column names are fixed
-// internal strings, never user input. Chunked under idChunkSize.
-func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
+// edgesByIDs is the shared batched edge lookup: edges filtered by stmt's route
+// column, joined on the other, bucketed by the route column stmt selects first.
+// Chunked under idChunkSize.
+func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, stmt stmtID) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
 	out := make(map[storeapi.ObjectID][]storeapi.ObjectRef, len(ids))
 	for start := 0; start < len(ids); start += idChunkSize {
 		end := min(start+idChunkSize, len(ids))
-		if err := s.edgesByIDsChunk(ctx, ids[start:end], relation, routeCol, joinCol, out); err != nil {
+		if err := s.edgesByIDsChunk(ctx, ids[start:end], relation, stmt, out); err != nil {
 			return nil, err
 		}
 	}
@@ -2940,19 +2898,8 @@ func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, r
 // edgesByIDsChunk runs one chunk, merging rows into out; it closes its result
 // set so the next chunk reuses that connection rather than taking another from
 // the read pool.
-func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
-	args := make([]any, 0, len(ids)+1)
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-	args = append(args, string(relation))
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT r.`+routeCol+`, o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.`+joinCol+`
-		WHERE r.`+routeCol+` IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
-		ORDER BY r.`+routeCol+`, r.`+joinCol, args...)
+func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, stmt stmtID, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
+	rows, err := s.query(ctx, stmt, jsonList(ids), string(relation))
 	if err != nil {
 		return err
 	}
@@ -2960,6 +2907,7 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 	for rows.Next() {
 		var route storeapi.ObjectID
 		var d storeapi.ObjectRef
+		// stmt must select the route column first — that is what buckets here.
 		// INTEGER/TEXT NOT NULL columns; the scan never fails.
 		_ = rows.Scan(&route, &d.ID, &d.Group, &d.Kind)
 		out[route] = append(out[route], d)
@@ -2991,7 +2939,7 @@ func (s sqliteEdges) ListOutgoingByRelation(ctx context.Context, fromID storeapi
 // once, bucketed by source id. It routes by r.from_id and joins the target side
 // (r.to_id).
 func (s sqliteEdges) GroupOutgoingByID(ctx context.Context, fromIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
-	return s.edgesByIDs(ctx, fromIDs, relation, "from_id", "to_id")
+	return s.edgesByIDs(ctx, fromIDs, relation, stmtEdgesGroupOutgoing)
 }
 
 // scanObjectRefs collects an (id, group, kind) SELECT into ObjectRefs, closing
@@ -3406,16 +3354,29 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	args := make([]any, 0, len(ids)+2)
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	args = append(args, gk.Group, gk.Kind)
-	return s.listObjectsWhere(ctx,
-		`WHERE o.id IN (`+placeholders(len(ids))+`) AND o."group" = ? AND o.kind = ?`, args...)
+	return s.listObjects(ctx, stmtListObjectsByIDs, jsonList(ids), gk.Group, gk.Kind)
 }
 
-// placeholders builds "?, ?, ?" for an IN list of n values.
+// jsonList marshals an IN list's ids as one JSON array, for
+// `IN (SELECT value FROM json_each(?))`. Numbers stay numbers: json_each gives a
+// JSON string TEXT affinity, which matches no INTEGER column. Integers cannot
+// fail to marshal, so the error is discarded.
+func jsonList[T ~int64](values []T) string {
+	out, _ := json.Marshal(values)
+	return string(out)
+}
+
+// conditionTypeList is jsonList for condition types, which are text and need
+// their own path: JSON cannot represent a byte sequence that is not UTF-8, and
+// json.Marshal substitutes U+FFFD instead of failing. The lookup would then miss
+// the raw bytes the upsert stored, and every Set would read the condition as
+// new. Conditions().Set refuses such a type, which is what makes this lossless.
+func conditionTypeList(types []string) string {
+	out, _ := json.Marshal(types)
+	return string(out)
+}
+
+// placeholders builds "?, ?, ?" for n values, one row of a VALUES tuple set.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }

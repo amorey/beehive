@@ -393,10 +393,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   through it; the reader's once `Open` has a read pool. Preparing compiles on the
   one connection it grabs, so the reader's others compile at first use — a
   warm-up through `Conn.QueryContext` cannot change that and was removed.
-  **Text rendered from a runtime count is not a field** — twelve functions,
-  pinned by `TestOnlyRenderedSQLLivesInAFunction`, which fails on SQL left inside
-  a function. Nothing new is promised about concurrency: a transaction ctx already
+  **Text rendered from a runtime count is not a field** — six functions, pinned
+  by `TestOnlyRenderedSQLLivesInAFunction`, which fails on SQL left inside a
+  function. Nothing new is promised about concurrency: a transaction ctx already
   belongs to one goroutine. → [ADR](docs/adr/2026-08-21-prepare-every-constant-statement.md)
+  **An id list binds as one JSON array** (`IN (SELECT value FROM json_each(?))`,
+  never a join against it), which is what took those twelve down to six: seven
+  `IN` lists became fields and got 24–64% faster. Values marshal as numbers — a
+  JSON string takes TEXT affinity and matches no INTEGER column, silently. The one
+  plan traded away is `unblockedTargets`', which sorts at every length now that a
+  list of one cannot fold into an equality; it is faster regardless.
+  → [ADR](docs/adr/2026-08-21-bind-an-id-list-as-json.md)
 - **Reads run on their own connections.** The writer is one connection; reads
   that are not inside a transaction run on a read-only pool of
   `WithReadConnections` (4 by default), so they no longer queue behind writes.
