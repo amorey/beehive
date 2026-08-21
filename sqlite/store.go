@@ -1446,10 +1446,12 @@ func (s sqliteObjects) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]st
 // lowers it, and the horizon is what says so — one statement, since the caller
 // that compares them needs both at one instant.
 func (s sqliteObjectWrites) MaxVersionAll(ctx context.Context) (int64, int64, error) {
+	ps, err := s.stmtFor(ctx, stmtWriteLogMaxVersionAll)
+	if err != nil {
+		return 0, 0, err
+	}
 	var at, trimmed int64
-	err := s.read(ctx).QueryRowContext(ctx,
-		`SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0), `+writeLogHorizonAll).
-		Scan(&at, &trimmed)
+	err = ps.QueryRowContext(ctx).Scan(&at, &trimmed)
 	return at, trimmed, err
 }
 
@@ -1467,11 +1469,11 @@ func (s sqliteObjectWrites) ListSinceAll(ctx context.Context, afterRV int64, lim
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, 0, nil
 	}
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT `+writeLogColumns+`, `+writeLogHorizonAll+`
-		  FROM object_writes
-		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
-		afterRV, limit)
+	ps, err := s.stmtFor(ctx, stmtWriteLogListSinceAll)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := ps.QueryContext(ctx, afterRV, limit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -3408,10 +3410,12 @@ func (s sqliteObjectWrites) ListSince(ctx context.Context, gk storeapi.GroupKind
 // trimmedThrough is gk's retention horizon; no row means nothing has been
 // trimmed, which is 0 rather than an error.
 func (s *sqliteStore) trimmedThrough(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
+	ps, err := s.stmtFor(ctx, stmtWriteLogTrimmedThrough)
+	if err != nil {
+		return 0, err
+	}
 	var trimmed int64
-	err := s.read(ctx).QueryRowContext(ctx, `
-		SELECT trimmed_through FROM object_writes_horizon
-		 WHERE "group" = ? AND kind = ?`, gk.Group, gk.Kind).Scan(&trimmed)
+	err = ps.QueryRowContext(ctx, gk.Group, gk.Kind).Scan(&trimmed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -3426,14 +3430,12 @@ func (s *sqliteStore) trimmedThrough(ctx context.Context, gk storeapi.GroupKind)
 func (s sqliteObjectWrites) MaxVersion(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
 	// One statement, not two: this is a watch's entire quiet-tick budget, and
 	// both halves are covering-index seeks that fold for free.
+	ps, err := s.stmtFor(ctx, stmtWriteLogMaxVersion)
+	if err != nil {
+		return 0, err
+	}
 	var at int64
-	err := s.read(ctx).QueryRowContext(ctx, `
-		SELECT max(
-			coalesce((SELECT MAX(resource_version) FROM object_writes
-			           WHERE "group" = ? AND kind = ?), 0),
-			coalesce((SELECT trimmed_through FROM object_writes_horizon
-			           WHERE "group" = ? AND kind = ?), 0))`,
-		gk.Group, gk.Kind, gk.Group, gk.Kind).Scan(&at)
+	err = ps.QueryRowContext(ctx, gk.Group, gk.Kind, gk.Group, gk.Kind).Scan(&at)
 	return at, err
 }
 
@@ -3485,8 +3487,11 @@ func (s sqliteObjectWrites) Sweep(ctx context.Context, perKind int, maxAge time.
 // only step of the count trim that is not a seek — kinds number in the handful
 // where entries number in the millions, so it is the right axis to iterate.
 func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, error) {
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT DISTINCT "group", kind FROM object_writes`)
+	ps, err := s.stmtFor(ctx, stmtWriteLogKinds)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx)
 	if err != nil {
 		return nil, err
 	}

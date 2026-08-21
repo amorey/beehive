@@ -51,6 +51,11 @@ const (
 	stmtDeleteCondition
 	stmtGetDriverCursor
 	stmtSetDriverCursor
+	stmtWriteLogMaxVersionAll
+	stmtWriteLogListSinceAll
+	stmtWriteLogMaxVersion
+	stmtWriteLogTrimmedThrough
+	stmtWriteLogKinds
 
 	numStmts
 )
@@ -106,6 +111,23 @@ var stmtSQL = [numStmts]string{
 		    ON CONFLICT(name) DO UPDATE
 		   SET cursor = excluded.cursor, updated_at = excluded.updated_at
 		 WHERE excluded.cursor > driver_cursors.cursor`,
+
+	stmtWriteLogMaxVersionAll: `SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0), ` +
+		writeLogHorizonAll,
+	stmtWriteLogListSinceAll: `
+		SELECT ` + writeLogColumns + `, ` + writeLogHorizonAll + `
+		  FROM object_writes
+		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
+	stmtWriteLogMaxVersion: `
+		SELECT max(
+			coalesce((SELECT MAX(resource_version) FROM object_writes
+			           WHERE "group" = ? AND kind = ?), 0),
+			coalesce((SELECT trimmed_through FROM object_writes_horizon
+			           WHERE "group" = ? AND kind = ?), 0))`,
+	stmtWriteLogTrimmedThrough: `
+		SELECT trimmed_through FROM object_writes_horizon
+		 WHERE "group" = ? AND kind = ?`,
+	stmtWriteLogKinds: `SELECT DISTINCT "group", kind FROM object_writes`,
 
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
