@@ -247,8 +247,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   (`internal/rategate`, 100ms) — a floor tick takes the slot the same as a wake,
   so a commit landing just after one waits out the rest of the window — and one
   drain is bounded by a page budget, so a write stream cannot make a tailer hold
-  the single connection away from the writers waking it; the first drain after a
-  quiet period is still eager.
+  the writer away from the writers waking it — its page read self-wraps in
+  `Within`, so it takes the writer even though it is a read; the first drain
+  after a quiet period is still eager.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
 - **`WatchOwnedObjects` scopes a watch to one owner's children, and reads
@@ -378,6 +379,14 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [ADR](docs/adr/2026-08-05-a-create-pushes-a-deleting-owners-collect.md),
   [ADR](docs/adr/2026-08-06-a-deletion-mark-pushes-the-target-it-unblocks.md),
   [ADR](docs/adr/2026-08-05-reclaim-a-client-only-owed-count.md)
+- **Reads run on their own connections.** The writer is one connection; reads
+  that are not inside a transaction run on a read-only pool of
+  `WithReadConnections` (4 by default), so they no longer queue behind writes.
+  `s.read(ctx)` returns the ambient transaction while it is live — that is the
+  safety property, and a read on any other ctx now returns stale committed state
+  rather than deadlocking. A grouped read still takes the writer, because the
+  five that self-wrap in `Within` have not moved.
+  → [ADR](docs/adr/2026-08-20-reads-get-their-own-connections.md)
 - **The store is `auto_vacuum=INCREMENTAL`**, set on the DSN (SQLite ignores the
   pragma on a non-empty database and inside a transaction — which a migration
   is). The sweeper drains the freelist through `Store.ReclaimSpace`, gated on a

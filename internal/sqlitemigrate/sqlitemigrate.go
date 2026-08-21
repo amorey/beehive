@@ -32,11 +32,14 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// OpenPool opens a modernc-sqlite pool at path with Beehive's PRAGMAs baked
-// into the DSN — WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys on,
-// auto_vacuum=INCREMENTAL, immediate txlock. maxConns caps the pool: 1 for a
-// writer pool, larger for a WAL reader pool. Run Apply against the result.
-// See docs/adr/2026-07-29-auto-vacuum-incremental.md.
+// OpenPool opens the writer pool at path with Beehive's PRAGMAs baked into the
+// DSN — WAL, 5s busy_timeout, synchronous=NORMAL, foreign_keys on,
+// auto_vacuum=INCREMENTAL, immediate txlock. maxConns caps the pool, and should
+// be 1: the DSN's immediate txlock means concurrent transactions collide at the
+// SQLite level rather than queueing in Go. Run Apply against the result.
+//
+// Not for readers: use OpenReadPool, which refuses writes and can begin a
+// transaction. See docs/adr/2026-07-29-auto-vacuum-incremental.md.
 func OpenPool(path string, maxConns int) *sql.DB {
 	// auto_vacuum MUST be set on the DSN, never in a migration: SQLite ignores
 	// the pragma on a non-empty database and inside a transaction, both of
@@ -52,6 +55,34 @@ func OpenPool(path string, maxConns int) *sql.DB {
 	db, _ := sql.Open("sqlite", dsn)
 	db.SetMaxOpenConns(maxConns)
 	db.SetConnMaxIdleTime(5 * time.Minute)
+	return db
+}
+
+// OpenReadPool opens a read-only pool at path, sized maxConns. Reads run here so
+// they do not queue behind writes in Go's pool, which WAL already allows.
+//
+// query_only, not mode=ro: it is enforced, and says so — a write fails with
+// "attempt to write a readonly database" rather than blocking.
+//
+// The DSN deliberately omits _txlock=immediate. BEGIN IMMEDIATE takes a write
+// lock, which query_only refuses, so inheriting it would fail every transaction
+// on this pool.
+//
+// No migrations run here: Apply targets the writer, before this pool opens.
+func OpenReadPool(path string, maxConns int) *sql.DB {
+	// No journal_mode or foreign_keys: the writer owns the journal, and foreign
+	// keys are enforced on write.
+	dsn := "file:" + path +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=query_only(true)"
+	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
+	db, _ := sql.Open("sqlite", dsn)
+	db.SetMaxOpenConns(maxConns)
+	// Idle readers are kept, not reaped. database/sql keeps two by default and
+	// OpenPool retires a connection idle for five minutes; either would have a
+	// quiet beehive drop reader connections between ticks and reopen them on the
+	// next one.
+	db.SetMaxIdleConns(maxConns)
 	return db
 }
 

@@ -412,8 +412,10 @@ type Store interface {
 
 	// Within runs fn inside a single transaction, committing on nil error and
 	// rolling back otherwise. Store calls made with the ctx passed to fn join
-	// the transaction — use that ctx for every call fn makes; any other ctx
-	// deadlocks a single-connection backend.
+	// the transaction — use that ctx for every call fn makes. What another ctx
+	// does is the implementation's to say: it may block on the transaction's
+	// connection, or read committed state and miss the transaction's own writes.
+	// Neither is an error, which is why the rule is stated rather than enforced.
 	//
 	// A nested Within is a rollback boundary: it joins the transaction, only
 	// the outermost commits, and an error from the nested fn MUST unwind that

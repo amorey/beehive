@@ -8722,3 +8722,144 @@ func TestGetObjectMetaByNameSkipsConditions(t *testing.T) {
 	_, err = store.Objects().GetMetaByName(ctx, testGK, "")
 	require.ErrorIs(t, err, beehive.ErrNotFound)
 }
+
+// newDiskStore is the split store: OpenMemory cannot open its database twice,
+// so only an on-disk store has a read pool to exercise.
+func newDiskStore(t *testing.T, opts ...Option) *sqliteStore {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"), opts...)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+	return store
+}
+
+// A read inside a live transaction runs on that transaction. On disk, because
+// a read that forgets it reads committed state — silently stale — where in
+// memory the reader is the writer and the same mistake merely deadlocks.
+func TestAReadJoinsItsTransaction(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		obj, err := store.Objects().Create(ctx, testGK, storeapi.ObjectsCreateInput{
+			Name: "written-inside", Spec: []byte(`{}`),
+		})
+		require.NoError(t, err)
+
+		got, err := store.Objects().GetMeta(ctx, obj.ID)
+		require.NoError(t, err, "the read must see the transaction's own write")
+		assert.Equal(t, obj.ID, got.ID)
+		return nil
+	}))
+}
+
+// A ctx outlives its transaction, so a read on a closed frame degrades to the
+// pool. Returning the dead transaction yields sql.ErrTxDone on every hook.
+func TestAReadOnAClosedFrameUsesThePool(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+
+	var escaped context.Context
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		escaped = ctx
+		return nil
+	}))
+
+	_, err := store.Objects().GetMeta(escaped, storeapi.ObjectID(1))
+	assert.ErrorIs(t, err, storeapi.ErrNotFound, "want a clean miss, not sql.ErrTxDone")
+}
+
+// The point of the split, in both halves: a read outside the transaction
+// completes rather than queueing behind the writer, and reads committed state
+// rather than the transaction's uncommitted write.
+func TestAReadOutsideATransactionDoesNotWaitOrSeeIt(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+
+	obj, err := store.Objects().Create(ctx, testGK, storeapi.ObjectsCreateInput{
+		Name: "target", Spec: []byte(`{}`),
+	})
+	require.NoError(t, err)
+
+	// The read's outcome travels back on the channel rather than being asserted
+	// where it runs: require in a spawned goroutine calls Goexit, which would
+	// leave the receive below with nothing to receive.
+	type read struct {
+		status []byte
+		err    error
+	}
+	reads := make(chan read, 1)
+
+	var seen read
+	require.NoError(t, store.Within(ctx, func(txCtx context.Context) error {
+		_, err := store.Objects().UpdateStatus(txCtx, testGK, obj.ID, []byte(`{"a":1}`), 0)
+		require.NoError(t, err)
+
+		go func() {
+			got, err := store.Objects().GetMeta(ctx, obj.ID) // ctx, not txCtx
+			if err != nil {
+				reads <- read{err: err}
+				return
+			}
+			reads <- read{status: got.Status}
+		}()
+		select {
+		case seen = <-reads:
+		case <-time.After(10 * time.Second):
+			return errors.New("a read outside the transaction blocked on the writer")
+		}
+		return nil
+	}))
+	require.NoError(t, seen.err)
+	assert.Empty(t, seen.status, "the reader must not see an uncommitted write")
+
+	got, err := store.Objects().GetMeta(ctx, obj.ID)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"a":1}`, string(got.Status), "and must see it once committed")
+}
+
+// The writes that run outside a transaction, on a split store. read returns the
+// ambient transaction, so only these can be caught at runtime — for the rest,
+// roDBTX is what keeps them off the reader, at compile time.
+func TestAutocommitWritesRunOnTheWriter(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	ref := storeapi.ObjectRef{ID: obj.ID, Group: testGK.Group, Kind: testGK.Kind}
+
+	require.NoError(t, store.ReconcileOwed().Stamp(ctx, []storeapi.ObjectRef{ref}))
+	require.NoError(t, store.ReconcileOwed().Decrement(ctx, testGK, obj.ID, 1))
+	_, err := store.ReconcileOwed().Sweep(ctx, []storeapi.GroupKind{testGK})
+	require.NoError(t, err)
+	require.NoError(t, store.Dependencies().WatermarkSet(ctx, obj.ID, 1))
+	require.NoError(t, store.DriverCursors().Set(ctx, "probe", 7))
+	_, err = store.ReclaimSpace(ctx, 8)
+	require.NoError(t, err)
+}
+
+// database/sql keeps two idle connections by default and OpenPool reaps after
+// five minutes, so a reader would churn connections between ticks. Asserted on
+// the pool's counters: no test can wait out a five-minute timer.
+func TestTheReaderKeepsItsConnections(t *testing.T) {
+	const n = 4
+	store := newDiskStore(t, WithReadConnections(n))
+	ctx := context.Background()
+	id := newRefObject(t, store).ID
+
+	var wg sync.WaitGroup
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				_, err := store.Objects().GetMeta(ctx, id)
+				assert.NoError(t, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	stats := store.readDB.Stats()
+	assert.Zero(t, stats.MaxIdleClosed, "a returned connection was closed over the idle count")
+	assert.Zero(t, stats.MaxIdleTimeClosed, "a returned connection was reaped on a timer")
+}
