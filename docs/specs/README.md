@@ -16,7 +16,7 @@ work we have decided to do.
 
 ## In flight
 
-Eighteen. Seventeen came from one audit of what the
+Seventeen. Sixteen came from one audit of what the
 [sole-writer constraint](../adr/2026-08-05-one-process-one-beehive-sole-writer.md)
 buys and the code does not yet spend; three follow on from the JSON id lists.
 Each is one PR. They are grouped by what they have in common, not by the order they must land in; the dependencies each
@@ -50,10 +50,11 @@ set.
 9. [A pass skips a condition write it can see is a no-op](2026-08-20-a-pass-skips-a-condition-write-it-can-see-is-a-no-op.md)
 
 **In-memory indexes.** These change what breaking the sole-writer rule costs,
-from latency to wrong answers. 10 gates the rest.
+from latency to wrong answers. Their gate has shipped: one beehive per store is
+now enforced within the process, and keeping a second process off the database is
+the embedder's — see
+[the sole-writer ADR](../adr/2026-08-05-one-process-one-beehive-sole-writer.md).
 
-10. [Enforce one process, one beehive](2026-08-20-enforce-one-process-one-beehive.md)
-    — a decision, not an optimization.
 11. [A reverse dependency index](2026-08-20-a-reverse-dependency-index.md)
 12. [A repeat AddDependency writes nothing](2026-08-20-a-repeat-add-dependency-writes-nothing.md)
 13. [Cache the latest event run](2026-08-20-cache-the-latest-event-run.md)

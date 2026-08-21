@@ -3,7 +3,7 @@
 - **Status:** Proposed. The largest change in this set, and the one that most
   changes the shape of the code.
 - **Date:** 2026-08-20
-- **Depends on:** [enforcement](2026-08-20-enforce-one-process-one-beehive.md).
+- **Depends on:** one beehive per store, now enforced within the process — see [the sole-writer ADR](../adr/2026-08-05-one-process-one-beehive-sole-writer.md).
   Supersedes
   [the floor-tick gate](2026-08-20-the-tail-answers-its-floor-tick-from-memory.md).
 

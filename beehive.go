@@ -196,6 +196,9 @@ func (bh *Beehive) log() *slog.Logger {
 // is called. Startup reads the store to seed the dependency waker, so a startCtx
 // that expires while the store is busy fails the start — a store *error* there
 // does not, since the waker is an optimisation.
+//
+// A store another Beehive is already running is ErrStoreInUse. That covers this
+// process only; keeping a second process off the database is the embedder's.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
