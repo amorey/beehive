@@ -36,6 +36,14 @@ exempt with the reason each cannot be prepared carried beside the name:
 - `txState.nested` — a savepoint name is not a parameter either, and the names
   are monotonic and unbounded, so there is no statement per name to prepare.
 
+**The savepoint verbs must be the whole literal.** Matched loosely they are
+ordinary English, and the pattern is case-insensitive, so `"free pages: release
+failed"` would make its function look like it holds SQL. A word boundary does not
+help — `release` is a whole word there — so the three verbs anchor to the entire
+literal, which is how `savepointStmt` is handed them. That in turn needs the
+literal unquoted before matching: `ast.BasicLit.Value` is raw source, and an
+anchored pattern would otherwise be comparing against the quote characters.
+
 **An exemption carries its reason or it is not an exemption.** The map is
 `name → why`, and `TestEveryUnpreparableExemptionIsLive` fails on an entry that
 no longer holds a statement and on one with an empty reason. A stale entry is how

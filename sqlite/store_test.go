@@ -9600,8 +9600,6 @@ func TestBothObjectListingsReadTheSameRow(t *testing.T) {
 // hot read from being silently unprepared: add one with its SQL inline and it
 // shows up here.
 func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
-	anySQL := regexp.MustCompile(
-		`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|PRAGMA\s|SAVEPOINT|ROLLBACK TO|RELEASE)`)
 
 	var inFunctions []string
 	for _, fn := range sqlLiteralSites(t, anySQL.MatchString) {
@@ -9615,6 +9613,15 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 	assert.ElementsMatch(t, renderedSQLSites, unique(inFunctions),
 		"SQL inside a function must be rendered from a runtime count; everything else is a field")
 }
+
+// anySQL matches a statement literal. The savepoint verbs must be the whole
+// literal, which is how savepointStmt is handed them: matched loosely they are
+// ordinary English, and case-insensitively "free pages: release failed" would
+// make its function look like it holds SQL. A word boundary is not enough for
+// that — "release" is a whole word there.
+var anySQL = regexp.MustCompile(
+	`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|PRAGMA\s)` +
+		`|^(SAVEPOINT|ROLLBACK TO|RELEASE)$`)
 
 // unpreparable is the functions holding constant statements SQLite will not let
 // us prepare, each with the reason. An exemption without one is how these went
@@ -9645,7 +9652,10 @@ func sqlLiteralSites(t *testing.T, match func(sql string) bool) []string {
 	var sites []string
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
 		lit, ok := n.(*ast.BasicLit)
-		if ok && fn != "" && lit.Kind == token.STRING && match(lit.Value) {
+		// Unquoted: lit.Value is raw source, so an anchored pattern would be
+		// matching against the quote characters rather than the statement.
+		if ok && fn != "" && lit.Kind == token.STRING &&
+			match(strings.Trim(lit.Value, "`\"")) {
 			sites = append(sites, qualify(recv, fn))
 		}
 	}))
@@ -10006,8 +10016,6 @@ func TestTheConditionUpsertCarriesNonASCIIText(t *testing.T) {
 // check closes was left open: the exempt list is only as good as the last time
 // somebody proved each line still fires.
 func TestEveryUnpreparableExemptionIsLive(t *testing.T) {
-	anySQL := regexp.MustCompile(
-		`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|PRAGMA\s|SAVEPOINT|ROLLBACK TO|RELEASE)`)
 
 	found := map[string]bool{}
 	for _, fn := range sqlLiteralSites(t, anySQL.MatchString) {
