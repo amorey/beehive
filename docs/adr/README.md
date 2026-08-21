@@ -66,6 +66,7 @@ for the mapping.
 - [A spec write enqueues its own object](2026-07-31-a-spec-write-enqueues-its-own-object.md)
 - [A spec write refuses a deletion-pending row](2026-08-19-a-spec-write-refuses-a-deleting-row.md)
 - [A spec write takes its transaction unconditionally](2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md)
+- [A spec write reads before it writes](2026-08-20-a-spec-write-reads-before-it-writes.md)
 - [Dependency watermarks: re-derived staleness](2026-07-29-dependency-watermarks.md)
 - [The dependency waker persists its scan cursor](2026-07-30-durable-waker-cursor.md)
 - [Store write shapes: narrow in, narrow out](2026-07-30-store-write-shapes.md)

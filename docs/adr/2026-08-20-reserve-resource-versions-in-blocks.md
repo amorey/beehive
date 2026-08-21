@@ -98,9 +98,10 @@ fallback and burns the remainder.
 ## Consequences
 
 Measured against the real store, blocks-off and blocks-on runs alternated so drift
-cancels, medians of fifteen each side: a status write in a `Within` goes 97.7 µs →
-79.5 µs (**−19%**) and a spec write that changes the spec 178.9 µs → 152.9 µs
-(**−15%**). A deletion cascade is unmoved: its cost is the row writes, and the
+cancels, medians of fifteen each side: a status write in a `Within` goes 98.0 µs →
+81.0 µs (**−17%**) and a spec write that changes the spec 176.4 µs → 151.4 µs
+(**−14%**). Repeated on this sandbox the status figure lands between −17% and −19%;
+the low end is the one to quote. A deletion cascade is unmoved: its cost is the row writes, and the
 `markManyForDeletion` range draw was already one statement for the level.
 
 A restart leaves a gap of up to `blockSize`, which nothing observes.

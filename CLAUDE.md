@@ -312,9 +312,12 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   cannot until GC releases the name. The refusal is checked before the schema
   stamp and the byte compare, and that order is contractual on `Store`.
   → [ADR](docs/adr/2026-08-19-a-spec-write-refuses-a-deleting-row.md)
-  **A converged spec write still takes its transaction**: skipping it on a
-  lock-free probe was measured and declined.
-  → [ADR](docs/adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md)
+  **A converged spec write still takes its transaction, and still reads before it
+  writes**: the lock-free probe in front and the read folded into the `UPDATE`
+  were both measured and declined, the second because a statement matching no row
+  costs more than the read it replaces.
+  → [ADR](docs/adr/2026-08-19-a-spec-write-takes-its-transaction-unconditionally.md),
+  [ADR](docs/adr/2026-08-20-a-spec-write-reads-before-it-writes.md)
   A spec write also enqueues
   its own object, gated on the store's `changed` bool — never on the row being
   unsettled; a delete does the same, gated on `marked`. `Store.AfterCommit` has
