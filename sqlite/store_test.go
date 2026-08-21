@@ -966,16 +966,10 @@ func TestEdgeListsInheritTheIndexOrder(t *testing.T) {
 			SELECT o.id, o."group", o.kind
 			FROM edges r JOIN objects o ON o.id = r.to_id
 			WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget, []any{int64(1), owned}},
-		{"incoming batch", `
-			SELECT r.to_id, o.id, o."group", o.kind
-			FROM edges r JOIN objects o ON o.id = r.from_id
-			WHERE r.to_id IN (?,?) AND r.relation = ?
-			ORDER BY r.to_id, r.from_id`, []any{int64(1), int64(2), owned}},
-		{"outgoing batch", `
-			SELECT r.from_id, o.id, o."group", o.kind
-			FROM edges r JOIN objects o ON o.id = r.to_id
-			WHERE r.from_id IN (?,?) AND r.relation = ?
-			ORDER BY r.from_id, r.to_id`, []any{int64(1), int64(2), owned}},
+		{"incoming batch", stmtSQL[stmtEdgesGroupIncoming],
+			[]any{jsonList([]storeapi.ObjectID{1, 2}), owned}},
+		{"outgoing batch", stmtSQL[stmtEdgesGroupOutgoing],
+			[]any{jsonList([]storeapi.ObjectID{1, 2}), owned}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := queryPlan(t, store, tc.query, tc.args...)
@@ -9642,7 +9636,6 @@ var renderedSQLSites = []string{
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
 	"sqliteStore.markManyForDeletionChunk",
-	"sqliteStore.edgesByIDsChunk",
 }
 
 // sqlLiteralSites names every function holding a string literal match accepts.

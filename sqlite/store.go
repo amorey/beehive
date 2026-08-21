@@ -2875,7 +2875,7 @@ func (s sqliteEdges) ListIncoming(ctx context.Context, toID storeapi.ObjectID, r
 // bucketed by target id — the incoming twin of Edges().GroupOutgoingByID. It routes
 // by r.to_id and joins the source side (r.from_id).
 func (s sqliteEdges) GroupIncomingByID(ctx context.Context, toIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
-	return s.edgesByIDs(ctx, toIDs, relation, "to_id", "from_id")
+	return s.edgesByIDs(ctx, toIDs, relation, stmtEdgesGroupIncoming)
 }
 
 // idChunkSize bounds the ids bound per batched query, under SQLite's
@@ -2883,14 +2883,14 @@ func (s sqliteEdges) GroupIncomingByID(ctx context.Context, toIDs []storeapi.Obj
 // exercise the multi-chunk merge.
 var idChunkSize = 30000
 
-// edgesByIDs is the shared batched edge lookup: edges filtered by routeCol IN
-// (ids), joined on joinCol, bucketed by routeCol. The column names are fixed
-// internal strings, never user input. Chunked under idChunkSize.
-func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
+// edgesByIDs is the shared batched edge lookup: edges filtered by stmt's route
+// column, joined on the other, bucketed by the route column stmt selects first.
+// Chunked under idChunkSize.
+func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, stmt stmtID) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
 	out := make(map[storeapi.ObjectID][]storeapi.ObjectRef, len(ids))
 	for start := 0; start < len(ids); start += idChunkSize {
 		end := min(start+idChunkSize, len(ids))
-		if err := s.edgesByIDsChunk(ctx, ids[start:end], relation, routeCol, joinCol, out); err != nil {
+		if err := s.edgesByIDsChunk(ctx, ids[start:end], relation, stmt, out); err != nil {
 			return nil, err
 		}
 	}
@@ -2900,19 +2900,8 @@ func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, r
 // edgesByIDsChunk runs one chunk, merging rows into out; it closes its result
 // set so the next chunk reuses that connection rather than taking another from
 // the read pool.
-func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
-	args := make([]any, 0, len(ids)+1)
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-	args = append(args, string(relation))
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT r.`+routeCol+`, o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.`+joinCol+`
-		WHERE r.`+routeCol+` IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
-		ORDER BY r.`+routeCol+`, r.`+joinCol, args...)
+func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, stmt stmtID, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
+	rows, err := s.query(ctx, stmt, jsonList(ids), string(relation))
 	if err != nil {
 		return err
 	}
@@ -2951,7 +2940,7 @@ func (s sqliteEdges) ListOutgoingByRelation(ctx context.Context, fromID storeapi
 // once, bucketed by source id. It routes by r.from_id and joins the target side
 // (r.to_id).
 func (s sqliteEdges) GroupOutgoingByID(ctx context.Context, fromIDs []storeapi.ObjectID, relation storeapi.Relation) (map[storeapi.ObjectID][]storeapi.ObjectRef, error) {
-	return s.edgesByIDs(ctx, fromIDs, relation, "from_id", "to_id")
+	return s.edgesByIDs(ctx, fromIDs, relation, stmtEdgesGroupOutgoing)
 }
 
 // scanObjectRefs collects an (id, group, kind) SELECT into ObjectRefs, closing
