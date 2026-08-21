@@ -75,6 +75,13 @@ the upsert; the gate read has bound two parameters since the id-list change, and
 the upsert now binds three. What the chunk bounds is the array built and the rows
 written.
 
+**`conn` is gone.** It was the choke point every data write took its connection
+from, and this was its last caller — the coverage gate found it, since the
+refusal branch stopped being reachable. What it guarded did not move: `writeStmt`
+refuses a read frame at routing, and `refuseWriteInReadFrame` answers for the
+sites that need it before an early return. `TestNoWriteBypassesConn` became
+`TestNoWriteBypassesTheAccessors`, and `st.tx` is down to four users.
+
 **`jsonConditionRows` is the one marshal helper that can be handed free text**,
 and its comment says so. What makes it lossless is not the helper's shape — the
 rule the other four rest on — but the gate above.
