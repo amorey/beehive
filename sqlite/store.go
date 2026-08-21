@@ -145,7 +145,7 @@ func (s *sqliteStore) releasePath() {
 	if s.path == "" {
 		return
 	}
-	dropPath(s.path)
+	openPaths.Drop(s.path)
 	s.path = ""
 }
 

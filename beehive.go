@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amorey/beehive/internal/claim"
 	"github.com/amorey/beehive/internal/driver"
 	"github.com/amorey/beehive/internal/logging"
 )
@@ -175,9 +176,12 @@ type Beehive struct {
 	tailMu  sync.Mutex
 	tailers map[GroupKind]*objectTailer
 
-	state  beehiveState
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	state beehiveState
+	// claimed records that this Beehive holds runningStores[store], so a release
+	// drops its own claim and never a successor's.
+	claimed bool
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
 }
 
 // log returns a non-nil logger; Stop and tests can run before Start resolves it.
@@ -449,37 +453,29 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	return drainErr
 }
 
-// runningStores is the Beehive running over each store, so one store has one
+// runningStores is the stores with a running Beehive, so one store has one
 // control plane. Only this process is covered: isolating the process from
-// another is the embedder's, and README.md says so.
-var runningStores struct {
-	mu sync.Mutex
-	m  map[Store]*Beehive
-}
+// another is the embedder's, and README.md says so. New rejects a store that
+// cannot key it.
+var runningStores claim.Set[Store]
 
-// claimStore reserves bh.store for bh. New rejects a store that cannot key the
-// map, so the lookup here cannot panic.
+// claimStore reserves bh.store for bh.
 func (bh *Beehive) claimStore() error {
-	runningStores.mu.Lock()
-	defer runningStores.mu.Unlock()
-	if _, running := runningStores.m[bh.store]; running {
+	if !runningStores.Take(bh.store) {
 		return ErrStoreInUse
 	}
-	if runningStores.m == nil {
-		runningStores.m = make(map[Store]*Beehive)
-	}
-	runningStores.m[bh.store] = bh
+	bh.claimed = true
 	return nil
 }
 
-// releaseStore drops bh's claim. Identity, not presence: a Beehive that never
-// started also reaches this, and must not evict a running one.
+// releaseStore drops bh's claim, and only bh's: a Beehive that never started
+// also reaches this, and must not evict a running one.
 func (bh *Beehive) releaseStore() {
-	runningStores.mu.Lock()
-	defer runningStores.mu.Unlock()
-	if runningStores.m[bh.store] == bh {
-		delete(runningStores.m, bh.store)
+	if !bh.claimed {
+		return
 	}
+	bh.claimed = false
+	runningStores.Drop(bh.store)
 }
 
 // New creates a control plane backed by store s. Register controllers on the

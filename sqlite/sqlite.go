@@ -24,9 +24,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sync"
 	"time"
 
+	"github.com/amorey/beehive/internal/claim"
 	"github.com/amorey/beehive/internal/sqlitemigrate"
 	_ "modernc.org/sqlite"
 )
@@ -44,33 +44,9 @@ var ErrAlreadyOpen = errors.New("beehive/sqlite: database is already open in thi
 // abs is filepath.Abs, swapped by the test that covers an unresolvable path.
 var abs = filepath.Abs
 
-// openPaths is the set of paths open in this process, so one process opens a
-// database once.
-var openPaths struct {
-	mu sync.Mutex
-	m  map[string]struct{}
-}
-
-// claimPath reserves path before the store exists, so the claim covers the
-// migrations and the version seed.
-func claimPath(path string) error {
-	openPaths.mu.Lock()
-	defer openPaths.mu.Unlock()
-	if _, held := openPaths.m[path]; held {
-		return fmt.Errorf("%w: %s", ErrAlreadyOpen, path)
-	}
-	if openPaths.m == nil {
-		openPaths.m = make(map[string]struct{})
-	}
-	openPaths.m[path] = struct{}{}
-	return nil
-}
-
-func dropPath(path string) {
-	openPaths.mu.Lock()
-	defer openPaths.mu.Unlock()
-	delete(openPaths.m, path)
-}
+// openPaths is the paths open in this process, so one process opens a database
+// once. A store records its own claim in sqliteStore.path.
+var openPaths claim.Set[string]
 
 // defaultReadConnections is a guess: one connection already keeps reads out of
 // the writers' queue, and more helps only readers that genuinely overlap.
@@ -110,8 +86,9 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := claimPath(full); err != nil {
-		return nil, err
+	// Before open, so the claim covers the migrations and the version seed.
+	if !openPaths.Take(full) {
+		return nil, fmt.Errorf("%w: %s", ErrAlreadyOpen, full)
 	}
 	// The reader opens after the migrations, which run on the writer: one opened
 	// first would hold a schema that does not exist yet.
@@ -120,7 +97,7 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	})
 	if err != nil {
 		// open's unwinds close the pool directly, so the release belongs here.
-		dropPath(full)
+		openPaths.Drop(full)
 		return nil, err
 	}
 	s.path = full
