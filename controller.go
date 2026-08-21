@@ -77,8 +77,9 @@ type ControllerClient[Status any] interface {
 	SetCondition(ctx context.Context, condition Condition) error
 	// SetConditions writes every named condition together, under a single version
 	// bump, so a watcher never sees half a pass. A type named twice is refused
-	// with ErrDuplicateConditionType; an empty slice writes nothing. Same
-	// stamping as SetCondition.
+	// with ErrDuplicateConditionType, and one that is not valid UTF-8 with
+	// ErrInvalidConditionType; an empty slice writes nothing. Same stamping as
+	// SetCondition.
 	SetConditions(ctx context.Context, conditions []Condition) error
 	// UpdateStatus records status and nothing else — the handshake is beehive's,
 	// recorded by returning Settled. Status that marshals to the bytes this pass
