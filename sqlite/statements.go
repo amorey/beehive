@@ -73,6 +73,7 @@ const (
 	stmtLoadConditions
 	stmtConditionsByIDs
 	stmtConditionSetLoad
+	stmtUpsertConditions
 	stmtDeleteCondition
 
 	stmtGetDriverCursor
@@ -269,6 +270,26 @@ var stmtSQL = [numStmts]string{
 		         ON c.object_id = o.id
 		        AND c.type IN (SELECT value FROM json_each(?))
 		 WHERE o.id = ?`,
+	// One row per condition, all under one timestamp: they are one pass, so
+	// splitting their clocks would date the same observation differently.
+	//
+	// WHERE true is required, not decoration: without it SQLite cannot tell the
+	// ON of a join from the ON CONFLICT, and the statement does not parse.
+	//
+	// transitioned_at tracks when status last CHANGED: keep the prior value
+	// unless the status differs from what's stored.
+	stmtUpsertConditions: `
+		INSERT INTO conditions
+		       (object_id, type, status, reason, message, liveness,
+		        transitioned_at, updated_at)
+		SELECT ?1, value ->> 0, value ->> 1, value ->> 2, value ->> 3, value ->> 4, ?2, ?2
+		  FROM json_each(?3) WHERE true
+		    ON CONFLICT(object_id, type) DO UPDATE SET
+		       status = excluded.status, reason = excluded.reason,
+		       message = excluded.message, liveness = excluded.liveness,
+		       transitioned_at = CASE WHEN conditions.status <> excluded.status
+		           THEN excluded.transitioned_at ELSE conditions.transitioned_at END,
+		       updated_at = excluded.updated_at`,
 	stmtConditionsByIDs: `
 		SELECT ` + conditionColumns + `
 		  FROM conditions
@@ -582,6 +603,7 @@ var stmtWrites = [numStmts]bool{
 	stmtOwedSweep:                      true,
 	stmtMarkManyForDeletion:            true,
 	stmtAppendWriteLogUpdates:          true,
+	stmtUpsertConditions:               true,
 	stmtWatermarkSet:                   true,
 	stmtStampOwedForNewEdge:            true,
 	stmtClearWatermarkForNewEdge:       true,

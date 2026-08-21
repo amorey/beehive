@@ -73,13 +73,15 @@ type ControllerClient[Status any] interface {
 	// ListOwned returns the objects this one owns (its incoming owned_by edges).
 	ListOwned(ctx context.Context) ([]ObjectRef, error)
 	// SetCondition writes the condition of that type. The store stamps
-	// TransitionedAt and UpdatedAt; the passed values are ignored.
+	// TransitionedAt and UpdatedAt; the passed values are ignored. Refuses text
+	// that is not valid UTF-8 with ErrInvalidCondition, as SetConditions does.
 	SetCondition(ctx context.Context, condition Condition) error
 	// SetConditions writes every named condition together, under a single version
 	// bump, so a watcher never sees half a pass. A type named twice is refused
-	// with ErrDuplicateConditionType, and one that is not valid UTF-8 with
-	// ErrInvalidConditionType; an empty slice writes nothing. Same stamping as
-	// SetCondition.
+	// with ErrDuplicateConditionType; text that is not valid UTF-8 — in Type,
+	// Status, Reason or Message — with ErrInvalidCondition, which a Message
+	// carrying a raw err.Error() can reach. An empty slice writes nothing. Same
+	// stamping as SetCondition.
 	SetConditions(ctx context.Context, conditions []Condition) error
 	// UpdateStatus records status and nothing else — the handshake is beehive's,
 	// recorded by returning Settled. Status that marshals to the bytes this pass
