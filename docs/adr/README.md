@@ -63,6 +63,7 @@ for the mapping.
 - [Bind an id list as JSON](2026-08-21-bind-an-id-list-as-json.md)
 - [Bind the tuple sets as JSON](2026-08-21-bind-the-tuple-sets-as-json.md)
 - [A condition is UTF-8 text, and its upsert is prepared](2026-08-21-a-condition-is-utf8-text.md)
+- [The tripwire sees a PRAGMA](2026-08-21-the-tripwire-sees-a-pragma.md)
 - [Every driver is a periodic scan of the store](2026-07-28-periodic-scan-drivers.md)
 - [The driver cadences are configurable, because every trigger pushes at commit](2026-08-06-driver-cadences-are-configurable.md)
 - [The startup full pass may be depended on; the periodic one may not](2026-08-07-the-startup-pass-may-be-depended-on.md)

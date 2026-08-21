@@ -69,17 +69,6 @@ that makes the steady state store-free.
 
 17. [Collect without a transaction it does not need](2026-08-20-collect-without-a-transaction-it-does-not-need.md)
 
-**Statements that are still rendered.** What the statement cache could not
-reach, because of how the SQL is written rather than anything about the store.
-
-18. [Let the tripwire see a PRAGMA](2026-08-21-let-the-tripwire-see-a-pragma.md) —
-    no conversions and no win: it closes the hole that hid six statements from
-    the check, and records why two constant ones still cannot be prepared.
-
-`Events().List` is the one rendered statement with no spec: preparing it is
-measured as a regression, and [`TODO.md`](../TODO.md) records why and what would
-change it.
-
 Three things the audit found and deliberately left without a spec: a name-to-id
 map, an object row cache, and dropping the conditions read from a spec write's
 return. The first two are poor trades — unbounded memory for one indexed seek, and
