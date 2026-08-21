@@ -19,7 +19,6 @@ import (
 	"errors"
 	"io/fs"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/amorey/beehive/internal/sqlitemigrate"
@@ -178,23 +177,6 @@ func TestOpenReportsAMigrationFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "newer than binary supports")
 }
 
-// One process opens a store once. The path is the key, so two stores over one
-// file collide and two over different files do not.
-func TestOpenRefusesAPathAlreadyOpen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "b.db")
-
-	first, err := Open(path)
-	require.NoError(t, err)
-
-	_, err = Open(path)
-	require.ErrorIs(t, err, ErrAlreadyOpen)
-
-	require.NoError(t, first.Close())
-	reopened, err := Open(path)
-	require.NoError(t, err, "Close releases the path")
-	t.Cleanup(func() { assert.NoError(t, reopened.Close()) })
-}
-
 // A path that cannot be made absolute fails the open. Registering the raw path
 // would weaken the key and skipping registration would disable the check, so
 // neither silent answer is available.
@@ -204,18 +186,6 @@ func TestOpenReportsAnUnresolvablePath(t *testing.T) {
 	_, err := Open(filepath.Join(t.TempDir(), "b.db"), withAbs(fail))
 	require.ErrorContains(t, err, "no working directory")
 	require.ErrorContains(t, err, "beehive/sqlite:", "every error out of Open names the package")
-}
-
-// Every file::memory: store is its own database, so there is no path to collide
-// on — which is what keeps the suite running.
-func TestOpenMemoryStoresDoNotCollide(t *testing.T) {
-	first, err := OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, first.Close()) })
-
-	second, err := OpenMemory()
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, second.Close()) })
 }
 
 // A disk store is named by its file and a memory store by a token, since every
@@ -237,28 +207,4 @@ func TestIdentityNamesTheDatabase(t *testing.T) {
 
 	assert.NotEqual(t, first.Identity(), second.Identity())
 	assert.NotEmpty(t, first.Identity())
-}
-
-// Close is idempotent and may be concurrent, so the claim must be released by
-// exactly one caller: a second release would hand the path away from whatever
-// reopened it.
-func TestCloseReleasesTheClaimOnce(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "b.db")
-	store, err := Open(path)
-	require.NoError(t, err)
-
-	var closing sync.WaitGroup
-	for range 4 {
-		closing.Go(func() { assert.NoError(t, store.Close()) })
-	}
-	closing.Wait()
-
-	reopened, err := Open(path)
-	require.NoError(t, err, "the closes released the path")
-	t.Cleanup(func() { assert.NoError(t, reopened.Close()) })
-
-	require.NoError(t, store.Close())
-	_, err = Open(path)
-	assert.ErrorIs(t, err, ErrAlreadyOpen,
-		"a late Close from the old store must not evict the one that reopened it")
 }

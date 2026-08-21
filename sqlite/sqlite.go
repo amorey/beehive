@@ -28,7 +28,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/amorey/beehive/internal/claim"
 	"github.com/amorey/beehive/internal/sqlitemigrate"
 	_ "modernc.org/sqlite"
 )
@@ -39,13 +38,6 @@ var migrations embed.FS
 // ErrInvalidOption reports an option value that has no meaning. Local to this
 // package: the store must not import the control plane.
 var ErrInvalidOption = errors.New("beehive/sqlite: option value is invalid")
-
-// ErrAlreadyOpen reports a second Open on a path this process already holds.
-var ErrAlreadyOpen = errors.New("beehive/sqlite: database is already open in this process")
-
-// storeClaims is the databases open in this process, so one process opens a
-// database once. A store records its own claim in sqliteStore.claimed.
-var storeClaims claim.Set
 
 // memoryStores numbers the memory stores, since each file::memory: is its own
 // database and so cannot share an identity with another.
@@ -84,8 +76,6 @@ func WithReadConnections(n int) Option {
 // Open opens (or creates) a Beehive SQLite database at path, running any
 // pending schema migrations before returning. Reads that are not inside a
 // transaction run on their own pool; see WithReadConnections.
-//
-// A path this process already has open is ErrAlreadyOpen, held until Close.
 func Open(path string, opts ...Option) (*sqliteStore, error) {
 	o := openOptions{readConns: defaultReadConnections, abs: filepath.Abs}
 	for _, opt := range opts {
@@ -94,14 +84,12 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	if o.readConns < 1 {
 		return nil, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
 	}
-	// Two names for one file still evade this; it is a guardrail, not a boundary.
+	// Before the pools open, so a path that cannot be resolved creates no file.
+	// Resolved because Identity must be one string for one database, whatever
+	// each caller spelled; two names for one file still evade that.
 	full, err := o.abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("beehive/sqlite: resolving %s: %w", path, err)
-	}
-	// Before open, so the claim covers the migrations and the version seed.
-	if !storeClaims.Take(full) {
-		return nil, fmt.Errorf("%w: %s", ErrAlreadyOpen, full)
 	}
 	// The reader opens after the migrations, which run on the writer: one opened
 	// first would hold a schema that does not exist yet.
@@ -109,18 +97,14 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 		return sqlitemigrate.OpenReadPool(path, o.readConns)
 	})
 	if err != nil {
-		// open's unwinds close the pool directly, so the release belongs here.
-		storeClaims.Drop(full)
 		return nil, err
 	}
 	s.identity = full
-	s.claimed.Store(true)
 	return s, nil
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
-// data is lost when the store is closed. It claims no path: every file::memory:
-// is its own database, so two of them cannot collide.
+// data is lost when the store is closed.
 //
 // No read pool: file::memory: is per-connection, so a second pool would be a
 // different and empty database. Reads run on the writer, and the split is

@@ -73,15 +73,22 @@ generation bump, `reconcile_owed`, `dependency_watermarks.reconciled_against`,
 the write log. The constraint is on *concurrent* access, not on succession.
 
 **Enforcement is split by what beehive can see.** Within the process it is
-checked: `Start` claims its store's database and a second `Beehive` over it is
-`ErrStoreInUse`; `sqlite.Open` claims its path and a second open is
-`ErrAlreadyOpen`. Both are `internal/claim` sets — a map and a mutex, no lock
-file and nothing durable.
+checked: `Start` claims its store's database, and a second `Beehive` over that
+database is `ErrStoreInUse`. One `internal/claim` set — a map and a mutex, no
+lock file and nothing durable.
 
-Both key on `Store.Identity` — the database's absolute path, or a token for a
-memory store, whose `file::memory:` genuinely is a database of its own. The
-identity member is what the enforcement rests on, and it is why a decorator
-wrapping a store claims what it wraps rather than itself.
+It keys on `Store.Identity` — the database's absolute path, or a token for a
+memory store, whose `file::memory:` genuinely is a database of its own. Keying
+on the database rather than on the store value is what makes the check
+sufficient on its own: two `sqlite.Open` calls on one path report one identity
+and collide, and a decorator claims what it wraps rather than itself.
+
+**`sqlite.Open` takes no claim of its own.** A second open with no second
+`Beehive` behind it is out-of-band access, which the third clause above leaves
+documented — and refusing it would enforce that clause only for the callers
+polite enough to come through this constructor, while `sql.Open` on the same
+path and an external tool stay invisible. Partial enforcement of a rule that
+cannot be enforced reads as coverage that is not there.
 
 Across processes it stays documented, and the embedder arranges it. Any lock
 beehive could take rests on `fcntl`, which needs a working lock daemon over NFS
