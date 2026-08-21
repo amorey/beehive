@@ -1226,9 +1226,11 @@ func (s sqliteDeletionRequests) List(ctx context.Context) ([]storeapi.ObjectRef,
 	// rides along for routing. idx_objects_deleting covers exactly this column
 	// list and order — keep them in step, or the plan silently gains a row fetch
 	// or a temp B-tree.
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT id, "group", kind FROM objects
-		 WHERE deletion_requested_at IS NOT NULL ORDER BY id`)
+	ps, err := s.stmtFor(ctx, stmtListDeletionRequests)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1237,11 +1239,11 @@ func (s sqliteDeletionRequests) List(ctx context.Context) ([]storeapi.ObjectRef,
 
 func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT id FROM objects
-		 WHERE "group" = ? AND kind = ? AND reconcile_owed != 0
-		 ORDER BY id`,
-		gk.Group, gk.Kind)
+	ps, err := s.stmtFor(ctx, stmtListOwedIDs)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, gk.Group, gk.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -1826,8 +1828,11 @@ const conditionColumns = `object_id, type, status, reason, message, liveness,
 
 // loadConditions returns id's conditions, ordered by type for a stable view.
 func (s *sqliteStore) loadConditions(ctx context.Context, id storeapi.ObjectID) ([]storeapi.Condition, error) {
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT `+conditionColumns+` FROM conditions WHERE object_id = ? ORDER BY type`, id)
+	ps, err := s.stmtFor(ctx, stmtLoadConditions)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -2115,8 +2120,11 @@ func (s sqliteConditions) Delete(ctx context.Context, gk storeapi.GroupKind, id 
 		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
-		res, err := c.ExecContext(ctx,
-			`DELETE FROM conditions WHERE object_id = ? AND type = ?`, id, condType)
+		ps, err := s.stmtFor(ctx, stmtDeleteCondition)
+		if err != nil {
+			return err
+		}
+		res, err := ps.ExecContext(ctx, id, condType)
 		if err != nil {
 			return err
 		}
@@ -3225,9 +3233,12 @@ func (s sqliteEdges) HasIncoming(ctx context.Context, id storeapi.ObjectID) (boo
 // DriverCursors().Get reads name's persisted cursor (see storeapi.Store). A
 // missing row is ok=false: absence is the ordinary first-run state, not a fault.
 func (s sqliteDriverCursors) Get(ctx context.Context, name string) (int64, bool, error) {
+	ps, err := s.stmtFor(ctx, stmtGetDriverCursor)
+	if err != nil {
+		return 0, false, err
+	}
 	var cursor int64
-	err := s.read(ctx).QueryRowContext(ctx,
-		`SELECT cursor FROM driver_cursors WHERE name = ?`, name).Scan(&cursor)
+	err = ps.QueryRowContext(ctx, name).Scan(&cursor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
 	}
@@ -3241,16 +3252,11 @@ func (s sqliteDriverCursors) Get(ctx context.Context, name string) (int64, bool,
 // The WHERE on DO UPDATE keeps the cursor monotonic and suppresses a no-advance
 // write outright — no page dirtied on a quiet tick.
 func (s sqliteDriverCursors) Set(ctx context.Context, name string, cursor int64) error {
-	c, err := s.conn(ctx)
+	ps, err := s.stmtFor(ctx, stmtSetDriverCursor)
 	if err != nil {
 		return err
 	}
-	_, err = c.ExecContext(ctx, `
-		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
-		    ON CONFLICT(name) DO UPDATE
-		   SET cursor = excluded.cursor, updated_at = excluded.updated_at
-		 WHERE excluded.cursor > driver_cursors.cursor`,
-		name, cursor, toMillis(time.Now().UTC()))
+	_, err = ps.ExecContext(ctx, name, cursor, toMillis(time.Now().UTC()))
 	return err
 }
 

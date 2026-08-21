@@ -45,6 +45,12 @@ const (
 	stmtInsertObject
 	stmtSetObservedGeneration
 	stmtUpdateStatus
+	stmtListDeletionRequests
+	stmtListOwedIDs
+	stmtLoadConditions
+	stmtDeleteCondition
+	stmtGetDriverCursor
+	stmtSetDriverCursor
 
 	numStmts
 )
@@ -87,6 +93,20 @@ var stmtSQL = [numStmts]string{
 		SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
 		WHERE id = ?`,
 
+	stmtListDeletionRequests: `SELECT id, "group", kind FROM objects
+		 WHERE deletion_requested_at IS NOT NULL ORDER BY id`,
+	stmtListOwedIDs: `SELECT id FROM objects
+		 WHERE "group" = ? AND kind = ? AND reconcile_owed != 0
+		 ORDER BY id`,
+	stmtLoadConditions:  `SELECT ` + conditionColumns + ` FROM conditions WHERE object_id = ? ORDER BY type`,
+	stmtDeleteCondition: `DELETE FROM conditions WHERE object_id = ? AND type = ?`,
+	stmtGetDriverCursor: `SELECT cursor FROM driver_cursors WHERE name = ?`,
+	stmtSetDriverCursor: `
+		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
+		    ON CONFLICT(name) DO UPDATE
+		   SET cursor = excluded.cursor, updated_at = excluded.updated_at
+		 WHERE excluded.cursor > driver_cursors.cursor`,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -117,6 +137,8 @@ var stmtWrites = [numStmts]bool{
 	stmtInsertObject:          true,
 	stmtSetObservedGeneration: true,
 	stmtUpdateStatus:          true,
+	stmtDeleteCondition:       true,
+	stmtSetDriverCursor:       true,
 }
 
 // stmtSet is one pool's preparations.
