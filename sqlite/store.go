@@ -2450,7 +2450,7 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, stmt stmtID, whereArg
 }
 
 // markChunkSize bounds the ids bound per batched deletion mark: a measured
-// optimum, not a parameter-limit ceiling like idChunkSize. A var so tests can
+// optimum, and the mark still renders a placeholder per id. A var so tests can
 // shrink it. See docs/adr/2026-07-30-store-write-shapes.md.
 var markChunkSize = 128
 
@@ -2867,9 +2867,10 @@ func (s sqliteEdges) GroupIncomingByID(ctx context.Context, toIDs []storeapi.Obj
 	return s.edgesByIDs(ctx, toIDs, relation, stmtEdgesGroupIncoming)
 }
 
-// idChunkSize bounds the ids bound per batched query, under SQLite's
-// SQLITE_MAX_VARIABLE_NUMBER (32766 in modernc). A var so tests can shrink it to
-// exercise the multi-chunk merge.
+// idChunkSize bounds the ids a batched query carries. The ids are one JSON
+// parameter now, so what it bounds is the array built and the rows returned, not
+// a parameter count. A var so tests can shrink it to exercise the multi-chunk
+// merge.
 var idChunkSize = 30000
 
 // edgesByIDs is the shared batched edge lookup: edges filtered by stmt's route
