@@ -2,7 +2,7 @@
 
 - **Status:** Planned.
 - **Date:** 2026-08-20
-- **Depends on:** [enforcement](2026-08-20-enforce-one-process-one-beehive.md).
+- **Depends on:** one beehive per store, now enforced within the process — see [the sole-writer ADR](../adr/2026-08-05-one-process-one-beehive-sole-writer.md).
   An index that does not know about another process's edges drops wakes silently.
 
 ## Why

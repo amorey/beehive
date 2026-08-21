@@ -185,6 +185,15 @@ type Object[Spec, Status any] struct {
 // relation was not fetched on the read that produced the object.
 var ErrNotLoaded = errors.New("beehive: secondary lookup not loaded")
 
+// ErrInvalidStoreIdentity is returned by Start when the store's Identity is
+// empty. "" names no database, so two unrelated stores would collide on it.
+var ErrInvalidStoreIdentity = errors.New("beehive: store reports no identity")
+
+// ErrStoreInUse is returned by Start when another Beehive is already running
+// over the store. Distinct from the "already started" error beside it: that one
+// reports misuse of this Beehive, which its caller can already see.
+var ErrStoreInUse = errors.New("beehive: store already has a running Beehive")
+
 // Owner returns the object's owner. ok reports presence; ErrNotLoaded if
 // LoadOwner() was not passed to the read.
 func (o *Object[Spec, Status]) Owner() (ObjectRef, bool, error) {

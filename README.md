@@ -75,6 +75,8 @@ func main() {
 
   ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
   defer cancel()
+  // An error means ctx expired before the loops drained. They are cancelled
+  // and ending, and the store's claim outlives them by exactly that long.
   if err := stop(ctx); err != nil {
     log.Printf("beehive: shutdown did not drain cleanly: %v", err)
   }
@@ -84,6 +86,8 @@ func main() {
 ## Architecture
 
 - **Embedded, single-process.** Beehive runs inside your app, not beside it: no server, no daemon, no network hop. In exchange, a store belongs to one process running one `Beehive`, which is its only writer while it runs. Restarts are supported but *concurrent* access from a separate process is not.
+
+  Within a process this is enforced: a second `Beehive` over a database another is already running fails `Start` with `ErrStoreInUse`. The check keys on the database, not the store value, so two `sqlite.Open` calls on one path collide as they should. **Keeping a second *process* off the database is yours** — a single-replica deployment, a lease, a supervisor, whatever you already run. Beehive does not take a lock of its own: any lock it could take rests on `fcntl`, which is unreliable on exactly the network and overlay filesystems where two replicas share a volume, so it would fail silently in the case that motivates it. Writes made to the database around a running `Beehive` — by another process or by a tool — are unsupported and undetectable.
 
 - **Declarative core.** You write `spec`, the desired state. Controllers reconcile actual state toward it, working from current state rather than from a sequence of events. That is what makes the system self-healing: it converges on restart, and a missed event costs nothing because the next pass reads the same state anyway. A cold start is just a reconcile from stored desired state.
 

@@ -2,7 +2,7 @@
 
 - **Status:** Planned.
 - **Date:** 2026-08-20
-- **Depends on:** [enforcement](2026-08-20-enforce-one-process-one-beehive.md).
+- **Depends on:** one beehive per store, now enforced within the process — see [the sole-writer ADR](../adr/2026-08-05-one-process-one-beehive-sole-writer.md).
   A cached run key that another writer has moved past extends the wrong run.
 
 ## Why

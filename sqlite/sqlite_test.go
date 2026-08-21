@@ -176,3 +176,35 @@ func TestOpenReportsAMigrationFailure(t *testing.T) {
 	assert.Nil(t, store)
 	assert.Contains(t, err.Error(), "newer than binary supports")
 }
+
+// A path that cannot be made absolute fails the open. Registering the raw path
+// would weaken the key and skipping registration would disable the check, so
+// neither silent answer is available.
+func TestOpenReportsAnUnresolvablePath(t *testing.T) {
+	fail := func(string) (string, error) { return "", errors.New("no working directory") }
+
+	_, err := Open(filepath.Join(t.TempDir(), "b.db"), withAbs(fail))
+	require.ErrorContains(t, err, "no working directory")
+	require.ErrorContains(t, err, "beehive/sqlite:", "every error out of Open names the package")
+}
+
+// A disk store is named by its file and a memory store by a token, since every
+// file::memory: is a database of its own. Two stores over one database report
+// one identity, which is what the control plane keys its claim on.
+func TestIdentityNamesTheDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+	store, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+	assert.Equal(t, path, store.Identity(), "t.TempDir is absolute already")
+
+	first, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, first.Close()) })
+	second, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, second.Close()) })
+
+	assert.NotEqual(t, first.Identity(), second.Identity())
+	assert.NotEmpty(t, first.Identity())
+}

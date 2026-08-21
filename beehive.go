@@ -174,7 +174,10 @@ type Beehive struct {
 	tailMu  sync.Mutex
 	tailers map[GroupKind]*objectTailer
 
-	state  beehiveState
+	state beehiveState
+	// claim is what this Beehive holds in beehiveClaims; its zero value holds
+	// nothing.
+	claim  storeClaim
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -196,6 +199,16 @@ func (bh *Beehive) log() *slog.Logger {
 // is called. Startup reads the store to seed the dependency waker, so a startCtx
 // that expires while the store is busy fails the start — a store *error* there
 // does not, since the waker is an optimisation.
+//
+// A store another Beehive is already running is ErrStoreInUse, and one whose
+// Identity is empty is ErrInvalidStoreIdentity. Both cover this process only;
+// keeping a second process off the database is the embedder's.
+//
+// The store's claim is released once the loops have stopped, which a nil from
+// the stop call that owns the teardown is proof of. Nothing else is: stop
+// returns its own ctx's error if the loops outlast it, and a second concurrent
+// call returns nil at once rather than waiting for the first. So start another
+// Beehive over the same store only after a nil from the owning call.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
@@ -204,6 +217,12 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		return nil, fmt.Errorf("beehive: already stopped; create a new Beehive to restart")
 	case beehiveRunning:
 		return nil, fmt.Errorf("beehive: already started")
+	}
+
+	// Before the first store read, and returned bare: abort frames a start that
+	// began work, and this one never did.
+	if err := bh.claimStore(); err != nil {
+		return nil, err
 	}
 
 	bh.logger = logging.Resolve(bh.logger, bh.logLevel)
@@ -215,6 +234,9 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	abort := func(err error) error {
 		bh.waker.teardown() // a no-op before prime
 		cancel()
+		// bh.state is not set here, so the caller may retry — which needs the
+		// store back.
+		bh.releaseStore()
 		return fmt.Errorf("beehive: start aborted: %w", err)
 	}
 	if err := startCtx.Err(); err != nil {
@@ -399,6 +421,9 @@ func (bh *Beehive) stop(ctx context.Context) error {
 		done := make(chan struct{})
 		go func() {
 			bh.wg.Wait()
+			// Here rather than on return: wg counts this Beehive's writers, so
+			// the claim outlives a blown deadline exactly as long as they run.
+			bh.releaseStore()
 			close(done)
 		}()
 		select {
@@ -425,6 +450,59 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// report the work queue instead and end here, after their final value.
 	bh.log().Info("control plane stopped")
 	return drainErr
+}
+
+// beehiveClaims is the databases with a running Beehive, so one database has
+// one control plane. Keyed on Store.Identity rather than the store value, so a
+// decorator wrapping a store claims what it wraps. Only this process is
+// covered: isolating the process from another is the embedder's, and README.md
+// says so.
+var beehiveClaims struct {
+	mu   sync.Mutex
+	held map[string]uint64
+	next uint64
+}
+
+// storeClaim is a Beehive's entry in beehiveClaims. Its zero value holds
+// nothing, so a Beehive that never claimed needs no flag of its own.
+type storeClaim struct {
+	id string
+	// tok distinguishes this claim from a later one on the same database, so a
+	// release drops only its own rather than resting on running exactly once.
+	tok uint64
+}
+
+// claimStore reserves bh.store's database for bh.
+func (bh *Beehive) claimStore() error {
+	id := bh.store.Identity()
+	if id == "" {
+		return fmt.Errorf("%w: %T", ErrInvalidStoreIdentity, bh.store)
+	}
+	beehiveClaims.mu.Lock()
+	defer beehiveClaims.mu.Unlock()
+	if _, held := beehiveClaims.held[id]; held {
+		return ErrStoreInUse
+	}
+	if beehiveClaims.held == nil {
+		beehiveClaims.held = make(map[string]uint64)
+	}
+	beehiveClaims.next++
+	beehiveClaims.held[id] = beehiveClaims.next
+	bh.claim = storeClaim{id: id, tok: beehiveClaims.next}
+	return nil
+}
+
+// releaseStore drops what claimStore took, and nothing else: a Beehive that
+// never started holds a zero claim, and one whose database was claimed again
+// since must not evict its successor.
+func (bh *Beehive) releaseStore() {
+	beehiveClaims.mu.Lock()
+	defer beehiveClaims.mu.Unlock()
+	// Presence, not just equality: a zero claim's token would otherwise match
+	// the zero a missing entry reads as.
+	if tok, held := beehiveClaims.held[bh.claim.id]; held && tok == bh.claim.tok {
+		delete(beehiveClaims.held, bh.claim.id)
+	}
 }
 
 // New creates a control plane backed by store s. Register controllers on the
