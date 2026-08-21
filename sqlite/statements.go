@@ -40,6 +40,11 @@ const (
 	stmtScopedGeneration
 	stmtScopedStatus
 	stmtScopedFinalizers
+	stmtListObjects
+	stmtListObjectsByIncomingEdge
+	stmtInsertObject
+	stmtSetObservedGeneration
+	stmtUpdateStatus
 
 	numStmts
 )
@@ -62,11 +67,37 @@ var stmtSQL = [numStmts]string{
 		 ORDER BY id`,
 	stmtListIDs: `SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
 
+	stmtListObjects: listObjectsSQL(`WHERE o."group" = ? AND o.kind = ?`),
+	stmtListObjectsByIncomingEdge: listObjectsSQL(`
+		WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
+		  AND o."group" = ? AND o.kind = ?`),
+
+	stmtInsertObject: `
+		INSERT INTO objects
+			("group", kind, name, spec, status, schema_version_spec,
+			 generation, resource_version, finalizers, created_at, updated_at)
+		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
+		RETURNING ` + objectColumns,
+	stmtSetObservedGeneration: `
+		UPDATE objects
+		SET observed_generation = ?, observed_at = ?, resource_version = ?
+		WHERE id = ?`,
+	stmtUpdateStatus: `
+		UPDATE objects
+		SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
+		WHERE id = ?`,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
 	stmtScopedStatus:     scopedSQL(`schema_version_status, status`),
 	stmtScopedFinalizers: scopedSQL(`finalizers, deletion_requested_at IS NOT NULL`),
+}
+
+// listObjectsSQL builds the shared multi-row object read. Objects().ListByIDs
+// renders its own tail and cannot be prepared, so it keeps listObjectsWhere.
+func listObjectsSQL(tail string) string {
+	return `SELECT ` + objectColumns + ` FROM objects o ` + tail + ` ORDER BY o.id`
 }
 
 // scopedSQL builds selectScoped's read: the kind gate's two columns, plus
@@ -82,7 +113,10 @@ func scopedSQL(cols string) string {
 // Preparing one on the read pool succeeds and fails only on execution, so the
 // nil slot is the only representation open can check.
 var stmtWrites = [numStmts]bool{
-	stmtIncrementOwed: true,
+	stmtIncrementOwed:         true,
+	stmtInsertObject:          true,
+	stmtSetObservedGeneration: true,
+	stmtUpdateStatus:          true,
 }
 
 // stmtSet is one pool's preparations.

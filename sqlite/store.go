@@ -842,13 +842,12 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	}
 	now := toMillis(time.Now().UTC())
 
+	insert, err := s.stmtFor(ctx, stmtInsertObject)
+	if err != nil {
+		return nil, err
+	}
 	// RETURNING hands back the written row, assigned id included — no follow-up read.
-	row := c.QueryRowContext(ctx, `
-		INSERT INTO objects
-			("group", kind, name, spec, status, schema_version_spec,
-			 generation, resource_version, finalizers, created_at, updated_at)
-		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
-		RETURNING `+objectColumns,
+	row := insert.QueryRowContext(ctx,
 		gk.Group, gk.Kind, in.Name, jsonText(in.Spec), in.SpecVersion,
 		rv, jsonText(finalizers), now, now)
 	// scanObject, not scanWritten: the id did not exist before this statement, so
@@ -1100,7 +1099,7 @@ func (s sqliteObjects) GetByName(ctx context.Context, gk storeapi.GroupKind, nam
 }
 
 func (s sqliteObjects) List(ctx context.Context, gk storeapi.GroupKind) ([]*storeapi.RawObject, error) {
-	return s.listObjectsWhere(ctx, `WHERE o."group" = ? AND o.kind = ?`, gk.Group, gk.Kind)
+	return s.listObjects(ctx, stmtListObjects, gk.Group, gk.Kind)
 }
 
 // Objects().ListByIncomingEdge returns the full rows of the objects pointing at
@@ -1109,9 +1108,7 @@ func (s sqliteObjects) List(ctx context.Context, gk storeapi.GroupKind) ([]*stor
 // The edge is a semi-join, not a join: IN (SELECT …) lets idx_edges_to drive, so
 // the work scales with the referrers rather than every object of the kind.
 func (s sqliteObjects) ListByIncomingEdge(ctx context.Context, gk storeapi.GroupKind, toID storeapi.ObjectID, relation storeapi.Relation) ([]*storeapi.RawObject, error) {
-	return s.listObjectsWhere(ctx, `
-		WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
-		  AND o."group" = ? AND o.kind = ?`,
+	return s.listObjects(ctx, stmtListObjectsByIncomingEdge,
 		toID, string(relation), gk.Group, gk.Kind)
 }
 
@@ -1124,6 +1121,25 @@ func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ..
 	if err != nil {
 		return nil, err
 	}
+	return s.attachConditionsToRows(ctx, rows)
+}
+
+// listObjects is listObjectsWhere over a prepared statement, for the callers
+// whose tail is constant.
+func (s *sqliteStore) listObjects(ctx context.Context, stmt stmtID, args ...any) ([]*storeapi.RawObject, error) {
+	ps, err := s.stmtFor(ctx, stmt)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return s.attachConditionsToRows(ctx, rows)
+}
+
+// attachConditionsToRows scans an object listing and fills its conditions.
+func (s *sqliteStore) attachConditionsToRows(ctx context.Context, rows *sql.Rows) ([]*storeapi.RawObject, error) {
 	// scanObjects closes rows, releasing their connection before the conditions query.
 	out, err := scanObjects(rows)
 	if err != nil {
@@ -1721,12 +1737,12 @@ func (s *sqliteStore) advanceObserved(ctx context.Context, gk storeapi.GroupKind
 	if err != nil {
 		return false, err
 	}
+	ps, err := s.stmtFor(ctx, stmtSetObservedGeneration)
+	if err != nil {
+		return false, err
+	}
 	// No RETURNING: no row reported, and the caller's scoped read proved existence.
-	_, err = c.ExecContext(ctx, `
-		UPDATE objects
-		SET observed_generation = ?, observed_at = ?, resource_version = ?
-		WHERE id = ?`,
-		observedGeneration, now, rv, id)
+	_, err = ps.ExecContext(ctx, observedGeneration, now, rv, id)
 	return err == nil, err
 }
 
@@ -1785,12 +1801,13 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		if err != nil {
 			return err
 		}
+		ps, err := s.stmtFor(ctx, stmtUpdateStatus)
+		if err != nil {
+			return err
+		}
 		// Keyed on id alone: the kind boundary came from the scoped read in this
 		// transaction — keep the read if you move this statement.
-		_, err = c.ExecContext(ctx, `
-			UPDATE objects
-			SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
-			WHERE id = ?`,
+		_, err = ps.ExecContext(ctx,
 			jsonText(status), stamp, rv, now, id)
 		changed = err == nil
 		return err

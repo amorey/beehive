@@ -9647,3 +9647,22 @@ func TestTheObjectsFamilyIssuesPreparedStatements(t *testing.T) {
 		})
 	}
 }
+
+// The two sides of listObjectsWhere. Objects().List has a constant tail and is
+// prepared; Objects().ListByIDs renders its IN list per arity and cannot be.
+func TestOnlyTheConstantObjectListingIsPrepared(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	before := store.stmtUses.Load()
+	_, err := store.Objects().List(ctx, testGK)
+	require.NoError(t, err)
+	assert.Greater(t, store.stmtUses.Load(), before, "a constant tail is prepared")
+
+	before = store.stmtUses.Load()
+	got, err := store.Objects().ListByIDs(ctx, testGK, []storeapi.ObjectID{obj.ID})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, before, store.stmtUses.Load(), "a rendered tail is not")
+}
