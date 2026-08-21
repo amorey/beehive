@@ -1512,14 +1512,11 @@ func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, int64, err
 // a trailing column, which every row repeats. One function, so a broken read is
 // one error rather than a query branch and a scan branch that cannot both happen.
 func (s *sqliteStore) writeLogPage(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT `+writeLogColumns+`,
-		       coalesce((SELECT trimmed_through FROM object_writes_horizon
-		                  WHERE "group" = ? AND kind = ?), 0)
-		  FROM object_writes
-		 WHERE "group" = ? AND kind = ? AND resource_version > ?
-		 ORDER BY resource_version LIMIT ?`,
-		gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
+	ps, err := s.stmtFor(ctx, stmtWriteLogPage)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := ps.QueryContext(ctx, gk.Group, gk.Kind, gk.Group, gk.Kind, afterRV, limit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2360,13 +2357,11 @@ func (s sqliteEvents) ListSince(
 func (s *sqliteStore) eventPage(
 	ctx context.Context, id storeapi.ObjectID, category *string, afterRV int64, limit int,
 ) ([]storeapi.Event, int64, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT `+eventColumns+`,
-		       coalesce((SELECT MAX(trimmed_through) FROM events_horizon
-		                  WHERE object_id = ?1 AND (?2 IS NULL OR category = ?2)), 0)
-		  FROM events
-		 WHERE object_id = ?1 AND resource_version > ?3
-		 ORDER BY resource_version LIMIT ?4`, id, category, afterRV, limit)
+	ps, err := s.stmtFor(ctx, stmtEventPage)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := ps.QueryContext(ctx, id, category, afterRV, limit)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2387,13 +2382,16 @@ func (s *sqliteStore) eventPage(
 // eventHorizon is what retention removed from id's category, or from its highest
 // timeline when category is nil. No row means nothing has been trimmed.
 func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, category *string) (int64, error) {
-	where, args := `object_id = ?`, []any{id}
+	stmt, args := stmtEventHorizon, []any{id}
 	if category != nil {
-		where, args = where+` AND category = ?`, append(args, *category)
+		stmt, args = stmtEventHorizonByCategory, append(args, *category)
+	}
+	ps, err := s.stmtFor(ctx, stmt)
+	if err != nil {
+		return 0, err
 	}
 	var rv sql.NullInt64
-	err := s.read(ctx).QueryRowContext(ctx,
-		`SELECT MAX(trimmed_through) FROM events_horizon WHERE `+where, args...).Scan(&rv)
+	err = ps.QueryRowContext(ctx, args...).Scan(&rv)
 	return rv.Int64, err
 }
 
@@ -2430,7 +2428,8 @@ func (s sqliteEvents) Sweep(ctx context.Context, perTimeline int, maxAge time.Du
 			total += n
 		}
 		if maxAge > 0 {
-			n, err := s.trimEvents(ctx, `last_at < ?`, toMillis(time.Now().UTC().Add(-maxAge)))
+			n, err := s.trimEvents(ctx, stmtRaiseEventHorizonByAge, stmtTrimEventsByAge,
+				toMillis(time.Now().UTC().Add(-maxAge)))
 			if err != nil {
 				return err
 			}
@@ -2498,9 +2497,7 @@ func (s *sqliteStore) trimEventsToCap(ctx context.Context, perTimeline, capBudge
 	for _, t := range over {
 		// Newest-first, skip the cap, delete the rest. The outer key predicate is
 		// what keeps both of trimEvents' statements on a seek.
-		n, err := s.trimEvents(ctx, `object_id = ? AND category = ? AND id IN (
-			SELECT id FROM events WHERE object_id = ? AND category = ?
-			 ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?)`,
+		n, err := s.trimEvents(ctx, stmtRaiseEventHorizonOverCap, stmtTrimEventsOverCap,
 			t.id, t.category, t.id, t.category, perTimeline)
 		if err != nil {
 			return 0, err
@@ -2517,21 +2514,19 @@ func (s *sqliteStore) trimEventsToCap(ctx context.Context, perTimeline, capBudge
 // transaction: RETURNING would give the same answer, but at the cost of
 // materialising every deleted run and holding a half-read cursor on the single
 // connection between two statements of one transaction.
-func (s *sqliteStore) trimEvents(ctx context.Context, where string, args ...any) (int, error) {
-	c, err := s.conn(ctx)
+func (s *sqliteStore) trimEvents(ctx context.Context, raise, del stmtID, args ...any) (int, error) {
+	raisePS, err := s.stmtFor(ctx, raise)
 	if err != nil {
 		return 0, err
 	}
-	if _, err := c.ExecContext(ctx, `
-		INSERT INTO events_horizon (object_id, category, trimmed_through)
-		SELECT object_id, category, MAX(resource_version) FROM events
-		 WHERE `+where+`
-		 GROUP BY object_id, category
-		    ON CONFLICT(object_id, category) DO UPDATE SET trimmed_through = excluded.trimmed_through
-		 WHERE excluded.trimmed_through > events_horizon.trimmed_through`, args...); err != nil {
+	if _, err := raisePS.ExecContext(ctx, args...); err != nil {
 		return 0, err
 	}
-	res, err := c.ExecContext(ctx, `DELETE FROM events WHERE `+where, args...)
+	delPS, err := s.stmtFor(ctx, del)
+	if err != nil {
+		return 0, err
+	}
+	res, err := delPS.ExecContext(ctx, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -3551,13 +3546,12 @@ func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...an
 	if err != nil {
 		return 0, err
 	}
+	raise, err := s.stmtFor(ctx, stmtRaiseWriteLogHorizon)
+	if err != nil {
+		return 0, err
+	}
 	for k, rv := range highest {
-		if _, err := c.ExecContext(ctx, `
-			INSERT INTO object_writes_horizon ("group", kind, trimmed_through)
-			VALUES (?, ?, ?)
-			    ON CONFLICT("group", kind) DO UPDATE SET trimmed_through = excluded.trimmed_through
-			 WHERE excluded.trimmed_through > object_writes_horizon.trimmed_through`,
-			k.Group, k.Kind, rv); err != nil {
+		if _, err := raise.ExecContext(ctx, k.Group, k.Kind, rv); err != nil {
 			return 0, err
 		}
 	}

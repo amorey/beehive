@@ -78,6 +78,18 @@ const (
 	stmtAppendWriteLogDelete
 	stmtDrawResourceVersions
 	stmtBumpObject
+	stmtWriteLogPage
+	stmtEventPage
+	stmtEventHorizon
+	stmtEventHorizonByCategory
+	stmtRaiseWriteLogHorizon
+	// trimEvents runs two statements over one predicate: the horizon raise, then
+	// the delete. One pair per predicate, kept adjacent so an edit cannot split
+	// them.
+	stmtRaiseEventHorizonByAge
+	stmtTrimEventsByAge
+	stmtRaiseEventHorizonOverCap
+	stmtTrimEventsOverCap
 
 	numStmts
 )
@@ -222,6 +234,33 @@ var stmtSQL = [numStmts]string{
 		UPDATE objects SET resource_version = ?, updated_at = ?
 		WHERE id = ?`,
 
+	stmtWriteLogPage: `
+		SELECT ` + writeLogColumns + `,
+		       coalesce((SELECT trimmed_through FROM object_writes_horizon
+		                  WHERE "group" = ? AND kind = ?), 0)
+		  FROM object_writes
+		 WHERE "group" = ? AND kind = ? AND resource_version > ?
+		 ORDER BY resource_version LIMIT ?`,
+	stmtEventPage: `
+		SELECT ` + eventColumns + `,
+		       coalesce((SELECT MAX(trimmed_through) FROM events_horizon
+		                  WHERE object_id = ?1 AND (?2 IS NULL OR category = ?2)), 0)
+		  FROM events
+		 WHERE object_id = ?1 AND resource_version > ?3
+		 ORDER BY resource_version LIMIT ?4`,
+	stmtEventHorizon:           `SELECT MAX(trimmed_through) FROM events_horizon WHERE object_id = ?`,
+	stmtEventHorizonByCategory: `SELECT MAX(trimmed_through) FROM events_horizon WHERE object_id = ? AND category = ?`,
+	stmtRaiseWriteLogHorizon: `
+			INSERT INTO object_writes_horizon ("group", kind, trimmed_through)
+			VALUES (?, ?, ?)
+			    ON CONFLICT("group", kind) DO UPDATE SET trimmed_through = excluded.trimmed_through
+			 WHERE excluded.trimmed_through > object_writes_horizon.trimmed_through`,
+
+	stmtRaiseEventHorizonByAge:   raiseEventHorizonSQL(eventTrimByAge),
+	stmtTrimEventsByAge:          `DELETE FROM events WHERE ` + eventTrimByAge,
+	stmtRaiseEventHorizonOverCap: raiseEventHorizonSQL(eventTrimOverCap),
+	stmtTrimEventsOverCap:        `DELETE FROM events WHERE ` + eventTrimOverCap,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -233,6 +272,27 @@ var stmtSQL = [numStmts]string{
 // renders its own tail and cannot be prepared, so it keeps listObjectsWhere.
 func listObjectsSQL(tail string) string {
 	return `SELECT ` + objectColumns + ` FROM objects o ` + tail + ` ORDER BY o.id`
+}
+
+// The two predicates trimEvents runs over. The outer key predicate is what keeps
+// both of each pair's statements on a seek.
+const (
+	eventTrimByAge   = `last_at < ?`
+	eventTrimOverCap = `object_id = ? AND category = ? AND id IN (
+			SELECT id FROM events WHERE object_id = ? AND category = ?
+			 ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?)`
+)
+
+// raiseEventHorizonSQL records what a trim over where is about to remove. It runs
+// before the delete, from the same predicate in the same transaction.
+func raiseEventHorizonSQL(where string) string {
+	return `
+		INSERT INTO events_horizon (object_id, category, trimmed_through)
+		SELECT object_id, category, MAX(resource_version) FROM events
+		 WHERE ` + where + `
+		 GROUP BY object_id, category
+		    ON CONFLICT(object_id, category) DO UPDATE SET trimmed_through = excluded.trimmed_through
+		 WHERE excluded.trimmed_through > events_horizon.trimmed_through`
 }
 
 // scopedSQL builds selectScoped's read: the kind gate's two columns, plus
@@ -266,6 +326,11 @@ var stmtWrites = [numStmts]bool{
 	stmtAppendWriteLogDelete:           true,
 	stmtDrawResourceVersions:           true,
 	stmtBumpObject:                     true,
+	stmtRaiseWriteLogHorizon:           true,
+	stmtRaiseEventHorizonByAge:         true,
+	stmtTrimEventsByAge:                true,
+	stmtRaiseEventHorizonOverCap:       true,
+	stmtTrimEventsOverCap:              true,
 }
 
 // stmtSet is one pool's preparations.

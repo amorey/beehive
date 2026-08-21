@@ -9156,12 +9156,15 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	for _, fn := range callSites(t, "conn", "stmtFor") {
 		takesConn[fn] = true
 	}
-	// Helpers handed a dbtx by a caller that did take one from conn.
+	// Functions that name a write without issuing it: helpers handed a dbtx by a
+	// caller that took one from conn, callers that hand a statement id to a helper
+	// that does, and the two builders that only return SQL.
 	for _, fn := range []string{
 		"appendWriteLogUpdates", "sqliteStore.bumpObject",
 		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
 		"sqliteStore.markManyForDeletionChunk",
-		"reconcileOwedSweepQuery", // builds a string, executes nothing
+		"sqliteEvents.Sweep", "sqliteStore.trimEventsToCap",
+		"reconcileOwedSweepQuery", "raiseEventHorizonSQL",
 	} {
 		takesConn[fn] = true
 	}
