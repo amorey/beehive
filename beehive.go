@@ -479,6 +479,9 @@ func (bh *Beehive) claimStore() error {
 // Identity is contracted to be stable, but a Store that broke that would leak
 // its own claim and evict whoever holds the key it now reports. An empty claim
 // is a Beehive that never started, which must evict nobody.
+//
+// Needs no lock of its own: claimStore writes bh.claim under bh.mu, and stop's
+// state switch lets one caller past, so two goroutines are never both here.
 func (bh *Beehive) releaseStore() {
 	if bh.claim == "" {
 		return

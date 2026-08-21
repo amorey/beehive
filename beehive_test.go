@@ -842,3 +842,32 @@ func TestStartRefusesAStoreReachedThroughADecorator(t *testing.T) {
 	_, err = second.Start(ctx)
 	assert.ErrorIs(t, err, ErrStoreInUse)
 }
+
+// stop anticipates concurrent callers — a signal handler racing a defer — and
+// the state switch is what gives one of them the teardown. The claim is
+// released by that one alone, which is what lets bh.claim go unsynchronized.
+func TestConcurrentStopReleasesTheStoreOnce(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	first := newTestBeehive(t, store)
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+
+	var stopping sync.WaitGroup
+	for range 4 {
+		stopping.Go(func() { assert.NoError(t, stop(ctx)) })
+	}
+	stopping.Wait()
+
+	second := newTestBeehive(t, store)
+	stop2, err := second.Start(ctx)
+	require.NoError(t, err, "the store was released exactly once")
+	t.Cleanup(func() { assert.NoError(t, stop2(ctx)) })
+
+	// A late stop from the first returns at the state switch, so it cannot
+	// evict the claim taken since.
+	require.NoError(t, stop(ctx))
+	_, err = newTestBeehive(t, store).Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse)
+}
