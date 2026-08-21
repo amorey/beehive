@@ -1791,20 +1791,7 @@ func (s *sqliteStore) attachConditions(ctx context.Context, obj *storeapi.RawObj
 	return obj, nil
 }
 
-// conditionSetLoad answers Conditions().Set's kind gate and its no-op comparisons
-// in one statement, keyed on the same object. The condition columns are NULL when
-// the object holds none of the types; status is NOT NULL wherever a row exists, so
-// it marks presence. transitioned_at is absent deliberately: the upsert decides it
-// in SQL.
-func conditionSetLoad(types int) string {
-	return `
-	SELECT o."group", o.kind, c.type, c.status, c.reason, c.message, c.liveness, c.updated_at
-	  FROM objects o
-	  LEFT JOIN conditions c ON c.object_id = o.id AND c.type IN (` + placeholders(types) + `)
-	 WHERE o.id = ?`
-}
-
-// loadForConditionSet runs conditionSetLoad over the conditions being written:
+// loadForConditionSet runs stmtConditionSetLoad over the conditions being written:
 // the scope error, then whichever of their types are stored, keyed by type.
 // Stored truth, undowngraded — see downgradeLiveness. Chunked under
 // conditionChunkSize, like the upsert it feeds.
@@ -1833,12 +1820,11 @@ func (s *sqliteStore) loadForConditionSetChunk(
 	conds []storeapi.Condition,
 	out map[string]storeapi.Condition,
 ) error {
-	args := make([]any, 0, len(conds)+1)
-	for _, cond := range conds {
-		args = append(args, cond.Type)
+	types := make([]string, len(conds))
+	for i, cond := range conds {
+		types[i] = cond.Type
 	}
-	args = append(args, id)
-	rows, err := s.read(ctx).QueryContext(ctx, conditionSetLoad(len(conds)), args...)
+	rows, err := s.query(ctx, stmtConditionSetLoad, jsonList(types), id)
 	if err != nil {
 		return err
 	}

@@ -69,6 +69,7 @@ const (
 
 	stmtLoadConditions
 	stmtConditionsByIDs
+	stmtConditionSetLoad
 	stmtDeleteCondition
 
 	stmtGetDriverCursor
@@ -237,6 +238,17 @@ var stmtSQL = [numStmts]string{
 		  FROM conditions
 		 WHERE object_id = ?
 		 ORDER BY type`,
+	// Conditions().Set's kind gate and its no-op comparisons, keyed on the same
+	// object. The condition columns are NULL when the object holds none of the
+	// types; status is NOT NULL wherever a row exists, so it marks presence.
+	// transitioned_at is absent deliberately: the upsert decides it in SQL.
+	stmtConditionSetLoad: `
+		SELECT o."group", o.kind, c.type, c.status, c.reason, c.message, c.liveness, c.updated_at
+		  FROM objects o
+		  LEFT JOIN conditions c
+		         ON c.object_id = o.id
+		        AND c.type IN (SELECT value FROM json_each(?))
+		 WHERE o.id = ?`,
 	stmtConditionsByIDs: `
 		SELECT ` + conditionColumns + `
 		  FROM conditions

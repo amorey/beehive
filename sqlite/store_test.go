@@ -1024,21 +1024,13 @@ func TestConditionsReadsRideThePrimaryKey(t *testing.T) {
 func TestConditionSetLoadsTheGateAndTheConditionsTogether(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 
-	for _, tc := range []struct {
-		name  string
-		types []any
-	}{
-		{"one type", []any{"Ready"}},
-		{"several types", []any{"Ready", "Healthy", "Connected"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			plan := queryPlan(t, store, conditionSetLoad(len(tc.types)), append(tc.types, int64(1))...)
-			assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
-				"objects must be reached by rowid:\n"+plan)
-			assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
-				"conditions must be reached through its primary key:\n"+plan)
-		})
-	}
+	plan := queryPlan(t, store, stmtSQL[stmtConditionSetLoad],
+		jsonList([]string{"Ready", "Healthy"}), int64(1))
+
+	assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
+		"objects must be reached by rowid:\n"+plan)
+	assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
+		"conditions must be reached through its primary key:\n"+plan)
 }
 
 // EventsGetLatest surfaces a scan fault on the current run.
@@ -9647,7 +9639,6 @@ var renderedSQLSites = []string{
 	"appendWriteLogUpdates",
 	"reconcileOwedSweepQuery",
 	"sqliteDependencies.ListStaleSince",
-	"conditionSetLoad",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
 	"sqliteStore.markManyForDeletionChunk",
