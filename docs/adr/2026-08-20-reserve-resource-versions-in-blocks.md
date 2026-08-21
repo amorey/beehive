@@ -41,7 +41,7 @@ connection, and the refill would then queue behind it.
 Its failure is swallowed: the commit has already landed, so it cannot be reported,
 and the next draw raises it where a caller can act.
 
-**A reservation that lands late is burned.** `settleVersions` runs after `Commit`
+**A reservation that lands late is burned.** `refillVersions` runs after `Commit`
 has released the connection, so two committing goroutines can both find the block
 spent and both draw; a fallback draw inside a transaction can also land between a
 refill's draw and its install. The block installed last is therefore not always the
