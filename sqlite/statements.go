@@ -112,11 +112,10 @@ const (
 	stmtEdgesListIncoming
 	stmtEdgesListOutgoing
 	stmtEdgesListOutgoingByRelation
-	stmtUnblockedTargets
-	// The batched edge lookups: one per direction, since the route and join
-	// columns swap and both appear in the ORDER BY.
+	// The batched edge lookups, one per direction.
 	stmtEdgesGroupIncoming
 	stmtEdgesGroupOutgoing
+	stmtUnblockedTargets
 	stmtListOwnedChildren
 	stmtEdgesHasIncoming
 	stmtEdgesDeleteFinalizingDependsOn
@@ -393,8 +392,8 @@ var stmtSQL = [numStmts]string{
 		  FROM edges r JOIN objects o ON o.id = r.to_id
 		 WHERE r.from_id IN (SELECT value FROM json_each(?)) AND r.relation = ?
 		 ORDER BY r.from_id, r.to_id`,
-	// Sorts, unlike the four above: the ORDER BY does not lead with the column
-	// the IN list constrains. See TestTheUnblockedTargetsReadSorts.
+	// This one sorts: its ORDER BY does not lead with the column the IN list
+	// constrains, so no index delivers it. See TestTheUnblockedTargetsReadSorts.
 	stmtUnblockedTargets: `
 		SELECT o.id, o."group", o.kind
 		  FROM edges r JOIN objects o ON o.id = r.to_id

@@ -1431,7 +1431,7 @@ func writeLogPageCap(limit int) int { return min(limit, 1024) }
 // nothing when the page has none. op identifies them without reading the blob,
 // which is why it is in the covering index.
 func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWrite) error {
-	var deletes []int64
+	deletes := make([]int64, 0, len(page))
 	for _, w := range page {
 		if w.Op == storeapi.WriteDelete {
 			deletes = append(deletes, w.ResourceVersion)
@@ -2450,8 +2450,8 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, stmt stmtID, whereArg
 }
 
 // markChunkSize bounds the ids bound per batched deletion mark: a measured
-// optimum, and the mark still renders a placeholder per id. A var so tests can
-// shrink it. See docs/adr/2026-07-30-store-write-shapes.md.
+// optimum, and the mark still renders a tuple per id. A var so tests can shrink
+// it. See docs/adr/2026-07-30-store-write-shapes.md.
 var markChunkSize = 128
 
 // markManyForDeletion is markForDeletion over a set: it stamps every id whose
@@ -2899,6 +2899,7 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 	for rows.Next() {
 		var route storeapi.ObjectID
 		var d storeapi.ObjectRef
+		// stmt must select the route column first — that is what buckets here.
 		// INTEGER/TEXT NOT NULL columns; the scan never fails.
 		_ = rows.Scan(&route, &d.ID, &d.Group, &d.Kind)
 		out[route] = append(out[route], d)
@@ -3351,14 +3352,13 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 // jsonList marshals an IN list's values as one JSON array, for
 // `IN (SELECT value FROM json_each(?))`. Numbers stay numbers: json_each gives a
 // JSON string TEXT affinity, which matches no INTEGER column. Marshalling a
-// slice of integers or strings cannot fail, so the error is discarded here
-// rather than at seven call sites.
+// slice of integers or strings cannot fail, so the error is discarded.
 func jsonList[T ~int64 | ~string](values []T) string {
 	out, _ := json.Marshal(values)
 	return string(out)
 }
 
-// placeholders builds "?, ?, ?" for an IN list of n values.
+// placeholders builds "?, ?, ?" for n values, one row of a VALUES tuple set.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
 }

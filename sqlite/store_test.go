@@ -9583,9 +9583,7 @@ func TestOpenFailsOnAStatementItCannotPrepare(t *testing.T) {
 }
 
 // Both multi-row object reads go through listObjects now, so the JSON list must
-// still find what the plain listing finds — and an id past 2^53 proves the list
-// reached SQLite as numbers: stringified, it would match nothing and report an
-// empty result rather than an error.
+// still find what the plain listing finds.
 func TestBothObjectListingsReadTheSameRow(t *testing.T) {
 	store := newDiskStore(t)
 	ctx := context.Background()
@@ -9603,16 +9601,6 @@ func TestBothObjectListingsReadTheSameRow(t *testing.T) {
 	assert.ElementsMatch(t,
 		[]string{"sqliteObjects.List", "sqliteObjects.ListByIncomingEdge", "sqliteObjects.ListByIDs"},
 		callSites(t, "listObjects"))
-
-	big := storeapi.ObjectID(1<<53 + 1)
-	_, err = store.db.ExecContext(ctx,
-		`UPDATE objects SET id = ? WHERE id = ?`, big, obj.ID)
-	require.NoError(t, err)
-
-	byID, err = store.Objects().ListByIDs(ctx, testGK, []storeapi.ObjectID{big})
-	require.NoError(t, err)
-	require.Len(t, byID, 1, "a stringified id would match nothing")
-	assert.Equal(t, big, byID[0].ID)
 }
 
 // Every statement whose text is constant is prepared, so the only SQL left
@@ -9866,6 +9854,17 @@ func TestAnIDListBindsAsNumbers(t *testing.T) {
 	require.NoError(t, store.db.QueryRowContext(ctx,
 		`SELECT typeof(value) FROM json_each(?)`, jsonList([]string{"Ready"})).Scan(&typ))
 	assert.Equal(t, "text", typ)
+
+	// And through a call site, which is where the conversion that breaks it would be.
+	obj := newRefObject(t, store)
+	big := storeapi.ObjectID(1<<53 + 1)
+	_, err := store.db.ExecContext(ctx, `UPDATE objects SET id = ? WHERE id = ?`, big, obj.ID)
+	require.NoError(t, err)
+
+	found, err := store.Objects().ListByIDs(ctx, testGK, []storeapi.ObjectID{big})
+	require.NoError(t, err)
+	require.Len(t, found, 1, "a stringified id would match nothing")
+	assert.Equal(t, big, found[0].ID)
 }
 
 // The batched conditions read orders by the column its IN list constrains, so
