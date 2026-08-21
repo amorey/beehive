@@ -9487,6 +9487,11 @@ func TestEveryWriteVerbRefusesAReadTransaction(t *testing.T) {
 			_, err := s.ReconcileOwed().Sweep(ctx, []storeapi.GroupKind{gk})
 			return err
 		}},
+		{"Events().Sweep by age", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
+			// No cap, so the age branch is what resolves a trim pair.
+			_, err := s.Events().Sweep(ctx, 0, time.Nanosecond, 0)
+			return err
+		}},
 		{"ObjectWrites().Sweep", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
 			// A maxAge that matches every entry, so the sweep reaches its delete.
 			_, err := s.ObjectWrites().Sweep(ctx, 16, time.Nanosecond)
@@ -9705,9 +9710,10 @@ func TestTheStatementSetsHaveThreeUsers(t *testing.T) {
 	}, users, "a statement reached outside the two accessors runs on the wrong connection")
 }
 
-// readsOnly is readStmt and the helpers that forward an id to it.
+// readsOnly is readStmt and the helpers that forward an id to it. query is not
+// among them: it carries a write for deleteWriteLogRows.
 var readsOnly = map[string]bool{
-	"readStmt": true, "query": true, "selectScoped": true, "listObjects": true,
+	"readStmt": true, "selectScoped": true, "listObjects": true,
 }
 
 // readStmt cannot refuse and cannot fail, both of which hold only for a read: a
@@ -9818,4 +9824,29 @@ func TestTheDirectWriteHelpersRefuseAReadFrame(t *testing.T) {
 			assert.ErrorIs(t, err, errWroteInReadTx)
 		})
 	}
+}
+
+// getObjectRowScoped is the blob-carrying scoped read, so its gate is the one
+// selectScoped's callers do not exercise.
+func TestGetObjectRowScopedGatesTheKind(t *testing.T) {
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	_, err := store.getObjectRowScoped(context.Background(),
+		beehive.GroupKind{Kind: "Other"}, obj.ID)
+	assert.ErrorIs(t, err, beehive.ErrWrongKind)
+}
+
+// Objects().ListByIDs renders one placeholder per id, so a caller that ignores
+// the chunk size reaches SQLite's parameter limit. The read reports it rather
+// than truncating.
+func TestAnOversizedIDListIsReported(t *testing.T) {
+	store := newRawStore(t)
+
+	ids := make([]storeapi.ObjectID, 40000)
+	for i := range ids {
+		ids[i] = storeapi.ObjectID(i + 1)
+	}
+	_, err := store.Objects().ListByIDs(context.Background(), testGK, ids)
+	assert.Error(t, err, "past the parameter limit the statement cannot be prepared")
 }

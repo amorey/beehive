@@ -459,7 +459,13 @@ func (s *sqliteStore) exec(ctx context.Context, id stmtID, args ...any) (sql.Res
 }
 
 func (s *sqliteStore) query(ctx context.Context, id stmtID, args ...any) (*sql.Rows, error) {
-	return s.readStmt(ctx, id).QueryContext(ctx, args...)
+	// Not readStmt: deleteWriteLogRows issues a DELETE ... RETURNING through here,
+	// so this shape carries writes and owes them their refusal.
+	ps, err := s.stmtFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return ps.QueryContext(ctx, args...)
 }
 
 // queryRow returns a scanner rather than (*sql.Row, error), so a routing failure

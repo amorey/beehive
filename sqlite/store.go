@@ -845,12 +845,8 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	}
 	now := toMillis(time.Now().UTC())
 
-	insert, err := s.stmtFor(ctx, stmtInsertObject)
-	if err != nil {
-		return nil, err
-	}
 	// RETURNING hands back the written row, assigned id included — no follow-up read.
-	row := insert.QueryRowContext(ctx,
+	row := s.queryRow(ctx, stmtInsertObject,
 		gk.Group, gk.Kind, in.Name, jsonText(in.Spec), in.SpecVersion,
 		rv, jsonText(finalizers), now, now)
 	// scanObject, not scanWritten: the id did not exist before this statement, so
@@ -1719,13 +1715,9 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		if err != nil {
 			return err
 		}
-		ps, err := s.stmtFor(ctx, stmtUpdateStatus)
-		if err != nil {
-			return err
-		}
 		// Keyed on id alone: the kind boundary came from the scoped read in this
 		// transaction — keep the read if you move this statement.
-		_, err = ps.ExecContext(ctx,
+		_, err = s.exec(ctx, stmtUpdateStatus,
 			jsonText(status), stamp, rv, now, id)
 		changed = err == nil
 		return err
@@ -2131,11 +2123,7 @@ func (s sqliteEvents) Add(ctx context.Context, gk storeapi.GroupKind, id storeap
 			return err
 		}
 		// New run (empty timeline or key changed): count 1, point window.
-		ps, err := s.stmtFor(ctx, stmtInsertEventRun)
-		if err != nil {
-			return err
-		}
-		_, err = ps.ExecContext(ctx,
+		_, err = s.exec(ctx, stmtInsertEventRun,
 			id, in.Category, in.Type, in.Reason, in.Message, jsonText(in.Detail), now, now, rv)
 		return err
 	})
@@ -2487,11 +2475,7 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, stmt stmtID, whereArg
 		return 0, false, err
 	}
 	now := toMillis(time.Now().UTC())
-	ps, err := s.stmtFor(ctx, stmt)
-	if err != nil {
-		return 0, false, err
-	}
-	row := ps.QueryRowContext(ctx, append([]any{now, rv, now}, whereArgs...)...)
+	row := s.queryRow(ctx, stmt, append([]any{now, rv, now}, whereArgs...)...)
 	var id storeapi.ObjectID
 	var gk storeapi.GroupKind
 	if err := row.Scan(&id, &gk.Group, &gk.Kind); errors.Is(err, sql.ErrNoRows) {
@@ -3320,12 +3304,9 @@ func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, 
 // version removed per kind, with the total. Closes its rows before returning, so
 // the horizon writes that follow get the transaction's connection back.
 func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, stmt stmtID, args ...any) (map[storeapi.GroupKind]int64, int, error) {
-	// A write id, not a read: a DELETE ... RETURNING is a write however it is issued.
-	ps, err := s.stmtFor(ctx, stmt)
-	if err != nil {
-		return nil, 0, err
-	}
-	rows, err := ps.QueryContext(ctx, args...)
+	// A write id, not a read: a DELETE ... RETURNING is a write however it is
+	// issued, so query is what refuses it on a read frame.
+	rows, err := s.query(ctx, stmt, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -3350,12 +3331,10 @@ func (s *sqliteStore) trimWriteLog(ctx context.Context, stmt stmtID, args ...any
 	if err != nil {
 		return 0, err
 	}
-	raise, err := s.stmtFor(ctx, stmtRaiseWriteLogHorizon)
-	if err != nil {
-		return 0, err
-	}
+	// One statement per kind, and kinds are a handful: resolving inside the loop
+	// costs a bound statement each, and buys the refusal deleteWriteLogRows made.
 	for k, rv := range highest {
-		if _, err := raise.ExecContext(ctx, k.Group, k.Kind, rv); err != nil {
+		if _, err := s.exec(ctx, stmtRaiseWriteLogHorizon, k.Group, k.Kind, rv); err != nil {
 			return 0, err
 		}
 	}
