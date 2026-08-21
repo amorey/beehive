@@ -467,3 +467,75 @@ func BenchmarkUnblockedTargets(b *testing.B) {
 		require.Len(b, out, 8)
 	}
 }
+
+// The two write paths the JSON tuple sets touch, at the sizes a delete cascade
+// runs them: one object, and a full markChunkSize level.
+//
+// The mark is measured directly, not through the cascade: a second cascade over
+// the same owner finds every child already pending and marks nothing, so driving
+// it that way would time the cascade's SELECT and never reach the statement.
+func BenchmarkDeletionMark(b *testing.B) {
+	for _, n := range []int{1, 128} {
+		b.Run(fmt.Sprintf("ids=%d", n), func(b *testing.B) { benchDeletionMark(b, n) })
+	}
+}
+
+func benchDeletionMark(b *testing.B, n int) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	ids := make([]storeapi.ObjectID, 0, n)
+	for i := range n {
+		obj, err := store.Objects().Create(ctx, testGK,
+			beehive.ObjectsCreateInput{Name: fmt.Sprintf("c-%d", i), Spec: []byte(`{}`)})
+		require.NoError(b, err)
+		ids = append(ids, obj.ID)
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		marked, err := store.markManyForDeletion(ctx, ids)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(marked) != n {
+			b.Fatalf("marked %d of %d: the statement is not being exercised", len(marked), n)
+		}
+		b.StopTimer()
+		_, err = store.db.ExecContext(ctx, `UPDATE objects SET deletion_requested_at = NULL`)
+		require.NoError(b, err)
+		b.StartTimer()
+	}
+}
+
+// The batched log append, over the row counts the mark hands it.
+func BenchmarkWriteLogAppendBatch(b *testing.B) {
+	for _, n := range []int{1, 128} {
+		b.Run(fmt.Sprintf("rows=%d", n), func(b *testing.B) { benchWriteLogAppendBatch(b, n) })
+	}
+}
+
+func benchWriteLogAppendBatch(b *testing.B, n int) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	writes := make([]loggedWrite, n)
+	for i := range n {
+		writes[i] = loggedWrite{id: storeapi.ObjectID(i + 1), gk: testGK}
+	}
+
+	b.ResetTimer()
+	for i := range b.N {
+		// Fresh versions per iteration: resource_version is the log's primary key.
+		for j := range writes {
+			writes[j].rv = int64(i*n+j) + 1
+		}
+		if err := store.appendWriteLogUpdates(ctx, writes, 1); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

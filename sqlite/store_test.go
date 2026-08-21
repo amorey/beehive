@@ -3908,20 +3908,24 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 func TestReconcileOwedSweepUsesThePartialIndex(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 
-	for _, tc := range []struct {
-		name string
-		keep []storeapi.GroupKind
-	}{
-		{"keeping kinds", []storeapi.GroupKind{testGK}},
-		{"keeping none", nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			q, args := reconcileOwedSweepQuery(tc.keep)
-			plan := queryPlan(t, store, q, args...)
-			assert.Contains(t, plan, "idx_objects_reconcile_owed",
-				"the reclaim must read the partial index, not scan objects:\n"+plan)
-		})
-	}
+	plan := queryPlan(t, store, stmtSQL[stmtOwedSweep], jsonKinds([]storeapi.GroupKind{testGK}))
+
+	assert.Contains(t, plan, "idx_objects_reconcile_owed",
+		"the reclaim must read the partial index, not scan objects:\n"+plan)
+}
+
+// An empty keep used to need a second query, because NOT IN (VALUES) is a syntax
+// error. An empty JSON array is neither, and it means the same thing.
+func TestReconcileOwedSweepKeepingNoneReclaimsEverything(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, sqliteReconcileOwed{store}.Increment(ctx, obj.ID))
+
+	n, err := store.ReconcileOwed().Sweep(ctx, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
 }
 
 func TestReconcileOwedSweepQueryError(t *testing.T) {
@@ -6967,23 +6971,15 @@ func TestDependentsListStaleSinceDrivesFromTheVersionIndex(t *testing.T) {
 	store := newRawStore(t)
 	newDependentObject(t, store, newRefObject(t, store).ID)
 
-	plan := queryPlan(t, store, `
-		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
-		  FROM objects t
-		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
-		  CROSS JOIN objects d ON d.id = e.from_id
-		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
-		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
-		   AND t.resource_version <= ?
-		   AND e.from_id != e.to_id
-		   AND (d."group", d.kind) IN (VALUES (?, ?))
-		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
-		 ORDER BY t.resource_version, t.id, e.from_id
-		 LIMIT ?`,
-		int64(0), int64(0), int64(0), int64(9000), testGK.Group, testGK.Kind, 10)
+	// The field the store issues, not a copy: the text is long-lived now, so a
+	// test carrying its own string would pass while the store ran something else.
+	plan := queryPlan(t, store, stmtSQL[stmtListStaleSince],
+		int64(0), int64(0), int64(0), int64(9000), jsonKinds([]beehive.GroupKind{testGK}), 10)
 
 	assert.Contains(t, plan, "idx_objects_rv", "the scan must seek targets by version:\n"+plan)
 	assert.NotContains(t, plan, "SCAN t", "and must not read every object:\n"+plan)
+	assert.Contains(t, plan, "idx_edges_to", "the edge seek survives the JSON list:\n"+plan)
+	assert.NotContains(t, plan, "TEMP B-TREE", "the cursor still delivers its own order:\n"+plan)
 }
 
 // TestDependentsListStaleSinceSkipsConvergedAndSpentPositions covers the two ways
@@ -9155,14 +9151,12 @@ func TestNoWriteBypassesConn(t *testing.T) {
 		takesConn[fn] = true
 	}
 	// Functions that name a write without issuing it: helpers handed a dbtx by a
-	// caller that took one from conn, callers that hand a statement id to a helper
-	// that does, and the two builders that only return SQL.
+	// caller that took one from conn, and callers that hand a statement id to a
+	// helper that does.
 	for _, fn := range []string{
-		"appendWriteLogUpdates", "sqliteStore.bumpObject",
+		"sqliteStore.bumpObject",
 		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
-		"sqliteStore.markManyForDeletionChunk",
 		"sqliteEvents.Sweep", "sqliteStore.trimEventsToCap",
-		"reconcileOwedSweepQuery", // builds a string, executes nothing
 	} {
 		takesConn[fn] = true
 	}
@@ -9623,17 +9617,12 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 		"SQL inside a function must be rendered from a runtime count; everything else is a field")
 }
 
-// renderedSQLSites is the twelve functions holding SQL whose text varies with
-// data. Each
-// renders an IN list, a VALUES tuple set or an optional predicate, so one
-// statement per arity would fill the table with single-use entries.
+// renderedSQLSites is the functions still holding SQL whose text varies with
+// data: a VALUES tuple set and an assembled WHERE, so one statement per arity or
+// per predicate combination would fill the table with single-use entries.
 var renderedSQLSites = []string{
-	"appendWriteLogUpdates",
-	"reconcileOwedSweepQuery",
-	"sqliteDependencies.ListStaleSince",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
-	"sqliteStore.markManyForDeletionChunk",
 }
 
 // sqlLiteralSites names every function holding a string literal match accepts.
@@ -9656,7 +9645,10 @@ func sqlLiteralSites(t *testing.T, match func(sql string) bool) []string {
 // refusing it in a read frame, and the write fails as a driver error on a cold
 // path instead. Derived here from the text rather than trusted.
 func TestEveryStatementIsClassifiedByItsOwnText(t *testing.T) {
-	writes := regexp.MustCompile(`(?is)^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+	// The optional WITH prefix is load-bearing: a CTE-fronted write does not
+	// start with its verb, and anchoring on the verb alone would call it a read.
+	writes := regexp.MustCompile(
+		`(?is)^\s*(WITH\b.*\)\s*)?(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
 
 	for id := stmtID(0); id < numStmts; id++ {
 		assert.Equal(t, writes.MatchString(stmtSQL[id]), stmtWrites[id],
@@ -9925,4 +9917,75 @@ func TestASecondSetOfANonASCIIConditionTypeWritesNothing(t *testing.T) {
 
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
 		"the load must find the stored type, or the write repeats forever")
+}
+
+// The rendered VALUES CTE was materialised into an ephemeral table before the
+// join; json_each feeds the join directly, so there is nothing to materialise.
+// The primary-key seek that does the work is unchanged either way.
+func TestTheDeletionMarkDoesNotMaterialiseItsAssignments(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, stmtSQL[stmtMarkManyForDeletion],
+		int64(1), jsonMarkPairs([]storeapi.ObjectID{1, 2}, 100))
+
+	assert.NotContains(t, plan, "MATERIALIZE", plan)
+	assert.Contains(t, plan, "SEARCH objects USING INTEGER PRIMARY KEY",
+		"the assignment still seeks by rowid:\n"+plan)
+}
+
+// The batched append writes the same entry the single append does, so a delete
+// cascade's log is indistinguishable from a row-at-a-time one. Each row carries
+// its own version: a batch shares a draw, never a value.
+func TestTheBatchedWriteLogAppendRecordsEveryWrite(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	for range 3 {
+		child := newRefObject(t, store)
+		require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	}
+	before := markNow(t, store)
+
+	_, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+
+	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, before, 100)
+	require.NoError(t, err)
+	require.Len(t, page, 3, "one entry per child the cascade marked")
+
+	seen := map[int64]bool{}
+	for _, w := range page {
+		assert.Equal(t, storeapi.WriteUpdate, w.Op, "a deletion mark is an update")
+		assert.False(t, seen[w.ResourceVersion], "each row takes its own version")
+		seen[w.ResourceVersion] = true
+	}
+}
+
+// conn's two pool routes, neither of which any caller takes today: every write
+// left that goes through it runs inside Within. Both are contract, not accident —
+// the second is what an AfterCommit hook's detached ctx relies on, and without it
+// a write issued there would fail with sql.ErrTxDone instead of committing
+// standalone.
+func TestConnFallsBackToThePoolWithoutALiveTransaction(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	c, err := store.conn(ctx)
+	require.NoError(t, err)
+	pool, ok := c.(*sql.DB)
+	require.True(t, ok, "no transaction: the pool")
+	assert.Same(t, store.db, pool)
+
+	// A ctx that outlives its transaction, which is what a hook is handed.
+	var expired context.Context
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		expired = ctx
+		return nil
+	}))
+
+	c, err = store.conn(expired)
+	require.NoError(t, err)
+	pool, ok = c.(*sql.DB)
+	require.True(t, ok, "closed transaction: the pool, not a handle that is done")
+	assert.Same(t, store.db, pool)
 }

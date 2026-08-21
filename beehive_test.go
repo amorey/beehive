@@ -413,20 +413,35 @@ func TestStopWithoutStartIsNoOp(t *testing.T) {
 }
 
 func TestStopReturnsWithExpiredContext(t *testing.T) {
-	bh := newTestBeehive(t, &fakeStore{}, WithFullPassInterval(0))
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
 
-	err := Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{})
+	// A drain that cannot finish, so the expired ctx is the only ready case in
+	// stop's select. A controller that returns leaves both ready, and the branch
+	// is then taken at random.
+	ctrl := &blockingController[cSpec, cStatus]{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(ctrl.release) })
+
+	bh := newTestBeehive(t, newClientTestStore(t), WithFullPassInterval(0))
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
-	stop, err := bh.Start(context.Background())
-	require.NoError(t, err)
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "held", cSpec{})
+	<-ctrl.entered
 
 	// An already-expired ctx caps the drain wait. stop must still return (the
 	// test completing proves no hang) and report the expired context so the caller
 	// can tell the drain didn't complete in time.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	assert.ErrorIs(t, stop(ctx), context.Canceled)
+	expired, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
+	assert.ErrorIs(t, stop(expired), context.Canceled)
 
+	// Under the lock: the loops this stop did not wait for are still running.
+	bh.mu.Lock()
+	defer bh.mu.Unlock()
 	assert.Equal(t, beehiveStopped, bh.state)
 }
 

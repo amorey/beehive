@@ -59,6 +59,7 @@ const (
 
 	// The deletion mark and what reads it.
 	stmtMarkForDeletionByID
+	stmtMarkManyForDeletion
 	stmtMarkForDeletionByName
 	stmtProbeDeletionByName
 	stmtListDeletionRequests
@@ -67,6 +68,7 @@ const (
 	stmtListOwedIDs
 	stmtDecrementOwed
 	stmtStampOwed
+	stmtOwedSweep
 
 	stmtLoadConditions
 	stmtConditionsByIDs
@@ -85,6 +87,7 @@ const (
 	stmtWriteLogPage
 	stmtWriteLogImages
 	stmtAppendWriteLog
+	stmtAppendWriteLogUpdates
 	stmtAppendWriteLogDelete
 	stmtRaiseWriteLogHorizon
 	// deleteWriteLogRows runs one of two predicates, both RETURNING.
@@ -126,6 +129,7 @@ const (
 	stmtStampOwedForNewEdge
 	stmtClearWatermarkForNewEdge
 	stmtWatermarkSet
+	stmtListStaleSince
 
 	stmtDrawResourceVersions
 
@@ -240,6 +244,14 @@ var stmtSQL = [numStmts]string{
 		UPDATE objects
 		   SET reconcile_owed = reconcile_owed + 1
 		 WHERE id IN (SELECT value FROM json_each(?))`,
+	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
+	// An empty array keeps no kind and so reclaims every row, which is what the
+	// rendered NOT IN (VALUES) could not express.
+	stmtOwedSweep: `
+		UPDATE objects
+		   SET reconcile_owed = 0
+		 WHERE reconcile_owed != 0
+		   AND ("group", kind) NOT IN (SELECT value ->> 0, value ->> 1 FROM json_each(?))`,
 
 	stmtLoadConditions: `
 		SELECT ` + conditionColumns + `
@@ -311,6 +323,12 @@ var stmtSQL = [numStmts]string{
 	stmtAppendWriteLog: `
 		INSERT INTO object_writes (` + objectWritesColumns + `)
 		VALUES (?, ?, ?, ?, ?, ?)`,
+	// One entry per write in a batch, each carrying the version its own row took.
+	// op and written_at are the batch's, so only the per-row values ride the array.
+	stmtAppendWriteLogUpdates: `
+		INSERT INTO object_writes (` + objectWritesColumns + `)
+		SELECT value ->> 0, value ->> 1, value ->> 2, value ->> 3, ?1, ?2
+		  FROM json_each(?3)`,
 	stmtAppendWriteLogDelete: `
 		INSERT INTO object_writes
 		       (resource_version, object_id, "group", kind, op, written_at, final)
@@ -437,6 +455,36 @@ var stmtSQL = [numStmts]string{
 	stmtClearWatermarkForNewEdge: `
 		DELETE FROM dependency_watermarks
 		 WHERE object_id = ? AND ` + edgeIsNew,
+	// The assignment rides a joined array, never a CASE over the id, which is
+	// quadratic in the chunk. A row the IS NULL guard skips leaves its assigned
+	// version unused; the gap is harmless, since every consumer seeks forward.
+	// RETURNING, not RowsAffected: the log entries need each row's identity and
+	// the version it actually took.
+	stmtMarkManyForDeletion: `
+		WITH assigned(mark_id, mark_rv) AS
+		     (SELECT value ->> 0, value ->> 1 FROM json_each(?2))
+		UPDATE objects
+		   SET deletion_requested_at = ?1, updated_at = ?1, resource_version = assigned.mark_rv
+		  FROM assigned
+		 WHERE objects.id = assigned.mark_id AND objects.deletion_requested_at IS NULL
+		RETURNING objects.id, objects."group", objects.kind, objects.resource_version`,
+	// The CROSS JOINs pin the join order: targets, then incoming edges, then
+	// dependents. Without them the planner reads the whole graph and the cursor
+	// buys nothing. No GROUP BY: a row is one (target, dependent) pair, and the
+	// position needs both to resume.
+	stmtListStaleSince: `
+		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
+		  FROM objects t
+		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
+		  CROSS JOIN objects d ON d.id = e.from_id
+		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
+		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND t.resource_version <= ?
+		   AND e.from_id != e.to_id
+		   AND (d."group", d.kind) IN (SELECT value ->> 0, value ->> 1 FROM json_each(?))
+		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
+		 ORDER BY t.resource_version, t.id, e.from_id
+		 LIMIT ?`,
 	stmtWatermarkSet: `
 		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
 		SELECT ?, ?, ?
@@ -531,6 +579,9 @@ var stmtWrites = [numStmts]bool{
 	stmtEdgesDeleteFinalizingDependsOn: true,
 	stmtDecrementOwed:                  true,
 	stmtStampOwed:                      true,
+	stmtOwedSweep:                      true,
+	stmtMarkManyForDeletion:            true,
+	stmtAppendWriteLogUpdates:          true,
 	stmtWatermarkSet:                   true,
 	stmtStampOwedForNewEdge:            true,
 	stmtClearWatermarkForNewEdge:       true,
