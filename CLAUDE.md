@@ -414,7 +414,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   columns), which is what let the last tuple set — the conditions upsert — bind
   as JSON too: the encoding substitutes U+FFFD for bytes it cannot carry, so the
   gate is what makes the write lossless rather than the helper's shape.
-  → [ADR](docs/adr/2026-08-21-a-condition-is-utf8-text.md)
+  → [ADR](docs/adr/2026-08-21-a-condition-is-utf8-text.md) **The tripwire sees a
+  `PRAGMA` and a savepoint verb**, and the four statements SQLite will not let us
+  prepare — one pragma argument, three savepoint names — are exempt with the
+  reason beside the name, which a test keeps from rotting.
+  → [ADR](docs/adr/2026-08-21-the-tripwire-sees-a-pragma.md)
 - **Reads run on their own connections.** The writer is one connection; reads
   that are not inside a transaction run on a read-only pool of
   `WithReadConnections` (4 by default), so they no longer queue behind writes.
