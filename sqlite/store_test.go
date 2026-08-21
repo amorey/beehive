@@ -9642,7 +9642,6 @@ var renderedSQLSites = []string{
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
 	"sqliteStore.markManyForDeletionChunk",
-	"sqliteStore.unblockedTargetsChunk",
 	"sqliteStore.edgesByIDsChunk",
 }
 
@@ -9888,4 +9887,18 @@ func TestTheBatchedConditionsReadInheritsTheIndexOrder(t *testing.T) {
 	plan := queryPlan(t, store, stmtSQL[stmtConditionsByIDs], jsonList([]storeapi.ObjectID{1, 2}))
 
 	assert.NotContains(t, plan, "ORDER BY", "the conditions index already delivers this order:\n"+plan)
+}
+
+// The one converted read whose plan changes. It filters r.from_id and orders by
+// r.to_id, which the primary key gives only inside one from_id — so a rendered
+// list of one used to sort for free and a JSON list never can. Pinned as it is,
+// not as it was: the sort is over the deletion-pending targets of one object.
+func TestTheUnblockedTargetsReadSorts(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, stmtSQL[stmtUnblockedTargets],
+		jsonList([]storeapi.ObjectID{1}), string(storeapi.RelationDependsOn))
+
+	assert.Contains(t, plan, "USE TEMP B-TREE FOR ORDER BY", plan)
+	assert.Contains(t, plan, "SEARCH r USING PRIMARY KEY", "the edges seek survives:\n"+plan)
 }

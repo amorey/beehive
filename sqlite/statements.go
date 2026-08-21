@@ -111,6 +111,7 @@ const (
 	stmtEdgesListIncoming
 	stmtEdgesListOutgoing
 	stmtEdgesListOutgoingByRelation
+	stmtUnblockedTargets
 	stmtListOwnedChildren
 	stmtEdgesHasIncoming
 	stmtEdgesDeleteFinalizingDependsOn
@@ -374,6 +375,14 @@ var stmtSQL = [numStmts]string{
 		SELECT o.id, o."group", o.kind
 		  FROM edges r JOIN objects o ON o.id = r.to_id
 		 WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget,
+	// Sorts, unlike the four above: the ORDER BY does not lead with the column
+	// the IN list constrains. See TestTheUnblockedTargetsReadSorts.
+	stmtUnblockedTargets: `
+		SELECT o.id, o."group", o.kind
+		  FROM edges r JOIN objects o ON o.id = r.to_id
+		 WHERE r.from_id IN (SELECT value FROM json_each(?)) AND r.relation = ?
+		   AND o.deletion_requested_at IS NOT NULL
+		   AND o.id <> r.from_id` + edgeOrderByTarget,
 	stmtListOwnedChildren: `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		  FROM edges r JOIN objects o ON o.id = r.from_id
