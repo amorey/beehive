@@ -16,7 +16,6 @@ package beehive
 
 import (
 	"context"
-	"log/slog"
 	"runtime"
 	"sync"
 	"testing"
@@ -800,14 +799,13 @@ func TestStopLeavesAnotherBeehivesRegistration(t *testing.T) {
 	assert.ErrorIs(t, err, ErrStoreInUse, "the never-started stop evicted a live claim")
 }
 
-// A stop whose drain hit its deadline still releases the store. The loops are
-// cancelled and ending, so handing the store on beats locking it out for the
-// life of the process — but this is the one case where the guarantee lapses,
-// and nothing else records it.
-func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
+// A stop whose drain hit its deadline holds the store until the loops it
+// cancelled actually stop. The claim outlives the deadline by exactly as long
+// as a writer of this Beehive is still running, so a successor is refused for
+// precisely that window and no longer.
+func TestABlownDeadlineHoldsTheStoreUntilTheLoopsStop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
-	logger, logs := captureLogger(slog.LevelWarn)
 	store := newClientTestStore(t)
 
 	// A drain that cannot finish, so stop's select has one ready case. A
@@ -816,9 +814,7 @@ func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	t.Cleanup(func() { close(ctrl.release) })
-
-	bh := newTestBeehive(t, store, WithFullPassInterval(0), WithLogger(logger))
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
 	require.NoError(t, Register(bh, clientTestGK, ctrl))
 	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
@@ -828,16 +824,22 @@ func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
 
 	expired, cancelExpired := context.WithCancel(context.Background())
 	cancelExpired()
-	err = stop(expired)
-	require.ErrorIs(t, err, context.Canceled, "the cause survives the wrap")
-	require.ErrorIs(t, err, ErrDrainIncomplete,
-		"a caller handing the store on must be able to tell this from any other stop failure")
+	require.ErrorIs(t, stop(expired), context.Canceled)
 
-	assert.Contains(t, logs.String(), "store released before its loops drained")
+	_, err = newTestBeehive(t, store).Start(ctx)
+	require.ErrorIs(t, err, ErrStoreInUse, "a writer of the stopped Beehive is still running")
 
-	stop2, err := newTestBeehive(t, store).Start(ctx)
-	require.NoError(t, err, "a blown deadline must not lock the store out")
-	assert.NoError(t, stop2(ctx))
+	// Releasing the loops is what releases the store. A spin on observable
+	// state, not a sleep: the release runs on the drain's own goroutine.
+	close(ctrl.release)
+	for deadline := time.Now().Add(testTimeout); ; runtime.Gosched() {
+		next, err := newTestBeehive(t, store).Start(ctx)
+		if err == nil {
+			assert.NoError(t, next(ctx))
+			break
+		}
+		require.False(t, time.Now().After(deadline), "the drained loops never released the store")
+	}
 }
 
 // A decorator reports what it wraps, so two beehives over one store through two
@@ -956,4 +958,30 @@ func TestNonOwningStopReturnsBeforeTheStoreIsReleased(t *testing.T) {
 	stopNext, err := newTestBeehive(t, store).Start(ctx)
 	require.NoError(t, err, "the owner's return is what frees the store")
 	assert.NoError(t, stopNext(ctx))
+}
+
+// Two Starts racing over one store: exactly one wins. The registry is package
+// state, so the losers must see the winner's claim however the two interleave.
+func TestSimultaneousStartsCollide(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	var starting sync.WaitGroup
+	stops := make(chan func(context.Context) error, 8)
+	for range 8 {
+		bh := newTestBeehive(t, store)
+		starting.Go(func() {
+			stop, err := bh.Start(ctx)
+			if err == nil {
+				stops <- stop
+				return
+			}
+			assert.ErrorIs(t, err, ErrStoreInUse)
+		})
+	}
+	starting.Wait()
+	close(stops)
+
+	require.Len(t, stops, 1, "exactly one Start holds the store")
+	assert.NoError(t, (<-stops)(ctx))
 }

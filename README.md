@@ -75,8 +75,8 @@ func main() {
 
   ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
   defer cancel()
-  // ErrDrainIncomplete means ctx expired first: the loops are cancelled and
-  // ending, but have not ended. The store's claim is released either way.
+  // An error means ctx expired before the loops drained. They are cancelled
+  // and ending, and the store's claim outlives them by exactly that long.
   if err := stop(ctx); err != nil {
     log.Printf("beehive: shutdown did not drain cleanly: %v", err)
   }

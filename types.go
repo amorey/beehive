@@ -185,12 +185,6 @@ type Object[Spec, Status any] struct {
 // relation was not fetched on the read that produced the object.
 var ErrNotLoaded = errors.New("beehive: secondary lookup not loaded")
 
-// ErrDrainIncomplete is returned by stop when ctx expired before the reconcile
-// loops drained. The store's claim is released regardless, so a caller that
-// means to hand the store to another Beehive can decline: the loops are
-// cancelled and ending, but they have not ended.
-var ErrDrainIncomplete = errors.New("beehive: stopped before the reconcile loops drained")
-
 // ErrInvalidStoreIdentity is returned by Start when the store's Identity is
 // empty. "" names no database, so two unrelated stores would collide on it.
 var ErrInvalidStoreIdentity = errors.New("beehive: store reports no identity")

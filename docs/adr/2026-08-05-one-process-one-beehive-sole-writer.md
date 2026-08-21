@@ -74,14 +74,22 @@ the write log. The constraint is on *concurrent* access, not on succession.
 
 **Enforcement is split by what beehive can see.** Within the process it is
 checked: `Start` claims its store's database, and a second `Beehive` over that
-database is `ErrStoreInUse`. One `internal/claim` set — a map and a mutex, no
-lock file and nothing durable.
+database is `ErrStoreInUse`. A map and a mutex in `beehive.go` — no lock file
+and nothing durable.
 
-It keys on `Store.Identity` — the database's absolute path, or a token for a
+**The claim outlives a blown stop deadline.** It is released once the reconcile
+loops have actually stopped, not when `stop` returns, so a caller whose deadline
+expired hands nothing on early: a successor is refused for exactly as long as a
+writer of the old `Beehive` is still running. That is what keeps the rule a rule
+rather than a rule with an acknowledged lapse.
+
+It keys on `Store.Identity` — the database's *normalized path*, or a token for a
 memory store, whose `file::memory:` genuinely is a database of its own. Keying
 on the database rather than on the store value is what makes the check
 sufficient on its own: two `sqlite.Open` calls on one path report one identity
-and collide, and a decorator claims what it wraps rather than itself.
+and collide, and a decorator claims what it wraps rather than itself. Normalized,
+not canonical: two names for one file — a symlink, a hard link — are two
+identities, which is the same guardrail-not-boundary the third clause already is.
 
 **`sqlite.Open` takes no claim of its own.** A second open with no second
 `Beehive` behind it is out-of-band access, which the third clause above leaves

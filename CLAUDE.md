@@ -65,8 +65,9 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   not degraded. Restarts are supported and are not what this excludes; the
   constraint is on *concurrent* access. **Enforced within the process** — a
   second `Beehive` over a running database is `ErrStoreInUse`, keyed on
-  `Store.Identity` through `internal/claim`, so two stores over one file collide
-  too — and documented only across
+  `Store.Identity`, so two stores over one file collide too — and the claim is
+  held until the loops it cancelled have stopped, so a blown stop deadline
+  narrows the window rather than opening one. Documented only across
   processes, which is the embedder's to arrange, and for an out-of-band writer,
   which nothing can detect. Do not justify
   a driver, a tick or a backstop by "a second process could write the store", and

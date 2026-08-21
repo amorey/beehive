@@ -409,9 +409,10 @@ type Store interface {
 	// Events is the per-object event log, aggregated into runs.
 	Events() Events
 
-	// Identity names the database behind this store, so two stores over one
-	// database report one string. Stable for the store's lifetime, and never
-	// empty: "" names no database, so two unrelated stores would collide on it.
+	// Identity names this store's database, so two stores opened the same way
+	// report one string — a normalized path, not a canonical one: two names for
+	// one file (a symlink, a hard link) are two identities. Stable for the
+	// store's lifetime, and never empty, since "" would collide across stores.
 	Identity() string
 
 	// ObjectWrites is the append-only object write log.

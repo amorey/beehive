@@ -136,7 +136,8 @@ func (s *sqliteStore) Close() error {
 	return errors.Join(err, s.db.Close())
 }
 
-// Identity is the absolute path, or a token for a memory store.
+// Identity is the absolute path, or a token for a memory store. Two names for
+// one file are two identities; see the interface.
 func (s *sqliteStore) Identity() string { return s.identity }
 
 // Drain floor: release only past both an absolute size and a share of the file.

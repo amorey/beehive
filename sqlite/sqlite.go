@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -125,7 +124,7 @@ func OpenMemory() (*sqliteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.identity = "memory:" + strconv.FormatInt(memoryStores.Add(1), 10)
+	s.identity = fmt.Sprintf("memory:%d", memoryStores.Add(1))
 	return s, nil
 }
 
