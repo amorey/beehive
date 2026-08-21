@@ -1218,27 +1218,10 @@ func (s sqliteReconcileOwed) Stamp(ctx context.Context, refs []storeapi.ObjectRe
 	return err
 }
 
-// reconcileOwedSweepQuery builds the reclaim. The test that pins its query plan
-// calls this too, so the plan it pins is the one that runs.
-func reconcileOwedSweepQuery(keep []storeapi.GroupKind) (string, []any) {
-	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
-	q := `UPDATE objects SET reconcile_owed = 0 WHERE reconcile_owed != 0`
-	if len(keep) == 0 {
-		return q, nil // NOT IN (VALUES) is a syntax error, and nothing is kept
-	}
-	values, args := kindTuples(keep)
-	return q + ` AND ("group", kind) NOT IN (VALUES ` + values + `)`, args
-}
-
 // ReconcileOwed().Sweep zeroes the owed count outside keep in one no-emit UPDATE
 // (contract on storeapi.Store).
 func (s sqliteReconcileOwed) Sweep(ctx context.Context, keep []storeapi.GroupKind) (int, error) {
-	q, args := reconcileOwedSweepQuery(keep)
-	c, err := s.conn(ctx)
-	if err != nil {
-		return 0, err
-	}
-	res, err := c.ExecContext(ctx, q, args...)
+	res, err := s.exec(ctx, stmtOwedSweep, jsonKinds(keep))
 	if err != nil {
 		return 0, err
 	}
@@ -3355,6 +3338,19 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 		return nil, nil
 	}
 	return s.listObjects(ctx, stmtListObjectsByIDs, jsonList(ids), gk.Group, gk.Kind)
+}
+
+// jsonKinds marshals kinds as one JSON array of [group, kind] pairs, for a
+// `(group, kind) IN (SELECT value ->> 0, value ->> 1 FROM json_each(?))` set.
+// The values come from Register, never from caller data, so they are identifiers
+// and marshalling them cannot lose bytes JSON has no room for.
+func jsonKinds(kinds []storeapi.GroupKind) string {
+	pairs := make([][2]string, len(kinds))
+	for i, gk := range kinds {
+		pairs[i] = [2]string{gk.Group, gk.Kind}
+	}
+	out, _ := json.Marshal(pairs)
+	return string(out)
 }
 
 // jsonList marshals an IN list's ids as one JSON array, for

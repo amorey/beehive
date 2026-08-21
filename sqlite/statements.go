@@ -67,6 +67,7 @@ const (
 	stmtListOwedIDs
 	stmtDecrementOwed
 	stmtStampOwed
+	stmtOwedSweep
 
 	stmtLoadConditions
 	stmtConditionsByIDs
@@ -240,6 +241,14 @@ var stmtSQL = [numStmts]string{
 		UPDATE objects
 		   SET reconcile_owed = reconcile_owed + 1
 		 WHERE id IN (SELECT value FROM json_each(?))`,
+	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
+	// An empty array keeps no kind and so reclaims every row, which is what the
+	// rendered NOT IN (VALUES) could not express.
+	stmtOwedSweep: `
+		UPDATE objects
+		   SET reconcile_owed = 0
+		 WHERE reconcile_owed != 0
+		   AND ("group", kind) NOT IN (SELECT value ->> 0, value ->> 1 FROM json_each(?))`,
 
 	stmtLoadConditions: `
 		SELECT ` + conditionColumns + `
@@ -531,6 +540,7 @@ var stmtWrites = [numStmts]bool{
 	stmtEdgesDeleteFinalizingDependsOn: true,
 	stmtDecrementOwed:                  true,
 	stmtStampOwed:                      true,
+	stmtOwedSweep:                      true,
 	stmtWatermarkSet:                   true,
 	stmtStampOwedForNewEdge:            true,
 	stmtClearWatermarkForNewEdge:       true,

@@ -3908,20 +3908,24 @@ func TestReconcileOwedSweepIsNoEmit(t *testing.T) {
 func TestReconcileOwedSweepUsesThePartialIndex(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 
-	for _, tc := range []struct {
-		name string
-		keep []storeapi.GroupKind
-	}{
-		{"keeping kinds", []storeapi.GroupKind{testGK}},
-		{"keeping none", nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			q, args := reconcileOwedSweepQuery(tc.keep)
-			plan := queryPlan(t, store, q, args...)
-			assert.Contains(t, plan, "idx_objects_reconcile_owed",
-				"the reclaim must read the partial index, not scan objects:\n"+plan)
-		})
-	}
+	plan := queryPlan(t, store, stmtSQL[stmtOwedSweep], jsonKinds([]storeapi.GroupKind{testGK}))
+
+	assert.Contains(t, plan, "idx_objects_reconcile_owed",
+		"the reclaim must read the partial index, not scan objects:\n"+plan)
+}
+
+// An empty keep used to need a second query, because NOT IN (VALUES) is a syntax
+// error. An empty JSON array is neither, and it means the same thing.
+func TestReconcileOwedSweepKeepingNoneReclaimsEverything(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	require.NoError(t, sqliteReconcileOwed{store}.Increment(ctx, obj.ID))
+
+	n, err := store.ReconcileOwed().Sweep(ctx, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
 }
 
 func TestReconcileOwedSweepQueryError(t *testing.T) {
@@ -9629,7 +9633,6 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 // statement per arity would fill the table with single-use entries.
 var renderedSQLSites = []string{
 	"appendWriteLogUpdates",
-	"reconcileOwedSweepQuery",
 	"sqliteDependencies.ListStaleSince",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
