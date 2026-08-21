@@ -409,6 +409,23 @@ var stmtWrites = [numStmts]bool{
 // stmtSet is one pool's preparations.
 type stmtSet [numStmts]*sql.Stmt
 
+// readStmt is stmtFor for an id that reads. It cannot fail: a read is prepared on
+// both pools, so no route reaches an empty slot, and a read is never refused.
+// Passing a write is a programming error, pinned by
+// TestOnlyReadsTakeTheInfallibleAccessor.
+func (s *sqliteStore) readStmt(ctx context.Context, id stmtID) *sql.Stmt {
+	st := liveTx(ctx)
+	if st == nil {
+		return s.readStmts[id]
+	}
+	if st.readOnly {
+		return st.tx.StmtContext(ctx, s.readStmts[id])
+	}
+	// A read inside a write transaction runs on the writer's connection, or it
+	// reads from before that transaction's own writes.
+	return st.tx.StmtContext(ctx, s.writeStmts[id])
+}
+
 // stmtFor returns id bound to the connection ctx selects: the transaction's own
 // connection while one is live, else the pool the statement was prepared on. A
 // nil slot is a routing bug and is reported here, not at execution.
@@ -416,17 +433,17 @@ func (s *sqliteStore) stmtFor(ctx context.Context, id stmtID) (*sql.Stmt, error)
 	st := liveTx(ctx)
 	switch {
 	case st == nil && stmtWrites[id]:
-		return bindStmt(ctx, st, id, s.writeStmts[id])
+		return bindStmt(ctx, st, s.writeStmts[id]), nil
 	case st == nil:
-		return bindStmt(ctx, st, id, s.readStmts[id])
+		return bindStmt(ctx, st, s.readStmts[id]), nil
 	case st.readOnly:
 		// Refused before any statement runs, as conn does and for the same reason.
 		if stmtWrites[id] {
 			return nil, errWroteInReadTx
 		}
-		return bindStmt(ctx, st, id, s.readStmts[id])
+		return bindStmt(ctx, st, s.readStmts[id]), nil
 	default:
-		return bindStmt(ctx, st, id, s.writeStmts[id])
+		return bindStmt(ctx, st, s.writeStmts[id]), nil
 	}
 }
 
@@ -442,11 +459,7 @@ func (s *sqliteStore) exec(ctx context.Context, id stmtID, args ...any) (sql.Res
 }
 
 func (s *sqliteStore) query(ctx context.Context, id stmtID, args ...any) (*sql.Rows, error) {
-	ps, err := s.stmtFor(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	return ps.QueryContext(ctx, args...)
+	return s.readStmt(ctx, id).QueryContext(ctx, args...)
 }
 
 // queryRow returns a scanner rather than (*sql.Row, error), so a routing failure
@@ -465,16 +478,13 @@ type errScanner struct{ err error }
 func (e errScanner) Scan(...any) error { return e.err }
 
 // bindStmt binds ps to st's connection, or hands back the pool's own where there
-// is no transaction. A nil slot means the id reached a pool that did not prepare
-// it; reported here rather than dereferenced at the call site.
-func bindStmt(ctx context.Context, st *txState, id stmtID, ps *sql.Stmt) (*sql.Stmt, error) {
-	if ps == nil {
-		return nil, fmt.Errorf("beehive/sqlite: statement %d is not prepared on this pool", id)
-	}
+// is no transaction. ps is never nil: a write is refused above before it can
+// reach the reader's empty slot, and a read is prepared on both pools.
+func bindStmt(ctx context.Context, st *txState, ps *sql.Stmt) *sql.Stmt {
 	if st == nil {
-		return ps, nil
+		return ps
 	}
-	return st.tx.StmtContext(ctx, ps), nil
+	return st.tx.StmtContext(ctx, ps)
 }
 
 // prepareWriteStatements fills the writer's set, reads included: a read issued

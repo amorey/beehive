@@ -9191,10 +9191,11 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	assert.Empty(t, bypass, "a write here takes its connection from somewhere conn cannot refuse")
 }
 
-// The transaction handle is reachable only through conn, read and stmtFor, plus
-// the savepoint statements. Those three are where a write into a read frame is
-// refused: a statement issued on st.tx directly would reach none of them.
-func TestTheTransactionHandleHasFourUsers(t *testing.T) {
+// The transaction handle is reachable only through conn, read and the two
+// statement accessors, plus the savepoint statements. conn and stmtFor are where
+// a write into a read frame is refused; readStmt carries no write to refuse. A
+// statement issued on st.tx directly would reach none of them.
+func TestTheTransactionHandleHasFiveUsers(t *testing.T) {
 	seen := map[string]bool{}
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
 		sel, ok := n.(*ast.SelectorExpr)
@@ -9208,11 +9209,12 @@ func TestTheTransactionHandleHasFourUsers(t *testing.T) {
 	}
 
 	assert.ElementsMatch(t, []string{
-		"sqliteStore.conn", // hands it to writes, and refuses a read frame
-		"sqliteStore.read", // hands it to reads
-		"bindStmt",         // binds a prepared statement to it; stmtFor refuses the same
-		"txState.nested",   // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
-	}, users, "a fifth user of st.tx is a write nothing can refuse")
+		"sqliteStore.conn",     // hands it to writes, and refuses a read frame
+		"sqliteStore.read",     // hands it to reads
+		"bindStmt",             // binds a write's statement; stmtFor refuses the same
+		"sqliteStore.readStmt", // binds a read's; there is nothing to refuse
+		"txState.nested",       // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
+	}, users, "a sixth user of st.tx is a write nothing can refuse")
 }
 
 // A write inside a read transaction is refused before any statement runs, in both
@@ -9699,5 +9701,121 @@ func TestTheStatementSetsHaveThreeUsers(t *testing.T) {
 		"sqliteStore.prepareReadStatements",
 		"sqliteStore.closeStatements",
 		"sqliteStore.stmtFor",
-	}, users, "a statement reached outside stmtFor runs on the wrong connection")
+		"sqliteStore.readStmt",
+	}, users, "a statement reached outside the two accessors runs on the wrong connection")
+}
+
+// readsOnly is readStmt and the helpers that forward an id to it.
+var readsOnly = map[string]bool{
+	"readStmt": true, "query": true, "selectScoped": true, "listObjects": true,
+}
+
+// readStmt cannot refuse and cannot fail, both of which hold only for a read: a
+// write reaching it would take the reader's empty slot. Every argument is
+// checked here, since the type cannot say it.
+func TestOnlyReadsTakeTheInfallibleAccessor(t *testing.T) {
+	writes := regexp.MustCompile(`(?is)^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+	text := preparedSQL(t)
+
+	var checked int
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			return
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !readsOnly[sel.Sel.Name] {
+			return
+		}
+		arg, ok := call.Args[1].(*ast.Ident)
+		if !ok {
+			return
+		}
+		sql, named := text[arg.Name]
+		if !named {
+			return // a parameter forwarding an id; its own callers are checked
+		}
+		assert.False(t, writes.MatchString(sql),
+			"%s passes a write to %s", qualify(recv, fn), sel.Sel.Name)
+		checked++
+	}))
+	assert.NotZero(t, checked, "the walk found no readStmt call, so it proves nothing")
+}
+
+// The version seed draws through a prepared statement before Open returns, so a
+// draw that fails is a constructor failure rather than a store handing out
+// versions nobody reserved.
+func TestOpenFailsWhenTheVersionSeedCannotDraw(t *testing.T) {
+	restore := stmtSQL[stmtDrawResourceVersions]
+	// Prepares and binds, and returns no row — so the seed's Scan fails.
+	stmtSQL[stmtDrawResourceVersions] = `SELECT value FROM resource_version_seq WHERE id = ? AND 0`
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	stmtSQL[stmtDrawResourceVersions] = restore
+
+	require.Error(t, err)
+	assert.Nil(t, store)
+}
+
+// OpenMemory prepares on the one pool it has, and reports the same failure.
+func TestOpenMemoryFailsOnAStatementItCannotPrepare(t *testing.T) {
+	restore := stmtSQL[stmtGetObjectRow]
+	stmtSQL[stmtGetObjectRow] = `SELECT nonexistent FROM objects WHERE id = ?`
+	store, err := OpenMemory()
+	stmtSQL[stmtGetObjectRow] = restore
+
+	require.Error(t, err)
+	assert.Nil(t, store)
+}
+
+// A write reaching queryRow on a read frame is refused there, and the refusal
+// rides to the Scan its caller was going to make.
+func TestAWriteThroughQueryRowIsRefusedOnAReadFrame(t *testing.T) {
+	store := newRawStore(t)
+
+	err := store.withinRead(context.Background(), func(ctx context.Context) error {
+		_, err := store.drawResourceVersions(ctx, 1)
+		return err
+	})
+	assert.ErrorIs(t, err, errWroteInReadTx)
+}
+
+// The write helpers that take their statement directly, rather than through
+// exec or queryRow, refuse a read frame the same way. Each is unexported and
+// reached only from a verb that refuses earlier, so the refusal is pinned here
+// rather than through a caller.
+func TestTheDirectWriteHelpersRefuseAReadFrame(t *testing.T) {
+	ctx := context.Background()
+
+	helpers := []struct {
+		name  string
+		write func(context.Context, *sqliteStore, *storeapi.RawObject) error
+	}{
+		{"appendWriteLogDelete", func(ctx context.Context, s *sqliteStore, obj *storeapi.RawObject) error {
+			return s.appendWriteLogDelete(ctx, obj, 1, 1)
+		}},
+		{"trimStmts", func(ctx context.Context, s *sqliteStore, _ *storeapi.RawObject) error {
+			_, _, err := s.trimStmts(ctx, stmtRaiseEventHorizonByAge, stmtTrimEventsByAge)
+			return err
+		}},
+		{"deleteWriteLogRows", func(ctx context.Context, s *sqliteStore, _ *storeapi.RawObject) error {
+			_, _, err := s.deleteWriteLogRows(ctx, stmtTrimWriteLogByAge, int64(0))
+			return err
+		}},
+		{"markForDeletion", func(ctx context.Context, s *sqliteStore, obj *storeapi.RawObject) error {
+			_, _, err := s.markForDeletion(ctx, stmtMarkForDeletionByID, obj.ID, testGK.Group, testGK.Kind)
+			return err
+		}},
+	}
+
+	for _, tc := range helpers {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRawStore(t)
+			obj := newRefObject(t, store)
+
+			err := store.withinRead(ctx, func(ctx context.Context) error {
+				return tc.write(ctx, store, obj)
+			})
+			assert.ErrorIs(t, err, errWroteInReadTx)
+		})
+	}
 }

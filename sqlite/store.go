@@ -961,12 +961,9 @@ func (s *sqliteStore) selectScoped(
 	stmt stmtID,
 	dest ...any,
 ) error {
-	ps, err := s.stmtFor(ctx, stmt)
-	if err != nil {
-		return err
-	}
+	ps := s.readStmt(ctx, stmt)
 	var group, kind string
-	err = ps.QueryRowContext(ctx, id).
+	err := ps.QueryRowContext(ctx, id).
 		Scan(append([]any{&group, &kind}, dest...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storeapi.ErrNotFound // bare, like scanObject's
@@ -1112,10 +1109,7 @@ func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ..
 // listObjects is listObjectsWhere over a prepared statement, for the callers
 // whose tail is constant.
 func (s *sqliteStore) listObjects(ctx context.Context, stmt stmtID, args ...any) ([]*storeapi.RawObject, error) {
-	ps, err := s.stmtFor(ctx, stmt)
-	if err != nil {
-		return nil, err
-	}
+	ps := s.readStmt(ctx, stmt)
 	rows, err := ps.QueryContext(ctx, args...)
 	if err != nil {
 		return nil, err
@@ -2279,12 +2273,9 @@ func (s *sqliteStore) eventPage(
 // eventHorizon is what retention removed from id's category, or from its highest
 // timeline when category is nil. No row means nothing has been trimmed.
 func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, category *string) (int64, error) {
-	ps, err := s.stmtFor(ctx, stmtEventHorizon)
-	if err != nil {
-		return 0, err
-	}
+	ps := s.readStmt(ctx, stmtEventHorizon)
 	var rv sql.NullInt64
-	err = ps.QueryRowContext(ctx, id, category).Scan(&rv)
+	err := ps.QueryRowContext(ctx, id, category).Scan(&rv)
 	return rv.Int64, err
 }
 
@@ -2293,12 +2284,9 @@ func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, ca
 // alone; without it the plan fetches one table row per run, past overflow chains
 // (TestEventsMaxVersionUsesCoveringIndex pins the plan).
 func (s sqliteEvents) MaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
-	ps, err := s.stmtFor(ctx, stmtEventsMaxVersion)
-	if err != nil {
-		return 0, err
-	}
+	ps := s.readStmt(ctx, stmtEventsMaxVersion)
 	var rv sql.NullInt64
-	err = ps.QueryRowContext(ctx, id).Scan(&rv)
+	err := ps.QueryRowContext(ctx, id).Scan(&rv)
 	return rv.Int64, err
 }
 
@@ -2414,11 +2402,9 @@ func (s *sqliteStore) trimStmts(ctx context.Context, raise, del stmtID) (*sql.St
 	if err != nil {
 		return nil, nil, err
 	}
+	// Both are writes on one frame, so the check above answers for this one too.
 	delPS, err := s.stmtFor(ctx, del)
-	if err != nil {
-		return nil, nil, err
-	}
-	return raisePS, delPS, nil
+	return raisePS, delPS, err
 }
 
 // trimEvents deletes the runs matching where and raises each affected timeline's
@@ -2595,12 +2581,9 @@ func (s *sqliteStore) markManyForDeletionChunk(
 // not hold is absent, not foreign. Saves the blob copies and finalizer unmarshal
 // of a full row read.
 func (s *sqliteStore) probeDeletionByName(ctx context.Context, gk storeapi.GroupKind, name string) (bool, error) {
-	ps, err := s.stmtFor(ctx, stmtProbeDeletionByName)
-	if err != nil {
-		return false, err
-	}
+	ps := s.readStmt(ctx, stmtProbeDeletionByName)
 	var deletionAt sql.NullInt64
-	err = ps.QueryRowContext(ctx, gk.Group, gk.Kind, name).Scan(&deletionAt)
+	err := ps.QueryRowContext(ctx, gk.Group, gk.Kind, name).Scan(&deletionAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, storeapi.ErrNotFound
 	}
@@ -2830,12 +2813,9 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 		// CSE, so separate subqueries would seek the same row twice. A missing
 		// endpoint yields no row — clean ErrNotFound over an FK violation.
 		var to storeapi.GroupKind
-		endpoints, err := s.stmtFor(ctx, stmtEdgeEndpointsForAdd)
-		if err != nil {
-			return err
-		}
+		endpoints := s.readStmt(ctx, stmtEdgeEndpointsForAdd)
 		var toDeletedAt *int64
-		err = endpoints.QueryRowContext(ctx, fromID, toID).
+		err := endpoints.QueryRowContext(ctx, fromID, toID).
 			Scan(&to.Group, &to.Kind, &toDeletedAt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return storeapi.ErrNotFound
@@ -2920,10 +2900,7 @@ func (s sqliteEdges) Delete(ctx context.Context, fromID, toID storeapi.ObjectID,
 	// pushes. Outside one the DELETE stands and the retry removes nothing, so
 	// the report costs the push, not the collect: the sweeper is the route, and
 	// it cannot be turned off.
-	endpoints, err := s.stmtFor(ctx, stmtEdgeEndpointsForDelete)
-	if err != nil {
-		return storeapi.EdgesDeleteResult{}, err
-	}
+	endpoints := s.readStmt(ctx, stmtEdgeEndpointsForDelete)
 	var to storeapi.GroupKind
 	var unblocked int
 	err = endpoints.QueryRowContext(ctx, toID, fromID).Scan(&to.Group, &to.Kind, &unblocked)
