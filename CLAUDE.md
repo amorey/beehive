@@ -248,8 +248,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   so a commit landing just after one waits out the rest of the window — and one
   drain is bounded by a page budget, so a write stream cannot make a tailer hold
   the writer away from the writers waking it — its page read self-wraps in
-  `Within`, so it takes the writer even though it is a read; the first drain
-  after a quiet period is still eager.
+  `withinRead`, on the reader, so it no longer takes the writer at all; the first
+  drain after a quiet period is still eager.
   → [ADR](docs/adr/2026-08-03-watch-shared-tail.md),
   [ADR](docs/adr/2026-08-05-the-object-tail-throttles-its-drains.md)
 - **`WatchOwnedObjects` scopes a watch to one owner's children, and reads
@@ -387,9 +387,17 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `WithReadConnections` (4 by default), so they no longer queue behind writes.
   `s.read(ctx)` returns the ambient transaction while it is live — that is the
   safety property, and a read on any other ctx now returns stale committed state
-  rather than deadlocking. A grouped read still takes the writer, because the
-  five that self-wrap in `Within` have not moved.
-  → [ADR](docs/adr/2026-08-20-reads-get-their-own-connections.md)
+  rather than deadlocking. **A read that groups is a read transaction**
+  (`withinRead`), on the reader, sharing `Within`'s frame protocol but settling no
+  versions; four of the five grouped reads moved. `Events().Sweep` did not — its
+  scan and the trim after it are one transaction — and the waker's `ListSinceAll`
+  is ungrouped so a commit wake mid-scan is seen. `ReadOnly` only picks the begin
+  verb, and `OpenMemory` has no reader pool to apply `query_only` — so **`conn`
+  refuses a read frame outright**, which holds in both modes and covers the
+  `UPDATE … RETURNING` a read-only interface cannot. It rests on every data write
+  taking its connection from `conn`.
+  → [ADR](docs/adr/2026-08-20-reads-get-their-own-connections.md),
+  [ADR](docs/adr/2026-08-20-a-read-that-groups-is-a-read-transaction.md)
 - **Resource versions are reserved in blocks, and are unique and increasing but
   never contiguous.** Every cursor in the system compares `>`, so a crash or a
   rollback burning the rest of a block costs nothing. The reservation runs where
