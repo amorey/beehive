@@ -76,7 +76,7 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	s.readDB = sqlitemigrate.OpenReadPool(path, o.readConns)
 	s.readConns = o.readConns
 	// After readDB: a statement prepared before it binds to the writer.
-	if err := s.prepareStatements(context.Background()); err != nil {
+	if err := s.prepareReadStatements(context.Background()); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -103,8 +103,8 @@ func OpenMemory() (*sqliteStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	// readDB is aliased to db here, so this is the pool both sets get.
-	if err := s.prepareStatements(context.Background()); err != nil {
+	// readDB is aliased to db here, so both sets are the one pool's.
+	if err := s.prepareReadStatements(context.Background()); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -123,6 +123,11 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		// Truncated to ms to match condition timestamps: a sub-ms processStart would
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
+	}
+	// Before the seed, which draws its first block through a prepared statement.
+	if err := s.prepareWriteStatements(context.Background()); err != nil {
+		db.Close()
+		return nil, err
 	}
 	// Here because open holds no transaction, so the reservation cannot be rolled back.
 	if err := s.seedVersions(context.Background()); err != nil {

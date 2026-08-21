@@ -74,6 +74,9 @@ const (
 	stmtInsertEdge
 	stmtDeleteEdge
 	stmtEdgeEndpointsForDelete
+	stmtAppendWriteLog
+	stmtAppendWriteLogDelete
+	stmtDrawResourceVersions
 
 	numStmts
 )
@@ -208,6 +211,12 @@ var stmtSQL = [numStmts]string{
 		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
 		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
 
+	stmtAppendWriteLog: `INSERT INTO object_writes (` + objectWritesColumns + `) VALUES (?, ?, ?, ?, ?, ?)`,
+	stmtAppendWriteLogDelete: `
+		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at, final)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	stmtDrawResourceVersions: `UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value`,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -248,6 +257,9 @@ var stmtWrites = [numStmts]bool{
 	stmtClearWatermarkForNewEdge:       true,
 	stmtInsertEdge:                     true,
 	stmtDeleteEdge:                     true,
+	stmtAppendWriteLog:                 true,
+	stmtAppendWriteLogDelete:           true,
+	stmtDrawResourceVersions:           true,
 }
 
 // stmtSet is one pool's preparations.
@@ -276,24 +288,34 @@ func (s *sqliteStore) stmtFor(ctx context.Context, id stmtID) (*sql.Stmt, error)
 	}
 }
 
-// prepareStatements fills both sets. It must run after the migrations, and after
-// s.readDB is assigned: a statement prepared before either names a schema or a
-// pool that is not there yet.
-func (s *sqliteStore) prepareStatements(ctx context.Context) error {
+// prepareWriteStatements fills the writer's set, reads included: a read issued
+// inside a write transaction runs on the writer's connection. It must run after
+// the migrations and before the version seed, which draws through it.
+func (s *sqliteStore) prepareWriteStatements(ctx context.Context) error {
 	for id := stmtID(0); id < numStmts; id++ {
 		ps, err := s.db.PrepareContext(ctx, stmtSQL[id])
 		if err != nil {
 			return fmt.Errorf("prepare %d on the writer: %w", id, err)
 		}
 		s.writeStmts[id] = ps
+	}
+	return nil
+}
 
+// prepareReadStatements fills the reader's set, which holds no write: preparing
+// one against query_only succeeds and fails only on execution, so the nil slot is
+// the only representation open can check. It must run after s.readDB is
+// assigned, or every read binds to the writer.
+func (s *sqliteStore) prepareReadStatements(ctx context.Context) error {
+	for id := stmtID(0); id < numStmts; id++ {
 		if stmtWrites[id] {
 			continue
 		}
 		if s.readDB == s.db {
-			s.readStmts[id] = ps
+			s.readStmts[id] = s.writeStmts[id]
 			continue
 		}
+		var err error
 		if s.readStmts[id], err = s.readDB.PrepareContext(ctx, stmtSQL[id]); err != nil {
 			return fmt.Errorf("prepare %d on the reader: %w", id, err)
 		}

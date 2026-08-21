@@ -727,7 +727,7 @@ func (s *sqliteStore) advanceResourceVersion(ctx context.Context, c dbtx, n int)
 	hi, ok := s.versions.take(n)
 	if !ok {
 		var err error
-		if hi, err = drawResourceVersions(ctx, c, n); err != nil {
+		if hi, err = s.drawResourceVersions(ctx, n); err != nil {
 			return 0, err
 		}
 		s.versions.record(hi)
@@ -744,10 +744,13 @@ func (s *sqliteStore) advanceResourceVersion(ctx context.Context, c dbtx, n int)
 // drawn. A standalone counter, not MAX(objects.resource_version): deleting the
 // highest-versioned row must never regress the cursor and hand out a reused
 // version.
-func drawResourceVersions(ctx context.Context, c dbtx, n int) (int64, error) {
+func (s *sqliteStore) drawResourceVersions(ctx context.Context, n int) (int64, error) {
+	ps, err := s.stmtFor(ctx, stmtDrawResourceVersions)
+	if err != nil {
+		return 0, err
+	}
 	var rv int64
-	err := c.QueryRowContext(ctx,
-		`UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value`, n).Scan(&rv)
+	err = ps.QueryRowContext(ctx, n).Scan(&rv)
 	return rv, err
 }
 
@@ -772,7 +775,10 @@ func (s *sqliteStore) refillVersions(ctx context.Context) {
 	// transaction's whole life waiting on the one writer connection.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refillTimeout)
 	defer cancel()
-	hi, err := drawResourceVersions(ctx, s.db, blockSize)
+	// The frame goes too, not just the deadline: settle runs after the commit but
+	// before flush latches the frame closed, so routing by ctx would draw on a
+	// transaction that is already over.
+	hi, err := s.drawResourceVersions(context.WithValue(ctx, txKey{}, nil), blockSize)
 	if err != nil {
 		// Swallowed: the commit already landed, so this cannot be reported. The
 		// block stays spent and the next draw raises it where a caller can act.
@@ -786,7 +792,7 @@ func (s *sqliteStore) refillVersions(ctx context.Context) {
 // sits below it is where that process left the counter.
 func (s *sqliteStore) seedVersions(ctx context.Context) error {
 	n := max(blockSize, 0)
-	hi, err := drawResourceVersions(ctx, s.db, n)
+	hi, err := s.drawResourceVersions(ctx, n)
 	if err != nil {
 		return err
 	}
@@ -856,7 +862,7 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	if err != nil {
 		return nil, asNameTaken(err)
 	}
-	if err := appendWriteLog(ctx, c, obj.ID, gk, writeOpCreate, rv, now); err != nil {
+	if err := s.appendWriteLog(ctx, obj.ID, gk, writeOpCreate, rv, now); err != nil {
 		return nil, err
 	}
 	return obj, nil
@@ -882,7 +888,7 @@ func (s *sqliteStore) recordObjectWrite(
 		return 0, 0, err
 	}
 	now = toMillis(time.Now().UTC())
-	if err = appendWriteLog(ctx, c, id, gk, op, rv, now); err != nil {
+	if err = s.appendWriteLog(ctx, id, gk, op, rv, now); err != nil {
 		return 0, 0, err
 	}
 	return rv, now, nil
@@ -893,10 +899,12 @@ const objectWritesColumns = `resource_version, object_id, "group", kind, op, wri
 
 // appendWriteLog records one committed object write. Callers pass the version the
 // write took, so the entry orders against the row it describes.
-func appendWriteLog(ctx context.Context, c dbtx, id storeapi.ObjectID, gk storeapi.GroupKind, op int, rv, now int64) error {
-	_, err := c.ExecContext(ctx,
-		`INSERT INTO object_writes (`+objectWritesColumns+`) VALUES (?, ?, ?, ?, ?, ?)`,
-		rv, id, gk.Group, gk.Kind, op, now)
+func (s *sqliteStore) appendWriteLog(ctx context.Context, id storeapi.ObjectID, gk storeapi.GroupKind, op int, rv, now int64) error {
+	ps, err := s.stmtFor(ctx, stmtAppendWriteLog)
+	if err != nil {
+		return err
+	}
+	_, err = ps.ExecContext(ctx, rv, id, gk.Group, gk.Kind, op, now)
 	return err
 }
 
@@ -927,12 +935,14 @@ func appendWriteLogUpdates(ctx context.Context, c dbtx, writes []loggedWrite, no
 // appendWriteLogDelete records a collection, carrying the row image a Deleted
 // change reports. image is stamped with the delete's own version: it is the
 // object's last, and the row that held the previous one no longer exists.
-func appendWriteLogDelete(ctx context.Context, c dbtx, image *storeapi.RawObject, rv, now int64) error {
+func (s *sqliteStore) appendWriteLogDelete(ctx context.Context, image *storeapi.RawObject, rv, now int64) error {
+	ps, err := s.stmtFor(ctx, stmtAppendWriteLogDelete)
+	if err != nil {
+		return err
+	}
 	image.ResourceVersion = rv
 	final, _ := json.Marshal(image) // plain data: no channel, func or cyclic field can fail it
-	_, err := c.ExecContext(ctx, `
-		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at, final)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	_, err = ps.ExecContext(ctx,
 		rv, image.ID, image.Group, image.Kind, writeOpDelete, now, string(final))
 	return err
 }
@@ -2612,7 +2622,7 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 		return 0, false, err
 	}
 	// The soft delete is an update: the row is still live and readable.
-	if err := appendWriteLog(ctx, c, id, gk, writeOpUpdate, rv, now); err != nil {
+	if err := s.appendWriteLog(ctx, id, gk, writeOpUpdate, rv, now); err != nil {
 		return 0, false, err
 	}
 	return id, true, nil
@@ -2906,7 +2916,7 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if err != nil {
 		return err
 	}
-	if err := appendWriteLogDelete(ctx, c, image, rv, toMillis(time.Now().UTC())); err != nil {
+	if err := s.appendWriteLogDelete(ctx, image, rv, toMillis(time.Now().UTC())); err != nil {
 		return err
 	}
 	return nil

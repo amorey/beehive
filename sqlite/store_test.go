@@ -9158,8 +9158,7 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	}
 	// Helpers handed a dbtx by a caller that did take one from conn.
 	for _, fn := range []string{
-		"drawResourceVersions", "appendWriteLog", "appendWriteLogUpdates",
-		"appendWriteLogDelete", "sqliteStore.bumpObject",
+		"appendWriteLogUpdates", "sqliteStore.bumpObject",
 		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
 		"sqliteStore.markManyForDeletionChunk",
 		"reconcileOwedSweepQuery", // builds a string, executes nothing

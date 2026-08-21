@@ -463,7 +463,7 @@ func TestARollbackPublishesNothing(t *testing.T) {
 func TestTheCounterIsWrittenInOnePlace(t *testing.T) {
 	writesSeq := regexp.MustCompile(`(?is)UPDATE\s+resource_version_seq`)
 	sites := sqlSites(t, writesSeq.MatchString)
-	assert.Equal(t, []string{"drawResourceVersions"}, sites)
+	assert.Equal(t, []string{"sqliteStore.drawResourceVersions"}, sites)
 }
 
 // published is only a lower bound on committed versions because draws are ordered
