@@ -966,16 +966,10 @@ func TestEdgeListsInheritTheIndexOrder(t *testing.T) {
 			SELECT o.id, o."group", o.kind
 			FROM edges r JOIN objects o ON o.id = r.to_id
 			WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget, []any{int64(1), owned}},
-		{"incoming batch", `
-			SELECT r.to_id, o.id, o."group", o.kind
-			FROM edges r JOIN objects o ON o.id = r.from_id
-			WHERE r.to_id IN (?,?) AND r.relation = ?
-			ORDER BY r.to_id, r.from_id`, []any{int64(1), int64(2), owned}},
-		{"outgoing batch", `
-			SELECT r.from_id, o.id, o."group", o.kind
-			FROM edges r JOIN objects o ON o.id = r.to_id
-			WHERE r.from_id IN (?,?) AND r.relation = ?
-			ORDER BY r.from_id, r.to_id`, []any{int64(1), int64(2), owned}},
+		{"incoming batch", stmtSQL[stmtEdgesGroupIncoming],
+			[]any{jsonList([]storeapi.ObjectID{1, 2}), owned}},
+		{"outgoing batch", stmtSQL[stmtEdgesGroupOutgoing],
+			[]any{jsonList([]storeapi.ObjectID{1, 2}), owned}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plan := queryPlan(t, store, tc.query, tc.args...)
@@ -1024,21 +1018,13 @@ func TestConditionsReadsRideThePrimaryKey(t *testing.T) {
 func TestConditionSetLoadsTheGateAndTheConditionsTogether(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 
-	for _, tc := range []struct {
-		name  string
-		types []any
-	}{
-		{"one type", []any{"Ready"}},
-		{"several types", []any{"Ready", "Healthy", "Connected"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			plan := queryPlan(t, store, conditionSetLoad(len(tc.types)), append(tc.types, int64(1))...)
-			assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
-				"objects must be reached by rowid:\n"+plan)
-			assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
-				"conditions must be reached through its primary key:\n"+plan)
-		})
-	}
+	plan := queryPlan(t, store, stmtSQL[stmtConditionSetLoad],
+		conditionTypeList([]string{"Ready", "Healthy"}), int64(1))
+
+	assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
+		"objects must be reached by rowid:\n"+plan)
+	assert.Contains(t, plan, "sqlite_autoindex_conditions_1",
+		"conditions must be reached through its primary key:\n"+plan)
 }
 
 // EventsGetLatest surfaces a scan fault on the current run.
@@ -8516,7 +8502,7 @@ func TestReadImagesSurfacesADBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.readImages(context.Background(), []any{int64(1)})
+	_, err := store.readImages(context.Background(), []int64{1})
 
 	require.Error(t, err)
 }
@@ -9596,9 +9582,9 @@ func TestOpenFailsOnAStatementItCannotPrepare(t *testing.T) {
 	t.Cleanup(func() { reopened.Close() })
 }
 
-// The two sides of listObjectsWhere. Objects().List has a constant tail and is
-// prepared; Objects().ListByIDs renders its IN list per arity and cannot be.
-func TestOnlyTheConstantObjectListingIsPrepared(t *testing.T) {
+// Both multi-row object reads go through listObjects now, so the JSON list must
+// still find what the plain listing finds.
+func TestBothObjectListingsReadTheSameRow(t *testing.T) {
 	store := newDiskStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -9612,10 +9598,8 @@ func TestOnlyTheConstantObjectListingIsPrepared(t *testing.T) {
 	require.Len(t, byID, 1)
 	assert.Equal(t, listed[0].ID, byID[0].ID, "both halves of the split read the same row")
 
-	// Which half is prepared is a static fact about the call graph: the rendered
-	// tail has exactly one caller, and the constant ones go through listObjects.
-	assert.Equal(t, []string{"sqliteObjects.ListByIDs"}, callSites(t, "listObjectsWhere"))
-	assert.ElementsMatch(t, []string{"sqliteObjects.List", "sqliteObjects.ListByIncomingEdge"},
+	assert.ElementsMatch(t,
+		[]string{"sqliteObjects.List", "sqliteObjects.ListByIncomingEdge", "sqliteObjects.ListByIDs"},
 		callSites(t, "listObjects"))
 }
 
@@ -9645,17 +9629,11 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 // statement per arity would fill the table with single-use entries.
 var renderedSQLSites = []string{
 	"appendWriteLogUpdates",
-	"sqliteStore.conditionsByIDsChunk",
-	"sqliteReconcileOwed.Stamp",
 	"reconcileOwedSweepQuery",
 	"sqliteDependencies.ListStaleSince",
-	"sqliteStore.readImages",
-	"conditionSetLoad",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
 	"sqliteStore.markManyForDeletionChunk",
-	"sqliteStore.unblockedTargetsChunk",
-	"sqliteStore.edgesByIDsChunk",
 }
 
 // sqlLiteralSites names every function holding a string literal match accepts.
@@ -9843,20 +9821,6 @@ func TestGetObjectRowScopedGatesTheKind(t *testing.T) {
 	assert.ErrorIs(t, err, beehive.ErrWrongKind)
 }
 
-// Objects().ListByIDs renders one placeholder per id, so a caller that ignores
-// the chunk size reaches SQLite's parameter limit. The read reports it rather
-// than truncating.
-func TestAnOversizedIDListIsReported(t *testing.T) {
-	store := newRawStore(t)
-
-	ids := make([]storeapi.ObjectID, 40000)
-	for i := range ids {
-		ids[i] = storeapi.ObjectID(i + 1)
-	}
-	_, err := store.Objects().ListByIDs(context.Background(), testGK, ids)
-	assert.Error(t, err, "past the parameter limit the statement cannot be prepared")
-}
-
 // A goroutine can outlive Close — a watch tailer stopping is not ordered against
 // it — and what it finds must be a closed statement to report, not a cleared
 // slot to dereference.
@@ -9869,4 +9833,96 @@ func TestAReadAfterCloseReportsRatherThanPanics(t *testing.T) {
 	_, err = store.Objects().GetMeta(context.Background(), obj.ID)
 	assert.Error(t, err)
 	assert.NoError(t, store.Close(), "closing twice closes each statement once")
+}
+
+// The ids reach SQLite as one JSON parameter, so their affinity is the JSON
+// parser's. A stringified id gets TEXT affinity and matches no INTEGER column —
+// a silent empty result, not an error — and a number past 2^53 is where a parser
+// that used floats would round. Both are ruled out at the boundary.
+func TestAnIDListBindsAsNumbers(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	var typ string
+	var got int64
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT typeof(value), value FROM json_each(?)`,
+		jsonList([]storeapi.ObjectID{1<<53 + 1})).Scan(&typ, &got))
+	assert.Equal(t, "integer", typ)
+	assert.Equal(t, int64(1<<53+1), got)
+
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT typeof(value) FROM json_each(?)`, conditionTypeList([]string{"Ready"})).Scan(&typ))
+	assert.Equal(t, "text", typ)
+
+	// And through a call site, which is where the conversion that breaks it would be.
+	obj := newRefObject(t, store)
+	big := storeapi.ObjectID(1<<53 + 1)
+	_, err := store.db.ExecContext(ctx, `UPDATE objects SET id = ? WHERE id = ?`, big, obj.ID)
+	require.NoError(t, err)
+
+	found, err := store.Objects().ListByIDs(ctx, testGK, []storeapi.ObjectID{big})
+	require.NoError(t, err)
+	require.Len(t, found, 1, "a stringified id would match nothing")
+	assert.Equal(t, big, found[0].ID)
+}
+
+// The batched conditions read orders by the column its IN list constrains, so
+// the index delivers that order and the JSON list does not cost a sort.
+func TestTheBatchedConditionsReadInheritsTheIndexOrder(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, stmtSQL[stmtConditionsByIDs], jsonList([]storeapi.ObjectID{1, 2}))
+
+	assert.NotContains(t, plan, "ORDER BY", "the conditions index already delivers this order:\n"+plan)
+}
+
+// The one converted read whose plan changes. It filters r.from_id and orders by
+// r.to_id, which the primary key gives only inside one from_id — so a rendered
+// list of one used to sort for free and a JSON list never can. Pinned as it is,
+// not as it was: the sort is over the deletion-pending targets of one object.
+func TestTheUnblockedTargetsReadSorts(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, stmtSQL[stmtUnblockedTargets],
+		jsonList([]storeapi.ObjectID{1}), string(storeapi.RelationDependsOn))
+
+	assert.Contains(t, plan, "USE TEMP B-TREE FOR ORDER BY", plan)
+	assert.Contains(t, plan, "SEARCH r USING PRIMARY KEY", "the edges seek survives:\n"+plan)
+}
+
+// A condition type is a lookup key as well as a stored value: the upsert binds
+// it raw, and the load looks it up through JSON. JSON has no representation for
+// bytes that are not UTF-8 and json.Marshal substitutes U+FFFD, so a type that
+// survived the write would never be found again — and every Set would read the
+// condition as new, rewriting it and waking every watcher. Refused instead.
+func TestASetRefusesAConditionTypeThatIsNotText(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	err := store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Ready\xff", Status: "True"})
+
+	assert.ErrorIs(t, err, storeapi.ErrInvalidConditionType)
+}
+
+// The no-op suppression rests on the load finding what the upsert stored, so a
+// type carrying non-ASCII text must round-trip through the JSON list intact.
+func TestASecondSetOfANonASCIIConditionTypeWritesNothing(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	cond := storeapi.Condition{Type: "Prêt→✓", Status: "True"}
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, cond))
+	first, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, cond))
+	second, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+
+	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
+		"the load must find the stored type, or the write repeats forever")
 }

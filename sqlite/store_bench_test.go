@@ -311,79 +311,6 @@ func BenchmarkReadUnderWrites(b *testing.B) {
 	}
 }
 
-// BenchmarkUnpreparedBesidePrepared answers the question the statement-cache
-// spec owes: does a statement that cannot be prepared — Objects().ListByIDs
-// renders its IN list — get slower when its connection carries prepared ones?
-//
-// One read connection, so "its connection" is exact. inTx runs the read inside a
-// read transaction, which is the shape the +26% measurement came from.
-func BenchmarkUnpreparedBesidePrepared(b *testing.B) {
-	for _, batch := range []int{1, 64} {
-		for _, prepared := range []int{0, 60} {
-			for _, inTx := range []bool{false, true} {
-				b.Run(fmt.Sprintf("batch=%d/prepared=%d/inTx=%t", batch, prepared, inTx), func(b *testing.B) {
-					benchUnpreparedBesidePrepared(b, batch, prepared, inTx)
-				})
-			}
-		}
-	}
-}
-
-func benchUnpreparedBesidePrepared(b *testing.B, batch, prepared int, inTx bool) {
-	ctx := context.Background()
-
-	store, err := Open(filepath.Join(b.TempDir(), "bench.db"), WithReadConnections(1))
-	require.NoError(b, err)
-	defer store.Close()
-
-	const objects = 1000
-	ids := make([]storeapi.ObjectID, 0, batch)
-	for i := range objects {
-		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
-			Name: fmt.Sprintf("bench-%d", i),
-			Spec: []byte(`{"a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`),
-		})
-		require.NoError(b, err)
-		if len(ids) < cap(ids) {
-			ids = append(ids, obj.ID)
-		}
-	}
-
-	// Resident on the one read connection, compiled by running each once.
-	stmts := make([]*sql.Stmt, 0, prepared)
-	for i := range prepared {
-		st, err := store.readDB.PrepareContext(ctx, probeSQL(i))
-		require.NoError(b, err)
-		rows, err := st.QueryContext(ctx, int64(1))
-		require.NoError(b, err)
-		require.NoError(b, rows.Close())
-		stmts = append(stmts, st)
-	}
-	defer func() {
-		for _, st := range stmts {
-			st.Close()
-		}
-	}()
-
-	read := func(ctx context.Context) {
-		out, err := store.Objects().ListByIDs(ctx, testGK, ids)
-		require.NoError(b, err)
-		require.Len(b, out, len(ids))
-	}
-
-	b.ResetTimer()
-	for range b.N {
-		if inTx {
-			require.NoError(b, store.withinRead(ctx, func(ctx context.Context) error {
-				read(ctx)
-				return nil
-			}))
-			continue
-		}
-		read(ctx)
-	}
-}
-
 // probeSQL is the i-th resident statement: distinct text, real schema, one row.
 func probeSQL(i int) string {
 	return fmt.Sprintf(
@@ -457,5 +384,86 @@ func benchResidencyToll(b *testing.B, resident int, prep bool) {
 		require.NoError(b, err)
 		require.True(b, rows.Next())
 		require.NoError(b, rows.Close())
+	}
+}
+
+// The two ends of the JSON binding: the object listing at the batch sizes the
+// watch tail runs at, and the one converted read that traded a plan for a
+// preparation.
+func BenchmarkListByIDs(b *testing.B) {
+	for _, batch := range []int{1, 64} {
+		for _, inTx := range []bool{false, true} {
+			b.Run(fmt.Sprintf("batch=%d/inTx=%t", batch, inTx), func(b *testing.B) {
+				benchListByIDs(b, batch, inTx)
+			})
+		}
+	}
+}
+
+func benchListByIDs(b *testing.B, batch int, inTx bool) {
+	ctx := context.Background()
+
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	ids := make([]storeapi.ObjectID, 0, batch)
+	for i := range 1000 {
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
+			Name: fmt.Sprintf("bench-%d", i),
+			Spec: []byte(`{"a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`),
+		})
+		require.NoError(b, err)
+		if len(ids) < batch {
+			ids = append(ids, obj.ID)
+		}
+	}
+
+	read := func(ctx context.Context) {
+		out, err := store.Objects().ListByIDs(ctx, testGK, ids)
+		require.NoError(b, err)
+		require.Len(b, out, batch)
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		if inTx {
+			require.NoError(b, store.withinRead(ctx, func(ctx context.Context) error {
+				read(ctx)
+				return nil
+			}))
+			continue
+		}
+		read(ctx)
+	}
+}
+
+// One id, which is what a client delete passes: the case whose rendered form
+// folded into an equality the index could sort on.
+func BenchmarkUnblockedTargets(b *testing.B) {
+	ctx := context.Background()
+
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	source, err := store.Objects().Create(ctx, testGK,
+		beehive.ObjectsCreateInput{Name: "source", Spec: []byte(`{}`)})
+	require.NoError(b, err)
+	for i := range 8 {
+		target, err := store.Objects().Create(ctx, testGK,
+			beehive.ObjectsCreateInput{Name: fmt.Sprintf("target-%d", i), Spec: []byte(`{}`)})
+		require.NoError(b, err)
+		_, err = store.Edges().Add(ctx, source.ID, target.ID, storeapi.RelationDependsOn)
+		require.NoError(b, err)
+		_, err = store.DeletionRequests().Create(ctx, testGK, target.ID)
+		require.NoError(b, err)
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		out, err := store.unblockedTargets(ctx, []storeapi.ObjectID{source.ID})
+		require.NoError(b, err)
+		require.Len(b, out, 8)
 	}
 }
