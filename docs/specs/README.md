@@ -16,9 +16,10 @@ work we have decided to do.
 
 ## In flight
 
-Seventeen, from one audit of what the
+Eighteen. Seventeen came from one audit of what the
 [sole-writer constraint](../adr/2026-08-05-one-process-one-beehive-sole-writer.md)
-buys and the code does not yet spend. Each is one PR. They are grouped by what
+buys and the code does not yet spend; the last is a follow-on from the statement
+cache that shipped. Each is one PR. They are grouped by what
 they have in common, not by the order they must land in; the dependencies each
 spec names are the real constraint.
 
@@ -68,6 +69,12 @@ that makes the steady state store-free.
 **Cleanup.**
 
 17. [Collect without a transaction it does not need](2026-08-20-collect-without-a-transaction-it-does-not-need.md)
+
+**Rendered SQL.** What the statement cache could not reach, because of how the
+SQL is written rather than anything about the store.
+
+18. [Bind an id list as JSON](2026-08-21-bind-an-id-list-as-json.md) — seven
+    rendered `IN` lists become prepared statements, and get faster doing it.
 
 Three things the audit found and deliberately left without a spec: a name-to-id
 map, an object row cache, and dropping the conditions read from a spec write's
