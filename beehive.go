@@ -175,7 +175,10 @@ type Beehive struct {
 	tailMu  sync.Mutex
 	tailers map[GroupKind]*objectTailer
 
-	state  beehiveState
+	state beehiveState
+	// claim is the key this Beehive holds in beehiveClaims, empty when it holds
+	// none.
+	claim  string
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -200,6 +203,9 @@ func (bh *Beehive) log() *slog.Logger {
 //
 // A store another Beehive is already running is ErrStoreInUse. That covers this
 // process only; keeping a second process off the database is the embedder's.
+//
+// The stop function returns ErrDrainIncomplete when its own ctx expired before
+// the loops drained. The store's claim is released either way.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
@@ -383,8 +389,8 @@ func (bh *Beehive) deletionAdvance(ctx context.Context, gk GroupKind, id ObjectI
 }
 
 // stop cancels the reconcile loops and waits for them to drain, bounded by ctx.
-// It returns non-nil only when the drain hit ctx's deadline. No-op for the
-// reconcile loops if not running.
+// It returns ErrDrainIncomplete wrapping ctx's error, and nil otherwise. No-op
+// for the reconcile loops if not running.
 func (bh *Beehive) stop(ctx context.Context) error {
 	bh.mu.Lock()
 	// beehiveStopped means another call owns the teardown. Returning without
@@ -433,16 +439,17 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	bh.kindWriteHub.Close()
 	bh.eventWriteHub.Close()
 
-	// Last, so nothing this Beehive owns is still live when another may claim
-	// the store, and only if this one claimed. A blown deadline releases anyway
-	// — bh.cancel has run, so the loops are ending — and announces itself, being
-	// the one case where the sole-writer guarantee lapses.
-	if running {
-		if drainErr != nil {
-			bh.log().Warn("store released before its loops drained", "err", drainErr)
-		}
-		bh.releaseStore()
+	// After the hubs, so nothing that writes is still running. The tailers below
+	// may still be exiting, which is safe because they only read.
+	//
+	// A blown deadline releases anyway — bh.cancel has run, so the loops are
+	// ending — and says so in both the log and the error, being the one case
+	// where the sole-writer guarantee lapses.
+	if drainErr != nil {
+		bh.log().Warn("store released before its loops drained", "err", drainErr)
+		drainErr = fmt.Errorf("%w: %w", ErrDrainIncomplete, drainErr)
 	}
+	bh.releaseStore()
 
 	// The watch tailers are not counted in wg: each ends with its own last
 	// subscriber, or with the hub close above. WatchSchedule streams
@@ -460,16 +467,24 @@ var beehiveClaims claim.Set
 
 // claimStore reserves bh.store's database for bh.
 func (bh *Beehive) claimStore() error {
-	if !beehiveClaims.Take(bh.store.Identity()) {
+	id := bh.store.Identity()
+	if !beehiveClaims.Take(id) {
 		return ErrStoreInUse
 	}
+	bh.claim = id
 	return nil
 }
 
-// releaseStore drops bh's claim. Owed by every path that claimed, and by no
-// other: a Beehive that never started must not evict a running one.
+// releaseStore drops the key claimStore took. Held rather than re-derived:
+// Identity is contracted to be stable, but a Store that broke that would leak
+// its own claim and evict whoever holds the key it now reports. An empty claim
+// is a Beehive that never started, which must evict nobody.
 func (bh *Beehive) releaseStore() {
-	beehiveClaims.Drop(bh.store.Identity())
+	if bh.claim == "" {
+		return
+	}
+	beehiveClaims.Drop(bh.claim)
+	bh.claim = ""
 }
 
 // New creates a control plane backed by store s. Register controllers on the

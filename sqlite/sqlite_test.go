@@ -198,12 +198,11 @@ func TestOpenRefusesAPathAlreadyOpen(t *testing.T) {
 // would weaken the key and skipping registration would disable the check, so
 // neither silent answer is available.
 func TestOpenReportsAnUnresolvablePath(t *testing.T) {
-	restore := abs
-	abs = func(string) (string, error) { return "", errors.New("no working directory") }
-	t.Cleanup(func() { abs = restore })
+	fail := func(string) (string, error) { return "", errors.New("no working directory") }
 
-	_, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	_, err := Open(filepath.Join(t.TempDir(), "b.db"), withAbs(fail))
 	require.ErrorContains(t, err, "no working directory")
+	require.ErrorContains(t, err, "beehive/sqlite:", "every error out of Open names the package")
 }
 
 // Every file::memory: store is its own database, so there is no path to collide

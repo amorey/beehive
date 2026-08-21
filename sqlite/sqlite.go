@@ -43,9 +43,6 @@ var ErrInvalidOption = errors.New("beehive/sqlite: option value is invalid")
 // ErrAlreadyOpen reports a second Open on a path this process already holds.
 var ErrAlreadyOpen = errors.New("beehive/sqlite: database is already open in this process")
 
-// abs is filepath.Abs, swapped by the test that covers an unresolvable path.
-var abs = filepath.Abs
-
 // storeClaims is the databases open in this process, so one process opens a
 // database once. A store records its own claim in sqliteStore.claimed.
 var storeClaims claim.Set
@@ -63,7 +60,17 @@ const defaultReadConnections = 4
 // option machinery never sees one.
 type Option func(*openOptions)
 
-type openOptions struct{ readConns int }
+type openOptions struct {
+	readConns int
+	// abs resolves path. A field rather than a package var so the test that
+	// covers an unresolvable path cannot affect a concurrent Open.
+	abs func(string) (string, error)
+}
+
+// withAbs replaces the path resolver, for the test covering its failure.
+func withAbs(f func(string) (string, error)) Option {
+	return func(o *openOptions) { o.abs = f }
+}
 
 // WithReadConnections sets how many connections serve reads. This bounds read
 // concurrency, not total connections — the writer is always one. Below 1 is
@@ -80,7 +87,7 @@ func WithReadConnections(n int) Option {
 //
 // A path this process already has open is ErrAlreadyOpen, held until Close.
 func Open(path string, opts ...Option) (*sqliteStore, error) {
-	o := openOptions{readConns: defaultReadConnections}
+	o := openOptions{readConns: defaultReadConnections, abs: filepath.Abs}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -88,9 +95,9 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 		return nil, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
 	}
 	// Two names for one file still evade this; it is a guardrail, not a boundary.
-	full, err := abs(path)
+	full, err := o.abs(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("beehive/sqlite: resolving %s: %w", path, err)
 	}
 	// Before open, so the claim covers the migrations and the version seed.
 	if !storeClaims.Take(full) {

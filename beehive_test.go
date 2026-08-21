@@ -815,7 +815,10 @@ func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
 
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
-	require.ErrorIs(t, stop(expired), context.Canceled)
+	err = stop(expired)
+	require.ErrorIs(t, err, context.Canceled, "the cause survives the wrap")
+	require.ErrorIs(t, err, ErrDrainIncomplete,
+		"a caller handing the store on must be able to tell this from any other stop failure")
 
 	assert.Contains(t, logs.String(), "store released before its loops drained")
 
