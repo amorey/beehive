@@ -9156,7 +9156,6 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	for _, fn := range []string{
 		"appendWriteLogUpdates", "sqliteStore.bumpObject",
 		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
-		"sqliteStore.markManyForDeletionChunk",
 		"sqliteEvents.Sweep", "sqliteStore.trimEventsToCap",
 		"reconcileOwedSweepQuery", // builds a string, executes nothing
 	} {
@@ -9627,7 +9626,6 @@ var renderedSQLSites = []string{
 	"appendWriteLogUpdates",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
-	"sqliteStore.markManyForDeletionChunk",
 }
 
 // sqlLiteralSites names every function holding a string literal match accepts.
@@ -9650,7 +9648,10 @@ func sqlLiteralSites(t *testing.T, match func(sql string) bool) []string {
 // refusing it in a read frame, and the write fails as a driver error on a cold
 // path instead. Derived here from the text rather than trusted.
 func TestEveryStatementIsClassifiedByItsOwnText(t *testing.T) {
-	writes := regexp.MustCompile(`(?is)^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+	// The optional WITH prefix is load-bearing: a CTE-fronted write does not
+	// start with its verb, and anchoring on the verb alone would call it a read.
+	writes := regexp.MustCompile(
+		`(?is)^\s*(WITH\b.*\)\s*)?(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
 
 	for id := stmtID(0); id < numStmts; id++ {
 		assert.Equal(t, writes.MatchString(stmtSQL[id]), stmtWrites[id],
@@ -9919,4 +9920,18 @@ func TestASecondSetOfANonASCIIConditionTypeWritesNothing(t *testing.T) {
 
 	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
 		"the load must find the stored type, or the write repeats forever")
+}
+
+// The rendered VALUES CTE was materialised into an ephemeral table before the
+// join; json_each feeds the join directly, so there is nothing to materialise.
+// The primary-key seek that does the work is unchanged either way.
+func TestTheDeletionMarkDoesNotMaterialiseItsAssignments(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, stmtSQL[stmtMarkManyForDeletion],
+		int64(1), jsonMarkPairs([]storeapi.ObjectID{1, 2}, 100))
+
+	assert.NotContains(t, plan, "MATERIALIZE", plan)
+	assert.Contains(t, plan, "SEARCH objects USING INTEGER PRIMARY KEY",
+		"the assignment still seeks by rowid:\n"+plan)
 }

@@ -59,6 +59,7 @@ const (
 
 	// The deletion mark and what reads it.
 	stmtMarkForDeletionByID
+	stmtMarkManyForDeletion
 	stmtMarkForDeletionByName
 	stmtProbeDeletionByName
 	stmtListDeletionRequests
@@ -447,6 +448,19 @@ var stmtSQL = [numStmts]string{
 	stmtClearWatermarkForNewEdge: `
 		DELETE FROM dependency_watermarks
 		 WHERE object_id = ? AND ` + edgeIsNew,
+	// The assignment rides a joined array, never a CASE over the id, which is
+	// quadratic in the chunk. A row the IS NULL guard skips leaves its assigned
+	// version unused; the gap is harmless, since every consumer seeks forward.
+	// RETURNING, not RowsAffected: the log entries need each row's identity and
+	// the version it actually took.
+	stmtMarkManyForDeletion: `
+		WITH assigned(mark_id, mark_rv) AS
+		     (SELECT value ->> 0, value ->> 1 FROM json_each(?2))
+		UPDATE objects
+		   SET deletion_requested_at = ?1, updated_at = ?1, resource_version = assigned.mark_rv
+		  FROM assigned
+		 WHERE objects.id = assigned.mark_id AND objects.deletion_requested_at IS NULL
+		RETURNING objects.id, objects."group", objects.kind, objects.resource_version`,
 	// The CROSS JOINs pin the join order: targets, then incoming edges, then
 	// dependents. Without them the planner reads the whole graph and the cursor
 	// buys nothing. No GROUP BY: a row is one (target, dependent) pair, and the
@@ -559,6 +573,7 @@ var stmtWrites = [numStmts]bool{
 	stmtDecrementOwed:                  true,
 	stmtStampOwed:                      true,
 	stmtOwedSweep:                      true,
+	stmtMarkManyForDeletion:            true,
 	stmtWatermarkSet:                   true,
 	stmtStampOwedForNewEdge:            true,
 	stmtClearWatermarkForNewEdge:       true,

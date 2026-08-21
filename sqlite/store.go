@@ -2461,9 +2461,6 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 }
 
 // markManyForDeletionChunk stamps one chunk, handing chunk[i] version first+i.
-// The assignment rides a joined VALUES list, never a CASE over the id, which is
-// quadratic in the chunk. A row the IS NULL guard skips leaves its assigned
-// version unused; the resulting gap is harmless, since consumers seek with `>`.
 // See docs/adr/2026-07-30-store-write-shapes.md.
 func (s *sqliteStore) markManyForDeletionChunk(
 	ctx context.Context,
@@ -2472,20 +2469,8 @@ func (s *sqliteStore) markManyForDeletionChunk(
 	first, now int64,
 	marked map[storeapi.ObjectID]bool,
 ) error {
-	args := make([]any, 0, len(ids)*2+2)
-	for i, id := range ids {
-		args = append(args, id, first+int64(i))
-	}
-	args = append(args, now, now)
-	// RETURNING, not RowsAffected: the log entries need each row's identity and
-	// the version it actually took.
 	// Drained and closed before the insert below, which needs the single conn.
-	stamped, err := scanLoggedWrites(c.QueryContext(ctx,
-		`WITH assigned(mark_id, mark_rv) AS (VALUES `+tupleRows(len(ids), 2)+`)
-		UPDATE objects SET deletion_requested_at = ?, updated_at = ?, resource_version = assigned.mark_rv
-		FROM assigned
-		WHERE objects.id = assigned.mark_id AND objects.deletion_requested_at IS NULL
-		RETURNING objects.id, objects."group", objects.kind, objects.resource_version`, args...))
+	stamped, err := scanLoggedWrites(s.query(ctx, stmtMarkManyForDeletion, now, jsonMarkPairs(ids, first)))
 	if err != nil {
 		return err
 	}
@@ -3322,6 +3307,18 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 		return nil, nil
 	}
 	return s.listObjects(ctx, stmtListObjectsByIDs, jsonList(ids), gk.Group, gk.Kind)
+}
+
+// jsonMarkPairs marshals the deletion mark's assignments as one JSON array of
+// [id, version] pairs: chunk[i] takes first+i. Integers only, so marshalling
+// cannot fail.
+func jsonMarkPairs(ids []storeapi.ObjectID, first int64) string {
+	pairs := make([][2]int64, len(ids))
+	for i, id := range ids {
+		pairs[i] = [2]int64{int64(id), first + int64(i)}
+	}
+	out, _ := json.Marshal(pairs)
+	return string(out)
 }
 
 // jsonKinds marshals kinds as one JSON array of [group, kind] pairs, for a
