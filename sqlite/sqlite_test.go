@@ -19,6 +19,7 @@ import (
 	"errors"
 	"io/fs"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/amorey/beehive/internal/sqlitemigrate"
@@ -236,4 +237,28 @@ func TestIdentityNamesTheDatabase(t *testing.T) {
 
 	assert.NotEqual(t, first.Identity(), second.Identity())
 	assert.NotEmpty(t, first.Identity())
+}
+
+// Close is idempotent and may be concurrent, so the claim must be released by
+// exactly one caller: a second release would hand the path away from whatever
+// reopened it.
+func TestCloseReleasesTheClaimOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+	store, err := Open(path)
+	require.NoError(t, err)
+
+	var closing sync.WaitGroup
+	for range 4 {
+		closing.Go(func() { assert.NoError(t, store.Close()) })
+	}
+	closing.Wait()
+
+	reopened, err := Open(path)
+	require.NoError(t, err, "the closes released the path")
+	t.Cleanup(func() { assert.NoError(t, reopened.Close()) })
+
+	require.NoError(t, store.Close())
+	_, err = Open(path)
+	assert.ErrorIs(t, err, ErrAlreadyOpen,
+		"a late Close from the old store must not evict the one that reopened it")
 }

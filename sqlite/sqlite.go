@@ -113,7 +113,8 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 		storeClaims.Drop(full)
 		return nil, err
 	}
-	s.identity, s.claimed = full, true
+	s.identity = full
+	s.claimed.Store(true)
 	return s, nil
 }
 

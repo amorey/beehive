@@ -103,8 +103,9 @@ type sqliteStore struct {
 
 	// claimed records that this store holds storeClaims[identity], so a release
 	// drops its own claim and never a successor's. False for a memory store,
-	// which claims nothing.
-	claimed bool
+	// which claims nothing. Atomic because Close is idempotent and may be
+	// concurrent, and the test-and-clear must let exactly one caller through.
+	claimed atomic.Bool
 
 	// readDB serves reads that are not inside a transaction. Aliased to db where
 	// the database cannot be opened twice (see OpenMemory).
@@ -145,12 +146,12 @@ func (s *sqliteStore) Close() error {
 }
 
 // releaseClaim drops this store's claim, and only its own: a second Close would
-// otherwise release whatever reopened the file.
+// otherwise release whatever reopened the file. The swap is what makes that
+// hold for two Closes at once, where both would otherwise see the claim.
 func (s *sqliteStore) releaseClaim() {
-	if !s.claimed {
+	if !s.claimed.CompareAndSwap(true, false) {
 		return
 	}
-	s.claimed = false
 	storeClaims.Drop(s.identity)
 }
 
