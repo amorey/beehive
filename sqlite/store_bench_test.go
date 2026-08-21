@@ -539,3 +539,46 @@ func benchWriteLogAppendBatch(b *testing.B, n int) {
 		}
 	}
 }
+
+// Conditions().Set at the batch sizes a controller reports: one condition, and a
+// handful. A converged set never reaches the upsert — the no-op comparison stops
+// it — so each pass alternates the status to force a write.
+func BenchmarkConditionsSet(b *testing.B) {
+	for _, n := range []int{1, 3} {
+		b.Run(fmt.Sprintf("conditions=%d", n), func(b *testing.B) { benchConditionsSet(b, n) })
+	}
+}
+
+func benchConditionsSet(b *testing.B, n int) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	obj, err := store.Objects().Create(ctx, testGK,
+		beehive.ObjectsCreateInput{Name: "o", Spec: []byte(`{}`)})
+	require.NoError(b, err)
+
+	conds := make([]storeapi.Condition, n)
+	for i := range conds {
+		conds[i] = storeapi.Condition{
+			Type:    fmt.Sprintf("C%d", i),
+			Reason:  "Reconciled",
+			Message: "the controller reported this pass",
+		}
+	}
+
+	b.ResetTimer()
+	for i := range b.N {
+		status := "True"
+		if i%2 == 1 {
+			status = "False"
+		}
+		for j := range conds {
+			conds[j].Status = status
+		}
+		if err := store.Conditions().Set(ctx, testGK, obj.ID, conds...); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
