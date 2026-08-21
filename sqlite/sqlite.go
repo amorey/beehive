@@ -67,14 +67,11 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	if o.readConns < 1 {
 		return nil, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
 	}
-	s, err := open(sqlitemigrate.OpenPool(path, 1))
-	if err != nil {
-		return nil, err
-	}
-	// After open: migrations run on the writer, and a reader opened first would
-	// hold a schema that does not exist yet.
-	s.readDB = sqlitemigrate.OpenReadPool(path, o.readConns)
-	return s, nil
+	// The reader opens after the migrations, which run on the writer: one opened
+	// first would hold a schema that does not exist yet.
+	return open(sqlitemigrate.OpenPool(path, 1), func() *sql.DB {
+		return sqlitemigrate.OpenReadPool(path, o.readConns)
+	})
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
@@ -90,11 +87,19 @@ func OpenMemory() (*sqliteStore, error) {
 	// sql.Open only fails on an unregistered driver; modernc is blank-imported.
 	db, _ := sql.Open("sqlite", "file::memory:?_pragma=foreign_keys(on)&_pragma=auto_vacuum(incremental)")
 	db.SetMaxOpenConns(1)
-	db.SetConnMaxIdleTime(5 * time.Minute)
-	return open(db)
+	// Never reaped: file::memory: is per-connection, so losing the connection
+	// loses the database — and with it every statement compiled on it.
+	db.SetMaxIdleConns(1)
+	// No read pool: file::memory: is per-connection, so a second would be a
+	// different and empty database. Both statement sets are the one pool's.
+	return open(db, nil)
 }
 
-func open(db *sql.DB) (*sqliteStore, error) {
+// open builds a store on db, and on the read pool openRead returns — nil where
+// there is none, which aliases both statement sets to db. It runs the two
+// preparations in the only order that works: the writer's before the version
+// seed draws through it, the reader's after openRead has been called.
+func open(db *sql.DB, openRead func() *sql.DB) (*sqliteStore, error) {
 	if _, err := sqlitemigrate.Apply(context.Background(), db, migrations, "migrations"); err != nil {
 		db.Close()
 		return nil, err
@@ -107,9 +112,21 @@ func open(db *sql.DB) (*sqliteStore, error) {
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),
 	}
+	// Before the seed, which draws its first block through a prepared statement.
+	if err := s.prepareWriteStatements(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// Here because open holds no transaction, so the reservation cannot be rolled back.
 	if err := s.seedVersions(context.Background()); err != nil {
 		db.Close()
+		return nil, err
+	}
+	if openRead != nil {
+		s.readDB = openRead()
+	}
+	if err := s.prepareReadStatements(context.Background()); err != nil {
+		s.Close()
 		return nil, err
 	}
 	return s, nil

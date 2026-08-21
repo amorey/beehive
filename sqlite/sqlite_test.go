@@ -72,7 +72,20 @@ func TestOpenApplyError(t *testing.T) {
 	require.NoError(t, err)
 	db.Close()
 
-	_, err = open(db)
+	_, err = open(db, nil)
+	require.Error(t, err)
+}
+
+// The reader is prepared last, so a read pool that cannot serve one fails the
+// constructor rather than leaving a store whose reads have no statement.
+func TestOpenReportsAFailedReaderPreparation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+
+	_, err := open(sqlitemigrate.OpenPool(path, 1), func() *sql.DB {
+		closed := sqlitemigrate.OpenReadPool(path, 1)
+		closed.Close()
+		return closed
+	})
 	require.Error(t, err)
 }
 

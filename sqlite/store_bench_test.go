@@ -16,6 +16,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -307,5 +308,154 @@ func BenchmarkReadUnderWrites(b *testing.B) {
 			close(stop)
 			wg.Wait()
 		})
+	}
+}
+
+// BenchmarkUnpreparedBesidePrepared answers the question the statement-cache
+// spec owes: does a statement that cannot be prepared — Objects().ListByIDs
+// renders its IN list — get slower when its connection carries prepared ones?
+//
+// One read connection, so "its connection" is exact. inTx runs the read inside a
+// read transaction, which is the shape the +26% measurement came from.
+func BenchmarkUnpreparedBesidePrepared(b *testing.B) {
+	for _, batch := range []int{1, 64} {
+		for _, prepared := range []int{0, 60} {
+			for _, inTx := range []bool{false, true} {
+				b.Run(fmt.Sprintf("batch=%d/prepared=%d/inTx=%t", batch, prepared, inTx), func(b *testing.B) {
+					benchUnpreparedBesidePrepared(b, batch, prepared, inTx)
+				})
+			}
+		}
+	}
+}
+
+func benchUnpreparedBesidePrepared(b *testing.B, batch, prepared int, inTx bool) {
+	ctx := context.Background()
+
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"), WithReadConnections(1))
+	require.NoError(b, err)
+	defer store.Close()
+
+	const objects = 1000
+	ids := make([]storeapi.ObjectID, 0, batch)
+	for i := range objects {
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
+			Name: fmt.Sprintf("bench-%d", i),
+			Spec: []byte(`{"a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`),
+		})
+		require.NoError(b, err)
+		if len(ids) < cap(ids) {
+			ids = append(ids, obj.ID)
+		}
+	}
+
+	// Resident on the one read connection, compiled by running each once.
+	stmts := make([]*sql.Stmt, 0, prepared)
+	for i := range prepared {
+		st, err := store.readDB.PrepareContext(ctx, probeSQL(i))
+		require.NoError(b, err)
+		rows, err := st.QueryContext(ctx, int64(1))
+		require.NoError(b, err)
+		require.NoError(b, rows.Close())
+		stmts = append(stmts, st)
+	}
+	defer func() {
+		for _, st := range stmts {
+			st.Close()
+		}
+	}()
+
+	read := func(ctx context.Context) {
+		out, err := store.Objects().ListByIDs(ctx, testGK, ids)
+		require.NoError(b, err)
+		require.Len(b, out, len(ids))
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		if inTx {
+			require.NoError(b, store.withinRead(ctx, func(ctx context.Context) error {
+				read(ctx)
+				return nil
+			}))
+			continue
+		}
+		read(ctx)
+	}
+}
+
+// probeSQL is the i-th resident statement: distinct text, real schema, one row.
+func probeSQL(i int) string {
+	return fmt.Sprintf(
+		`SELECT resource_version FROM objects WHERE id = ? AND generation >= %d LIMIT 1`, i)
+}
+
+// BenchmarkResidencyToll measures what a statement pays for running on a
+// connection that holds prepared statements, prepared and unprepared alike.
+func BenchmarkResidencyToll(b *testing.B) {
+	for _, resident := range []int{0, 15, 60, 240} {
+		for _, prep := range []bool{false, true} {
+			b.Run(fmt.Sprintf("resident=%d/prepared=%t", resident, prep), func(b *testing.B) {
+				benchResidencyToll(b, resident, prep)
+			})
+		}
+	}
+}
+
+func benchResidencyToll(b *testing.B, resident int, prep bool) {
+	ctx := context.Background()
+
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"), WithReadConnections(1))
+	require.NoError(b, err)
+	defer store.Close()
+
+	var one storeapi.ObjectID
+	for i := range 1000 {
+		obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
+			Name: fmt.Sprintf("bench-%d", i),
+			Spec: []byte(`{"a":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`),
+		})
+		require.NoError(b, err)
+		one = obj.ID
+	}
+
+	stmts := make([]*sql.Stmt, 0, resident)
+	for i := range resident {
+		st, err := store.readDB.PrepareContext(ctx, probeSQL(i))
+		require.NoError(b, err)
+		rows, err := st.QueryContext(ctx, int64(1))
+		require.NoError(b, err)
+		require.NoError(b, rows.Close())
+		stmts = append(stmts, st)
+	}
+	defer func() {
+		for _, st := range stmts {
+			st.Close()
+		}
+	}()
+
+	// The measured statement: seventeen columns by primary key, the spec's own.
+	const q = `SELECT ` + objectColumns + ` FROM objects o WHERE o.id = ?`
+	var hot *sql.Stmt
+	if prep {
+		hot, err = store.readDB.PrepareContext(ctx, q)
+		require.NoError(b, err)
+		defer hot.Close()
+		rows, err := hot.QueryContext(ctx, one)
+		require.NoError(b, err)
+		require.NoError(b, rows.Close())
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		var rows *sql.Rows
+		if prep {
+			rows, err = hot.QueryContext(ctx, one)
+		} else {
+			rows, err = store.readDB.QueryContext(ctx, q, one)
+		}
+		require.NoError(b, err)
+		require.True(b, rows.Next())
+		require.NoError(b, rows.Close())
 	}
 }

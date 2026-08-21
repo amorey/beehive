@@ -91,6 +91,10 @@ type ControllerClient[Status any] interface {
 	// it makes. A read on any other ctx does not join the transaction, and reads
 	// run on their own connection, so it quietly returns state from before the
 	// transaction rather than failing. Watches cannot be opened inside it.
+	//
+	// fn's ctx belongs to one goroutine. Issuing store calls on it from two at
+	// once interleaves them on one prepared statement's cursor: each sees part of
+	// the other's rows, and neither reports an error.
 	Within(ctx context.Context, fn func(ctx context.Context) error) error
 }
 
