@@ -451,10 +451,9 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   memory-mapped I/O at all is not something to take on faith from the C docs.
 
   What would make it worth doing: a number. This is one line of DSN against the
-  whole of [cache prepared statements](specs/2026-08-20-cache-prepared-statements.md),
-  which hoists every constant statement into a field for −63% on a bare read — so
-  it is worth pricing on that spec's benchmarks, which measure the same paths.
-  Deferred on measurement, not on doubt.
+  whole of [preparing every constant statement](adr/2026-08-21-prepare-every-constant-statement.md),
+  which took 66% off a bare read — so it is worth pricing on that work's
+  benchmarks, which measure the same paths. Deferred on measurement, not on doubt.
 
 - **Nothing ever runs `PRAGMA optimize`.** SQLite recommends it for long-lived
   connections: it runs `ANALYZE` where the statistics have drifted, which is what
