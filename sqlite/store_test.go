@@ -9870,3 +9870,24 @@ func TestAReadAfterCloseReportsRatherThanPanics(t *testing.T) {
 	assert.Error(t, err)
 	assert.NoError(t, store.Close(), "closing twice closes each statement once")
 }
+
+// The ids reach SQLite as one JSON parameter, so their affinity is the JSON
+// parser's. A stringified id gets TEXT affinity and matches no INTEGER column —
+// a silent empty result, not an error — and a number past 2^53 is where a parser
+// that used floats would round. Both are ruled out at the boundary.
+func TestAnIDListBindsAsNumbers(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	var typ string
+	var got int64
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT typeof(value), value FROM json_each(?)`,
+		jsonList([]storeapi.ObjectID{1<<53 + 1})).Scan(&typ, &got))
+	assert.Equal(t, "integer", typ)
+	assert.Equal(t, int64(1<<53+1), got)
+
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		`SELECT typeof(value) FROM json_each(?)`, jsonList([]string{"Ready"})).Scan(&typ))
+	assert.Equal(t, "text", typ)
+}

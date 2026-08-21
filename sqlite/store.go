@@ -3415,6 +3415,16 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 		`WHERE o.id IN (`+placeholders(len(ids))+`) AND o."group" = ? AND o.kind = ?`, args...)
 }
 
+// jsonList marshals an IN list's values as one JSON array, for
+// `IN (SELECT value FROM json_each(?))`. Numbers stay numbers: json_each gives a
+// JSON string TEXT affinity, which matches no INTEGER column. Marshalling a
+// slice of integers or strings cannot fail, so the error is discarded here
+// rather than at seven call sites.
+func jsonList[T ~int64 | ~string](values []T) string {
+	out, _ := json.Marshal(values)
+	return string(out)
+}
+
 // placeholders builds "?, ?, ?" for an IN list of n values.
 func placeholders(n int) string {
 	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
