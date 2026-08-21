@@ -68,6 +68,12 @@ const (
 	stmtWatermarkSet
 	stmtProbeDeletionByName
 	stmtOverCapTimelines
+	stmtEdgeEndpointsForAdd
+	stmtStampOwedForNewEdge
+	stmtClearWatermarkForNewEdge
+	stmtInsertEdge
+	stmtDeleteEdge
+	stmtEdgeEndpointsForDelete
 
 	numStmts
 )
@@ -184,6 +190,24 @@ var stmtSQL = [numStmts]string{
 		 WHERE "group" = ? AND kind = ? AND name = ?`,
 	stmtOverCapTimelines: eventCapCandidates,
 
+	stmtEdgeEndpointsForAdd: `
+			SELECT t."group", t.kind, t.deletion_requested_at
+			FROM objects f, objects t WHERE f.id = ? AND t.id = ?`,
+	stmtStampOwedForNewEdge: `
+				UPDATE objects SET reconcile_owed = reconcile_owed + 1
+				WHERE id = ? AND ` + edgeIsNew,
+	stmtClearWatermarkForNewEdge: `
+				DELETE FROM dependency_watermarks
+				 WHERE object_id = ? AND ` + edgeIsNew,
+	stmtInsertEdge: `
+			INSERT INTO edges (from_id, to_id, relation) VALUES (?, ?, ?)
+			ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
+	stmtDeleteEdge: `DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
+	stmtEdgeEndpointsForDelete: `
+		SELECT t."group", t.kind,
+		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
+		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -220,6 +244,10 @@ var stmtWrites = [numStmts]bool{
 	stmtEdgesDeleteFinalizingDependsOn: true,
 	stmtDecrementOwed:                  true,
 	stmtWatermarkSet:                   true,
+	stmtStampOwedForNewEdge:            true,
+	stmtClearWatermarkForNewEdge:       true,
+	stmtInsertEdge:                     true,
+	stmtDeleteEdge:                     true,
 }
 
 // stmtSet is one pool's preparations.

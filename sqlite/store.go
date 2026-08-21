@@ -2935,18 +2935,16 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 		// CSE, so separate subqueries would seek the same row twice. A missing
 		// endpoint yields no row — clean ErrNotFound over an FK violation.
 		var to storeapi.GroupKind
-		var toDeletedAt *int64
-		err := s.read(ctx).QueryRowContext(ctx, `
-			SELECT t."group", t.kind, t.deletion_requested_at
-			FROM objects f, objects t WHERE f.id = ? AND t.id = ?`,
-			fromID, toID).Scan(&to.Group, &to.Kind, &toDeletedAt)
-		if errors.Is(err, sql.ErrNoRows) {
-			return storeapi.ErrNotFound
-		}
+		endpoints, err := s.stmtFor(ctx, stmtEdgeEndpointsForAdd)
 		if err != nil {
 			return err
 		}
-		c, err := s.conn(ctx)
+		var toDeletedAt *int64
+		err = endpoints.QueryRowContext(ctx, fromID, toID).
+			Scan(&to.Group, &to.Kind, &toDeletedAt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return storeapi.ErrNotFound
+		}
 		if err != nil {
 			return err
 		}
@@ -2959,10 +2957,11 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 		newDependency := relation == storeapi.RelationDependsOn && fromID != toID
 		var stamped bool
 		if newDependency {
-			res, err := c.ExecContext(ctx, `
-				UPDATE objects SET reconcile_owed = reconcile_owed + 1
-				WHERE id = ? AND `+edgeIsNew,
-				fromID, fromID, toID, string(relation))
+			stamp, err := s.stmtFor(ctx, stmtStampOwedForNewEdge)
+			if err != nil {
+				return err
+			}
+			res, err := stamp.ExecContext(ctx, fromID, fromID, toID, string(relation))
 			if err != nil {
 				return err
 			}
@@ -2979,17 +2978,19 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 		// Dependencies().ListStaleSince until the owed pass. Same edge-new gate;
 		// self-edges skipped to match that listing.
 		if newDependency {
-			if _, err := c.ExecContext(ctx, `
-				DELETE FROM dependency_watermarks
-				 WHERE object_id = ? AND `+edgeIsNew,
-				fromID, fromID, toID, string(relation)); err != nil {
+			clear, err := s.stmtFor(ctx, stmtClearWatermarkForNewEdge)
+			if err != nil {
+				return err
+			}
+			if _, err := clear.ExecContext(ctx, fromID, fromID, toID, string(relation)); err != nil {
 				return err
 			}
 		}
-		if _, err := c.ExecContext(ctx, `
-			INSERT INTO edges (from_id, to_id, relation) VALUES (?, ?, ?)
-			ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
-			fromID, toID, string(relation)); err != nil {
+		insert, err := s.stmtFor(ctx, stmtInsertEdge)
+		if err != nil {
+			return err
+		}
+		if _, err := insert.ExecContext(ctx, fromID, toID, string(relation)); err != nil {
 			return err
 		}
 		out = storeapi.EdgesAddResult{
@@ -3042,13 +3043,13 @@ func (s sqliteEdges) Delete(ctx context.Context, fromID, toID storeapi.ObjectID,
 	// pushes. Outside one the DELETE stands and the retry removes nothing, so
 	// the report costs the push, not the collect: the sweeper is the route, and
 	// it cannot be turned off.
+	endpoints, err := s.stmtFor(ctx, stmtEdgeEndpointsForDelete)
+	if err != nil {
+		return storeapi.EdgesDeleteResult{}, err
+	}
 	var to storeapi.GroupKind
 	var unblocked int
-	err = s.read(ctx).QueryRowContext(ctx, `
-		SELECT t."group", t.kind,
-		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
-		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
-		toID, fromID).Scan(&to.Group, &to.Kind, &unblocked)
+	err = endpoints.QueryRowContext(ctx, toID, fromID).Scan(&to.Group, &to.Kind, &unblocked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = nil // an endpoint went in the gap: nothing left to push
