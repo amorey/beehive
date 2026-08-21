@@ -4205,16 +4205,16 @@ func TestSelectScopedGatesAndReadsNamedColumns(t *testing.T) {
 	obj := newRefObject(t, store)
 
 	var gen int64
-	var deletionAt sql.NullInt64
+	var observed sql.NullInt64
 	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID,
-		`generation, deletion_requested_at`, &gen, &deletionAt))
+		stmtScopedGeneration, &gen, &observed))
 	assert.Equal(t, obj.Generation, gen)
-	assert.False(t, deletionAt.Valid)
+	assert.False(t, observed.Valid, "nothing has reconciled it")
 
 	// No columns: the gate alone, which is what checkObjectScoped wants.
-	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID, ``))
-	assert.ErrorIs(t, store.selectScoped(ctx, testGK, 999999, ``), beehive.ErrNotFound)
-	assert.ErrorIs(t, store.selectScoped(ctx, beehive.GroupKind{Kind: "Other"}, obj.ID, ``),
+	require.NoError(t, store.selectScoped(ctx, testGK, obj.ID, stmtScopedGate))
+	assert.ErrorIs(t, store.selectScoped(ctx, testGK, 999999, stmtScopedGate), beehive.ErrNotFound)
+	assert.ErrorIs(t, store.selectScoped(ctx, beehive.GroupKind{Kind: "Other"}, obj.ID, stmtScopedGate),
 		beehive.ErrWrongKind)
 }
 
@@ -6849,15 +6849,18 @@ func staleRefs(t *testing.T, store beehive.Store, kinds ...beehive.GroupKind) []
 	return refs
 }
 
-func dedupeIDs(ids []beehive.ObjectID) []beehive.ObjectID {
-	seen := make(map[beehive.ObjectID]struct{}, len(ids))
-	var out []beehive.ObjectID
-	for _, id := range ids {
-		if _, dup := seen[id]; dup {
+func dedupeIDs(ids []beehive.ObjectID) []beehive.ObjectID { return unique(ids) }
+
+// unique drops repeats, keeping first-seen order.
+func unique[T comparable](in []T) []T {
+	seen := make(map[T]struct{}, len(in))
+	var out []T
+	for _, v := range in {
+		if _, dup := seen[v]; dup {
 			continue
 		}
-		seen[id] = struct{}{}
-		out = append(out, id)
+		seen[v] = struct{}{}
+		out = append(out, v)
 	}
 	return out
 }
@@ -7685,7 +7688,7 @@ func TestRequestDeletionResolvesARowThatMovedAfterTheProbe(t *testing.T) {
 		return calls > 1, nil
 	}
 
-	res, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	res, err := store.requestDeletion(ctx, probe, stmtMarkForDeletionByID, 99999, testGK.Group, testGK.Kind)
 
 	require.NoError(t, err, "the row was collected or marked by someone else; that is success")
 	assert.False(t, res.Marked, "this call stamped nothing")
@@ -7707,7 +7710,7 @@ func TestRequestDeletionReportsARowCollectedAfterTheProbe(t *testing.T) {
 		return false, storeapi.ErrNotFound // gone
 	}
 
-	res, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	res, err := store.requestDeletion(ctx, probe, stmtMarkForDeletionByID, 99999, testGK.Group, testGK.Kind)
 
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
 	assert.False(t, res.Marked)
@@ -8671,18 +8674,67 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 }
 
 // sqlSites names every function in this package holding a string literal that
-// match accepts. Blind to a statement built by concatenation and to SQL outside
-// this package.
+// match accepts, or naming a prepared statement whose text it accepts. The
+// second is what keeps these tripwires keyed to the function issuing the SQL
+// once the text has moved into stmtSQL. Blind to a statement built by
+// concatenation and to SQL outside this package.
 func sqlSites(t *testing.T, match func(sql string) bool) []string {
 	t.Helper()
-	var sites []string
+	prepared := preparedSQL(t)
+	sites := sqlLiteralSites(t, match)
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
-		lit, ok := n.(*ast.BasicLit)
-		if ok && lit.Kind == token.STRING && match(lit.Value) {
+		id, ok := n.(*ast.Ident)
+		// fn is empty outside any function, which is where stmtSQL names every id.
+		if ok && fn != "" && match(prepared[id.Name]) {
 			sites = append(sites, qualify(recv, fn))
 		}
 	}))
 	return sites
+}
+
+// preparedSQL maps each stmtID to the text stmtSQL gives it, so a site naming
+// the id is attributed the statement it issues. Concatenated pieces are joined,
+// which is as blind to the join as sqlSites is elsewhere.
+func preparedSQL(t *testing.T) map[string]string {
+	t.Helper()
+	texts := map[string]string{}
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		// Scoped to stmtSQL: stmtWrites is keyed by the same idents and would
+		// otherwise be walked too.
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok || len(spec.Names) != 1 || spec.Names[0].Name != "stmtSQL" {
+			return
+		}
+		for _, kv := range spec.Values[0].(*ast.CompositeLit).Elts {
+			collectStmtText(kv, texts)
+		}
+	}))
+	return texts
+}
+
+// collectStmtText records one stmtSQL entry's id and text. Concatenated pieces
+// are joined, which is as blind to the join as sqlSites is elsewhere.
+func collectStmtText(elt ast.Expr, texts map[string]string) {
+	kv, ok := elt.(*ast.KeyValueExpr)
+	if !ok {
+		return
+	}
+	key, ok := kv.Key.(*ast.Ident)
+	if !ok {
+		return
+	}
+	var text strings.Builder
+	ast.Inspect(kv.Value, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			// Unquoted: a caller matching on the SQL would otherwise be reading the
+			// literal's own backticks, and anchoring on the first verb never fires.
+			text.WriteString(strings.Trim(lit.Value, "`\""))
+		}
+		return true
+	})
+	if text.Len() > 0 {
+		texts[key.Name] = text.String()
+	}
 }
 
 // callSites names every function calling any of methods, qualified by receiver
@@ -8744,14 +8796,18 @@ func inspectPackage(t *testing.T, visit func(fn, recv string, n ast.Node)) error
 		if err != nil {
 			return err
 		}
-		var fn, recv string
-		ast.Inspect(file, func(n ast.Node) bool {
-			if decl, ok := n.(*ast.FuncDecl); ok {
-				fn, recv = decl.Name.Name, receiverName(decl)
+		// Per declaration, so a package-level var after a function is attributed to
+		// no function rather than to whichever one precedes it.
+		for _, decl := range file.Decls {
+			var fn, recv string
+			if fd, ok := decl.(*ast.FuncDecl); ok {
+				fn, recv = fd.Name.Name, receiverName(fd)
 			}
-			visit(fn, recv, n)
-			return true
-		})
+			ast.Inspect(decl, func(n ast.Node) bool {
+				visit(fn, recv, n)
+				return true
+			})
+		}
 		return nil
 	})
 }
@@ -9106,15 +9162,20 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	// write on more than one sub-API, so a bare name would let a new one pass on
 	// an existing one's behalf.
 	takesConn := map[string]bool{}
-	for _, fn := range callSites(t, "conn") {
+	// Beside conn: a prepared write reaches its connection through writeStmt, or
+	// through one of the shapes wrapping it, and all of them refuse a write in a
+	// read frame the same way.
+	for _, fn := range callSites(t, "conn", "writeStmt", "stmt", "exec", "query", "queryRow") {
 		takesConn[fn] = true
 	}
-	// Helpers handed a dbtx by a caller that did take one from conn.
+	// Functions that name a write without issuing it: helpers handed a dbtx by a
+	// caller that took one from conn, callers that hand a statement id to a helper
+	// that does, and the two builders that only return SQL.
 	for _, fn := range []string{
-		"drawResourceVersions", "appendWriteLog", "appendWriteLogUpdates",
-		"appendWriteLogDelete", "sqliteStore.bumpObject",
+		"appendWriteLogUpdates", "sqliteStore.bumpObject",
 		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
 		"sqliteStore.markManyForDeletionChunk",
+		"sqliteEvents.Sweep", "sqliteStore.trimEventsToCap",
 		"reconcileOwedSweepQuery", // builds a string, executes nothing
 	} {
 		takesConn[fn] = true
@@ -9122,17 +9183,21 @@ func TestNoWriteBypassesConn(t *testing.T) {
 
 	var bypass []string
 	for _, fn := range sqlSites(t, writesData.MatchString) {
-		if !takesConn[fn] {
-			bypass = append(bypass, fn)
+		// The *SQL builders return statement text and issue nothing. Named by
+		// suffix rather than listed, so adding one is not a roster edit.
+		if takesConn[fn] || strings.HasSuffix(fn, "SQL") {
+			continue
 		}
+		bypass = append(bypass, fn)
 	}
 	assert.Empty(t, bypass, "a write here takes its connection from somewhere conn cannot refuse")
 }
 
-// The transaction handle is reachable only through conn and read, plus the
-// savepoint statements. That is what leaves conn the one place a data write can
-// be refused: a statement issued on st.tx directly would never reach it.
-func TestTheTransactionHandleHasThreeUsers(t *testing.T) {
+// The transaction handle is reachable only through conn, read and the two
+// statement accessors, plus the savepoint statements. conn and stmtFor are where
+// a write into a read frame is refused; readStmt carries no write to refuse. A
+// statement issued on st.tx directly would reach none of them.
+func TestTheTransactionHandleHasFiveUsers(t *testing.T) {
 	seen := map[string]bool{}
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
 		sel, ok := n.(*ast.SelectorExpr)
@@ -9146,10 +9211,12 @@ func TestTheTransactionHandleHasThreeUsers(t *testing.T) {
 	}
 
 	assert.ElementsMatch(t, []string{
-		"sqliteStore.conn", // hands it to writes, and refuses a read frame
-		"sqliteStore.read", // hands it to reads
-		"txState.nested",   // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
-	}, users, "a fourth user of st.tx is a write conn cannot refuse")
+		"sqliteStore.conn",     // hands it to writes, and refuses a read frame
+		"sqliteStore.read",     // hands it to reads
+		"bindStmt",             // binds a write's statement; stmtFor refuses the same
+		"sqliteStore.readStmt", // binds a read's; there is nothing to refuse
+		"txState.nested",       // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
+	}, users, "a sixth user of st.tx is a write nothing can refuse")
 }
 
 // A write inside a read transaction is refused before any statement runs, in both
@@ -9422,6 +9489,11 @@ func TestEveryWriteVerbRefusesAReadTransaction(t *testing.T) {
 			_, err := s.ReconcileOwed().Sweep(ctx, []storeapi.GroupKind{gk})
 			return err
 		}},
+		{"Events().Sweep by age", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
+			// No cap, so the age branch is what resolves a trim pair.
+			_, err := s.Events().Sweep(ctx, 0, time.Nanosecond, 0)
+			return err
+		}},
 		{"ObjectWrites().Sweep", func(ctx context.Context, s *sqliteStore, _ storeapi.ObjectID) error {
 			// A maxAge that matches every entry, so the sweep reaches its delete.
 			_, err := s.ObjectWrites().Sweep(ctx, 16, time.Nanosecond)
@@ -9447,4 +9519,354 @@ func TestEveryWriteVerbRefusesAReadTransaction(t *testing.T) {
 			assert.ErrorIs(t, err, errWroteInReadTx)
 		})
 	}
+}
+
+// A read is prepared on both pools, because a read issued inside a write
+// transaction must run on the writer's connection. A write is prepared on the
+// writer alone: the reader accepts the preparation and fails only on execution,
+// so a nil slot is the only representation Open can check.
+func TestStatementsFillTheSetsTheirPoolAllows(t *testing.T) {
+	store := newDiskStore(t)
+
+	assert.NotNil(t, store.readStmts[stmtGetObjectRow], "a read is prepared on the reader")
+	assert.NotNil(t, store.writeStmts[stmtGetObjectRow], "and on the writer, for case 3")
+	assert.Nil(t, store.readStmts[stmtIncrementOwed], "a write is never prepared on the reader")
+	assert.NotNil(t, store.writeStmts[stmtIncrementOwed], "only on the writer")
+}
+
+// Case 3: a read inside a write transaction runs on the writer's connection, so
+// it sees that transaction's own uncommitted writes. Running the read pool's
+// preparation here would answer from before them, silently.
+func TestAPreparedReadSeesItsWriteTransaction(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		owed := sqliteReconcileOwed{store}
+		if err := owed.Increment(ctx, obj.ID); err != nil {
+			return err
+		}
+		got, err := store.Objects().GetMeta(ctx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), got.ReconcileOwed, "the read joins the transaction that wrote")
+		return nil
+	}))
+}
+
+// Case 2: a read inside a read transaction runs on that transaction's own
+// connection, so it keeps one snapshot. Running the pool's preparation would
+// take a second connection and see the write that landed after it opened.
+func TestAPreparedReadKeepsItsSnapshot(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	require.NoError(t, store.withinRead(ctx, func(txCtx context.Context) error {
+		before, err := store.Objects().GetMeta(txCtx, obj.ID)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), before.ReconcileOwed)
+
+		// Committed on the writer while this read transaction is open.
+		require.NoError(t, sqliteReconcileOwed{store}.Increment(ctx, obj.ID))
+
+		after, err := store.Objects().GetMeta(txCtx, obj.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), after.ReconcileOwed, "the snapshot does not move under the read")
+		return nil
+	}))
+}
+
+// Preparing eagerly is what turns a typo on a cold path into a startup error.
+// The reopen is what stands in for "no pool leaked": a leaked writer would hold
+// the file's write lock.
+func TestOpenFailsOnAStatementItCannotPrepare(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+
+	restore := stmtSQL[stmtGetObjectRow]
+	stmtSQL[stmtGetObjectRow] = `SELECT nonexistent FROM objects WHERE id = ?`
+	store, err := Open(path)
+	stmtSQL[stmtGetObjectRow] = restore
+
+	require.Error(t, err)
+	assert.Nil(t, store)
+
+	reopened, err := Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { reopened.Close() })
+}
+
+// The two sides of listObjectsWhere. Objects().List has a constant tail and is
+// prepared; Objects().ListByIDs renders its IN list per arity and cannot be.
+func TestOnlyTheConstantObjectListingIsPrepared(t *testing.T) {
+	store := newDiskStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	listed, err := store.Objects().List(ctx, testGK)
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+
+	byID, err := store.Objects().ListByIDs(ctx, testGK, []storeapi.ObjectID{obj.ID})
+	require.NoError(t, err)
+	require.Len(t, byID, 1)
+	assert.Equal(t, listed[0].ID, byID[0].ID, "both halves of the split read the same row")
+
+	// Which half is prepared is a static fact about the call graph: the rendered
+	// tail has exactly one caller, and the constant ones go through listObjects.
+	assert.Equal(t, []string{"sqliteObjects.ListByIDs"}, callSites(t, "listObjectsWhere"))
+	assert.ElementsMatch(t, []string{"sqliteObjects.List", "sqliteObjects.ListByIncomingEdge"},
+		callSites(t, "listObjects"))
+}
+
+// Every statement whose text is constant is prepared, so the only SQL left
+// inside a function is rendered from a runtime count. This is what keeps a new
+// hot read from being silently unprepared: add one with its SQL inline and it
+// shows up here.
+func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
+	anySQL := regexp.MustCompile(`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+
+	var inFunctions []string
+	for _, fn := range sqlLiteralSites(t, anySQL.MatchString) {
+		// The *SQL builders hold the text of prepared statements.
+		if strings.HasSuffix(fn, "SQL") {
+			continue
+		}
+		inFunctions = append(inFunctions, fn)
+	}
+
+	assert.ElementsMatch(t, renderedSQLSites, unique(inFunctions),
+		"SQL inside a function must be rendered from a runtime count; everything else is a field")
+}
+
+// renderedSQLSites is the twelve functions holding SQL whose text varies with
+// data. Each
+// renders an IN list, a VALUES tuple set or an optional predicate, so one
+// statement per arity would fill the table with single-use entries.
+var renderedSQLSites = []string{
+	"appendWriteLogUpdates",
+	"sqliteStore.conditionsByIDsChunk",
+	"sqliteReconcileOwed.Stamp",
+	"reconcileOwedSweepQuery",
+	"sqliteDependencies.ListStaleSince",
+	"sqliteStore.readImages",
+	"conditionSetLoad",
+	"sqliteStore.upsertConditions",
+	"sqliteEvents.List",
+	"sqliteStore.markManyForDeletionChunk",
+	"sqliteStore.unblockedTargetsChunk",
+	"sqliteStore.edgesByIDsChunk",
+}
+
+// sqlLiteralSites names every function holding a string literal match accepts.
+// Unlike sqlSites it does not follow a statement id: this asks which functions
+// carry SQL *text*, not which issue SQL.
+func sqlLiteralSites(t *testing.T, match func(sql string) bool) []string {
+	t.Helper()
+	var sites []string
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		lit, ok := n.(*ast.BasicLit)
+		if ok && fn != "" && lit.Kind == token.STRING && match(lit.Value) {
+			sites = append(sites, qualify(recv, fn))
+		}
+	}))
+	return sites
+}
+
+// stmtWrites is a second table over the same ids, and a miss in the write
+// direction is the bad one: the id is prepared on the read pool, stmtFor stops
+// refusing it in a read frame, and the write fails as a driver error on a cold
+// path instead. Derived here from the text rather than trusted.
+func TestEveryStatementIsClassifiedByItsOwnText(t *testing.T) {
+	writes := regexp.MustCompile(`(?is)^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+
+	for id := stmtID(0); id < numStmts; id++ {
+		assert.Equal(t, writes.MatchString(stmtSQL[id]), stmtWrites[id],
+			"statement %d: stmtWrites disagrees with its own SQL", id)
+	}
+}
+
+// The statement sets carry the same hazard st.tx does: reached directly, a
+// write-set statement runs on the writer's pool connection rather than the
+// ambient transaction — the silent wrong-connection read stmtFor exists to
+// prevent. Only the functions that build, route and release them may name them.
+func TestTheStatementSetsHaveFiveUsers(t *testing.T) {
+	seen := map[string]bool{}
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		sel, ok := n.(*ast.SelectorExpr)
+		if ok && (sel.Sel.Name == "readStmts" || sel.Sel.Name == "writeStmts") {
+			seen[qualify(recv, fn)] = true
+		}
+	}))
+	users := make([]string, 0, len(seen))
+	for fn := range seen {
+		users = append(users, fn)
+	}
+
+	assert.ElementsMatch(t, []string{
+		"sqliteStore.prepareWriteStatements",
+		"sqliteStore.prepareReadStatements",
+		"sqliteStore.closeStatements",
+		"sqliteStore.writeStmt",
+		"sqliteStore.readStmt",
+	}, users, "a statement reached outside the two accessors runs on the wrong connection")
+}
+
+// takesReads and takesWrites are the two accessors and the helpers that forward
+// an id to one of them. stmt is on neither: it dispatches on the id itself.
+var (
+	takesReads  = map[string]bool{"readStmt": true, "selectScoped": true, "listObjects": true}
+	takesWrites = map[string]bool{"writeStmt": true, "trimStmts": true}
+)
+
+// Each accessor takes one kind, and only the id says which: readStmt cannot
+// refuse and would find the reader's empty slot for a write, and writeStmt
+// refuses a frame a read is entitled to. The type cannot say it, so every
+// argument is checked here.
+func TestEachAccessorTakesItsOwnKind(t *testing.T) {
+	writes := regexp.MustCompile(`(?is)^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+	text := preparedSQL(t)
+
+	var checked int
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			return
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !takesReads[sel.Sel.Name] && !takesWrites[sel.Sel.Name] {
+			return
+		}
+		for _, arg := range call.Args[1:] {
+			id, ok := arg.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			sql, named := text[id.Name]
+			if !named {
+				continue // a parameter forwarding an id; its own callers are checked
+			}
+			assert.Equal(t, takesWrites[sel.Sel.Name], writes.MatchString(sql),
+				"%s passes %s to %s", qualify(recv, fn), id.Name, sel.Sel.Name)
+			checked++
+		}
+	}))
+	assert.NotZero(t, checked, "the walk found no accessor call, so it proves nothing")
+}
+
+// The version seed draws through a prepared statement before Open returns, so a
+// draw that fails is a constructor failure rather than a store handing out
+// versions nobody reserved.
+func TestOpenFailsWhenTheVersionSeedCannotDraw(t *testing.T) {
+	restore := stmtSQL[stmtDrawResourceVersions]
+	// Prepares and binds, and returns no row — so the seed's Scan fails.
+	stmtSQL[stmtDrawResourceVersions] = `SELECT value FROM resource_version_seq WHERE id = ? AND 0`
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	stmtSQL[stmtDrawResourceVersions] = restore
+
+	require.Error(t, err)
+	assert.Nil(t, store)
+}
+
+// OpenMemory prepares on the one pool it has, and reports the same failure.
+func TestOpenMemoryFailsOnAStatementItCannotPrepare(t *testing.T) {
+	restore := stmtSQL[stmtGetObjectRow]
+	stmtSQL[stmtGetObjectRow] = `SELECT nonexistent FROM objects WHERE id = ?`
+	store, err := OpenMemory()
+	stmtSQL[stmtGetObjectRow] = restore
+
+	require.Error(t, err)
+	assert.Nil(t, store)
+}
+
+// A write reaching queryRow on a read frame is refused there, and the refusal
+// rides to the Scan its caller was going to make.
+func TestAWriteThroughQueryRowIsRefusedOnAReadFrame(t *testing.T) {
+	store := newRawStore(t)
+
+	err := store.withinRead(context.Background(), func(ctx context.Context) error {
+		_, err := store.drawResourceVersions(ctx, 1)
+		return err
+	})
+	assert.ErrorIs(t, err, errWroteInReadTx)
+}
+
+// The write helpers that take their statement directly, rather than through
+// exec or queryRow, refuse a read frame the same way. Each is unexported and
+// reached only from a verb that refuses earlier, so the refusal is pinned here
+// rather than through a caller.
+func TestTheDirectWriteHelpersRefuseAReadFrame(t *testing.T) {
+	ctx := context.Background()
+
+	helpers := []struct {
+		name  string
+		write func(context.Context, *sqliteStore, *storeapi.RawObject) error
+	}{
+		{"appendWriteLogDelete", func(ctx context.Context, s *sqliteStore, obj *storeapi.RawObject) error {
+			return s.appendWriteLogDelete(ctx, obj, 1, 1)
+		}},
+		{"trimStmts", func(ctx context.Context, s *sqliteStore, _ *storeapi.RawObject) error {
+			_, _, err := s.trimStmts(ctx, stmtRaiseEventHorizonByAge, stmtTrimEventsByAge)
+			return err
+		}},
+		{"deleteWriteLogRows", func(ctx context.Context, s *sqliteStore, _ *storeapi.RawObject) error {
+			_, _, err := s.deleteWriteLogRows(ctx, stmtTrimWriteLogByAge, int64(0))
+			return err
+		}},
+		{"markForDeletion", func(ctx context.Context, s *sqliteStore, obj *storeapi.RawObject) error {
+			_, _, err := s.markForDeletion(ctx, stmtMarkForDeletionByID, obj.ID, testGK.Group, testGK.Kind)
+			return err
+		}},
+	}
+
+	for _, tc := range helpers {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRawStore(t)
+			obj := newRefObject(t, store)
+
+			err := store.withinRead(ctx, func(ctx context.Context) error {
+				return tc.write(ctx, store, obj)
+			})
+			assert.ErrorIs(t, err, errWroteInReadTx)
+		})
+	}
+}
+
+// getObjectRowScoped is the blob-carrying scoped read, so its gate is the one
+// selectScoped's callers do not exercise.
+func TestGetObjectRowScopedGatesTheKind(t *testing.T) {
+	store := newRawStore(t)
+	obj := newRefObject(t, store)
+
+	_, err := store.getObjectRowScoped(context.Background(),
+		beehive.GroupKind{Kind: "Other"}, obj.ID)
+	assert.ErrorIs(t, err, beehive.ErrWrongKind)
+}
+
+// Objects().ListByIDs renders one placeholder per id, so a caller that ignores
+// the chunk size reaches SQLite's parameter limit. The read reports it rather
+// than truncating.
+func TestAnOversizedIDListIsReported(t *testing.T) {
+	store := newRawStore(t)
+
+	ids := make([]storeapi.ObjectID, 40000)
+	for i := range ids {
+		ids[i] = storeapi.ObjectID(i + 1)
+	}
+	_, err := store.Objects().ListByIDs(context.Background(), testGK, ids)
+	assert.Error(t, err, "past the parameter limit the statement cannot be prepared")
+}
+
+// A goroutine can outlive Close — a watch tailer stopping is not ordered against
+// it — and what it finds must be a closed statement to report, not a cleared
+// slot to dereference.
+func TestAReadAfterCloseReportsRatherThanPanics(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	require.NoError(t, err)
+	obj := newRefObject(t, store)
+	require.NoError(t, store.Close())
+
+	_, err = store.Objects().GetMeta(context.Background(), obj.ID)
+	assert.Error(t, err)
+	assert.NoError(t, store.Close(), "closing twice closes each statement once")
 }

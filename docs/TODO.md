@@ -440,3 +440,29 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   `TestDependentsListStaleSince*`. Drift from the accessor refactor, left out of
   the verb-first rename so that diff stayed one mechanical change. Nothing reads
   wrong, but the names now point at methods that exist on neither surface.
+
+- **The read pool sets two pragmas, and the tuning ones are not among them.**
+  `OpenReadPool`'s DSN carries `busy_timeout` and `query_only`; neither pool sets
+  `cache_size` or `temp_store`. Each connection keeps its own page cache, about
+  2MB by default, so N readers doing repeated indexed lookups over the same pages
+  each re-fetch what a larger cache would hold — the shape every driver loop has.
+  `mmap_size` is the other usual candidate, and it needs checking rather than
+  assuming: `modernc` is a pure-Go translation, and whether its VFS implements
+  memory-mapped I/O at all is not something to take on faith from the C docs.
+
+  What would make it worth doing: a number. This is one line of DSN against the
+  whole of [preparing every constant statement](adr/2026-08-21-prepare-every-constant-statement.md),
+  which took 66% off a bare read — so it is worth pricing on that work's
+  benchmarks, which measure the same paths. Deferred on measurement, not on doubt.
+
+- **Nothing ever runs `PRAGMA optimize`.** SQLite recommends it for long-lived
+  connections: it runs `ANALYZE` where the statistics have drifted, which is what
+  keeps the planner choosing the indexes this store's queries are shaped around.
+  `TestEdgeListsInheritTheIndexOrder` and `TestEventsIndexesKeepSortsOutOfPlans`
+  assert the plan is right on a fresh database; neither says the planner still has
+  the statistics to find it after a million writes.
+
+  It is a write — `sqlite_stat1` — so it belongs on the writer, and the GC sweeper
+  already has the cadence and the per-sweep budget to hang it on. What would make
+  it worth doing: a plan that measurably degrades on a large, long-lived store.
+  Nobody has run one that long, which is the actual gap here.
