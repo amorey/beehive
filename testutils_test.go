@@ -25,6 +25,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -293,9 +294,34 @@ func mustCreate[Spec, Status any](
 
 // captureLogger returns a logger that records everything at or above level into
 // the returned buffer, for tests asserting that a code path announces itself.
-func captureLogger(level slog.Level) (*slog.Logger, *bytes.Buffer) {
-	var buf bytes.Buffer
-	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})), &buf
+func captureLogger(level slog.Level) (*slog.Logger, *safeBuffer) {
+	buf := &safeBuffer{}
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: level})), buf
+}
+
+// safeBuffer is a bytes.Buffer a logger and a test can hold at once, which
+// captureLogger needs wherever the code under test still has loops running.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *safeBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
 }
 
 // withoutGCSweeper stops the global GC sweeper from starting, for tests that are
@@ -325,7 +351,21 @@ type (
 type fakeStore struct {
 	mu     sync.Mutex
 	closed bool
+	id     int64
 }
+
+// Identity is per value, since two fakeStores are two databases. Lazy so the
+// zero value works: every fixture builds one with &fakeStore{}.
+func (s *fakeStore) Identity() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.id == 0 {
+		s.id = fakeStoreIDs.Add(1)
+	}
+	return "fake:" + strconv.FormatInt(s.id, 10)
+}
+
+var fakeStoreIDs atomic.Int64
 
 func (s *fakeStore) Close() error {
 	s.mu.Lock()

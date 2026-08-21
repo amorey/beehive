@@ -97,6 +97,10 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
+	// identity names the database: the absolute path, or a token for a memory
+	// store, whose file::memory: genuinely is a database of its own.
+	identity string
+
 	// readDB serves reads that are not inside a transaction. Aliased to db where
 	// the database cannot be opened twice (see OpenMemory).
 	readDB *sql.DB
@@ -131,6 +135,10 @@ func (s *sqliteStore) Close() error {
 	}
 	return errors.Join(err, s.db.Close())
 }
+
+// Identity is the absolute path, or a token for a memory store. Two names for
+// one file are two identities; see the interface.
+func (s *sqliteStore) Identity() string { return s.identity }
 
 // Drain floor: release only past both an absolute size and a share of the file.
 // Free pages are what the next inserts would have reused, so draining a small

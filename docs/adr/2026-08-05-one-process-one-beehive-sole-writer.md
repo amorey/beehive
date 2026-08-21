@@ -72,9 +72,44 @@ binary — is supported, and is what the durable records exist for: a spec write
 generation bump, `reconcile_owed`, `dependency_watermarks.reconciled_against`,
 the write log. The constraint is on *concurrent* access, not on succession.
 
-**This is documented, not enforced.** No lock file, no advisory lock, no
-registration row. Enforcement is a defensible thing to add later; it is a
-separate decision, and adding it would not change the contract above.
+**Enforcement is split by what beehive can see.** Within the process it is
+checked: `Start` claims its store's database, and a second `Beehive` over that
+database is `ErrStoreInUse`. A map and a mutex in `beehive.go` — no lock file
+and nothing durable.
+
+**The claim outlives a blown stop deadline.** It is released once the reconcile
+loops have actually stopped, not when `stop` returns, so a caller whose deadline
+expired hands nothing on early: a successor is refused for exactly as long as a
+writer of the old `Beehive` is still running. That is what keeps the rule a rule
+rather than a rule with an acknowledged lapse.
+
+It keys on `Store.Identity` — the database's *normalized path*, or a token for a
+memory store, whose `file::memory:` genuinely is a database of its own. Keying
+on the database rather than on the store value is what makes the check
+sufficient on its own: two `sqlite.Open` calls on one path report one identity
+and collide, and a decorator claims what it wraps rather than itself. Normalized,
+not canonical: two names for one file — a symlink, a hard link — are two
+identities, which is the same guardrail-not-boundary the third clause already is.
+
+**`sqlite.Open` takes no claim of its own.** A second open with no second
+`Beehive` behind it is out-of-band access, which the third clause above leaves
+documented — and refusing it would enforce that clause only for the callers
+polite enough to come through this constructor, while `sql.Open` on the same
+path and an external tool stay invisible. Partial enforcement of a rule that
+cannot be enforced reads as coverage that is not there.
+
+Across processes it stays documented, and the embedder arranges it. Any lock
+beehive could take rests on `fcntl`, which needs a working lock daemon over NFS
+and is advisory-only on some network and overlay filesystems — so it would fail
+silently on a shared volume with two replicas, which is the deployment that
+motivates it. An embedder running a single-replica deployment, a lease, or a
+supervisor already has a stronger guarantee than beehive could offer, and one
+beehive cannot see. An out-of-band writer stays undetectable either way.
+
+The split does not change the contract above. What it changes is that two of the
+three violations now fail loudly at startup instead of silently at runtime, which
+matters because the in-memory indexes built on this rule turn a second writer
+from a latency cost into a wrong answer.
 
 ## Consequences
 
@@ -107,11 +142,18 @@ tests and stay.
 
 ### Rejected alternatives
 
-**Enforce it — a lock file or `PRAGMA locking_mode=EXCLUSIVE`.** Turns a
-documented constraint into a runtime error, which is strictly better for anyone
-who trips it. Not done now because it changes `New`'s failure modes and its
-teardown obligations, and because the immediate problem is that the docs claim
-the opposite of the truth. Fixing the claim does not depend on it.
+**A cross-process lock — a lock file or `PRAGMA locking_mode=EXCLUSIVE`.** Both
+were measured. A held `BEGIN EXCLUSIVE` on an empty database beside the store
+survives every crash cleanly: the kernel drops the lock on `SIGKILL` and a reboot
+starts unclaimed, so nothing durable can go stale. It is still rejected, for the
+reason above — it is unreliable on precisely the filesystems that make two
+replicas possible — and `locking_mode=EXCLUSIVE` on the store file is rejected
+outright, since the reader pool opens the same path and would be locked out.
+
+**A `beehive_lock` row with a heartbeat.** The heartbeat exists only to guess
+whether a crashed process is dead, and it guesses wrong in both directions: a
+stopped-the-world pause looks like a crash, and a power loss leaves a row
+claiming the store until a timeout chosen months earlier expires.
 
 **Support it properly — a store-backed wake, scoped cursors, a shared queue.**
 This is the honest fix for the deployment shape, and it is a different package.

@@ -729,3 +729,259 @@ func TestRegisterInheritsIndividualPassInterval(t *testing.T) {
 	assert.NotNil(t, bh.reconcilers[inherited].individualPassRand, "the jitter source is seeded")
 	assert.Equal(t, time.Second, bh.reconcilers[overridden].individualPassInterval)
 }
+
+// One store, one running Beehive. The in-memory indexes a later pass builds are
+// correct only under that rule, so a second Start says so rather than running.
+func TestStartRefusesAStoreAlreadyRunning(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	first := newTestBeehive(t, store)
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(ctx)) })
+
+	second := newTestBeehive(t, store)
+	_, err = second.Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse)
+	assert.NotErrorIs(t, err, context.Canceled,
+		"a store owned elsewhere is not a start that began work and aborted")
+}
+
+// The restart: a stopped Beehive leaves its store to the next one. This is the
+// ordinary process restart, and it must stay easy.
+func TestStartAfterStopReclaimsTheStore(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	first := newTestBeehive(t, store)
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+	require.NoError(t, stop(ctx))
+
+	second := newTestBeehive(t, store)
+	stop2, err := second.Start(ctx)
+	require.NoError(t, err)
+	assert.NoError(t, stop2(ctx))
+}
+
+// A start that claimed the store and then failed leaves it startable. abort
+// does not set bh.state, so the retry is a supported path.
+func TestStartAbortReleasesTheStore(t *testing.T) {
+	store := &fakeStore{}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	bh := newTestBeehive(t, store)
+	_, err := bh.Start(cancelled)
+	require.ErrorIs(t, err, context.Canceled)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err, "the aborted start released the store")
+	assert.NoError(t, stop(context.Background()))
+}
+
+// A Beehive releases its own claim and nobody else's. A never-started one
+// reaches the release — running is false, so it skips the drain and falls
+// through — and must leave a running Beehive's registration alone.
+func TestStopLeavesAnotherBeehivesRegistration(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	running := newTestBeehive(t, store)
+	stop, err := running.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(ctx)) })
+
+	require.NoError(t, newTestBeehive(t, store).stop(ctx))
+
+	_, err = newTestBeehive(t, store).Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse, "the never-started stop evicted a live claim")
+}
+
+// A stop whose drain hit its deadline holds the store until the loops it
+// cancelled actually stop. The claim outlives the deadline by exactly as long
+// as a writer of this Beehive is still running, so a successor is refused for
+// precisely that window and no longer.
+func TestABlownDeadlineHoldsTheStoreUntilTheLoopsStop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+	store := newClientTestStore(t)
+
+	// A drain that cannot finish, so stop's select has one ready case. A
+	// controller that returns leaves both ready and the branch taken at random.
+	ctrl := &blockingController[cSpec, cStatus]{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	bh := newTestBeehive(t, store, WithFullPassInterval(0))
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "held", cSpec{})
+	<-ctrl.entered
+
+	expired, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
+	require.ErrorIs(t, stop(expired), context.Canceled)
+
+	_, err = newTestBeehive(t, store).Start(ctx)
+	require.ErrorIs(t, err, ErrStoreInUse, "a writer of the stopped Beehive is still running")
+
+	// Releasing the loops is what releases the store. A spin on observable
+	// state, not a sleep: the release runs on the drain's own goroutine.
+	close(ctrl.release)
+	for deadline := time.Now().Add(testTimeout); ; runtime.Gosched() {
+		next, err := newTestBeehive(t, store).Start(ctx)
+		if err == nil {
+			assert.NoError(t, next(ctx))
+			break
+		}
+		require.False(t, time.Now().After(deadline), "the drained loops never released the store")
+	}
+}
+
+// A decorator reports what it wraps, so two beehives over one store through two
+// wrappers meet the same claim. Keying on the store value would miss this.
+func TestStartRefusesAStoreReachedThroughADecorator(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	first := newTestBeehive(t, &seedProbe{Store: store, mark: 500})
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(ctx)) })
+
+	second := newTestBeehive(t, &seedProbe{Store: store, mark: 500})
+	_, err = second.Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse)
+}
+
+// stop anticipates concurrent callers — a signal handler racing a defer — and
+// the state switch is what gives one of them the teardown. The claim is
+// released by that one alone, which is what lets bh.claim go unsynchronized.
+func TestConcurrentStopReleasesTheStoreOnce(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	first := newTestBeehive(t, store)
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+
+	var stopping sync.WaitGroup
+	for range 4 {
+		stopping.Go(func() { assert.NoError(t, stop(ctx)) })
+	}
+	stopping.Wait()
+
+	second := newTestBeehive(t, store)
+	stop2, err := second.Start(ctx)
+	require.NoError(t, err, "the store was released exactly once")
+	t.Cleanup(func() { assert.NoError(t, stop2(ctx)) })
+
+	// A late stop from the first returns at the state switch, so it cannot
+	// evict the claim taken since.
+	require.NoError(t, stop(ctx))
+	_, err = newTestBeehive(t, store).Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse)
+}
+
+// namelessStore reports the identity of no database.
+type namelessStore struct{ Store }
+
+func (namelessStore) Identity() string { return "" }
+
+// "" is both a claim nobody can hold and the record of holding none, so taking
+// it would strand the key for the life of the process. Refused at the claim,
+// which is also the only way two unrelated stores do not collide on it.
+func TestStartRefusesAStoreWithNoIdentity(t *testing.T) {
+	ctx := context.Background()
+
+	_, err := newTestBeehive(t, namelessStore{Store: &fakeStore{}}).Start(ctx)
+	require.ErrorIs(t, err, ErrInvalidStoreIdentity)
+	assert.NotErrorIs(t, err, ErrStoreInUse)
+
+	// Nothing was taken, so the next one is unaffected.
+	_, err = newTestBeehive(t, namelessStore{Store: &fakeStore{}}).Start(ctx)
+	require.ErrorIs(t, err, ErrInvalidStoreIdentity)
+
+	stop, err := newTestBeehive(t, &fakeStore{}).Start(ctx)
+	require.NoError(t, err)
+	assert.NoError(t, stop(ctx))
+}
+
+// A stop that does not own the teardown returns before the owner has released
+// the store — deliberately, since the early return is what keeps a non-owner
+// from blocking. Start's godoc says so, and this is what keeps that true: a
+// caller reading nil as "the store is free" would start the next Beehive too
+// early.
+func TestNonOwningStopReturnsBeforeTheStoreIsReleased(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	ctrl := &blockingController[cSpec, cStatus]{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "held", cSpec{})
+	<-ctrl.entered // the drain now has something to wait for
+
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- stop(ctx) }()
+
+	// The owner takes the teardown under bh.mu before it drains, so wait for
+	// that rather than racing it.
+	for deadline := time.Now().Add(testTimeout); ; runtime.Gosched() {
+		bh.mu.Lock()
+		owned := bh.state == beehiveStopped
+		bh.mu.Unlock()
+		if owned {
+			break
+		}
+		require.False(t, time.Now().After(deadline), "the owner never took the teardown")
+	}
+
+	require.NoError(t, stop(ctx), "the non-owner returns rather than waiting")
+	_, err = newTestBeehive(t, store).Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse, "nil from a non-owner is not a released store")
+
+	close(ctrl.release)
+	require.NoError(t, <-ownerDone)
+
+	stopNext, err := newTestBeehive(t, store).Start(ctx)
+	require.NoError(t, err, "the owner's return is what frees the store")
+	assert.NoError(t, stopNext(ctx))
+}
+
+// Two Starts racing over one store: exactly one wins. The registry is package
+// state, so the losers must see the winner's claim however the two interleave.
+func TestSimultaneousStartsCollide(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	var starting sync.WaitGroup
+	stops := make(chan func(context.Context) error, 8)
+	for range 8 {
+		bh := newTestBeehive(t, store)
+		starting.Go(func() {
+			stop, err := bh.Start(ctx)
+			if err == nil {
+				stops <- stop
+				return
+			}
+			assert.ErrorIs(t, err, ErrStoreInUse)
+		})
+	}
+	starting.Wait()
+	close(stops)
+
+	require.Len(t, stops, 1, "exactly one Start holds the store")
+	assert.NoError(t, (<-stops)(ctx))
+}

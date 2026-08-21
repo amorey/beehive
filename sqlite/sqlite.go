@@ -23,6 +23,8 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/amorey/beehive/internal/sqlitemigrate"
@@ -36,6 +38,10 @@ var migrations embed.FS
 // package: the store must not import the control plane.
 var ErrInvalidOption = errors.New("beehive/sqlite: option value is invalid")
 
+// memoryStores numbers the memory stores, since each file::memory: is its own
+// database and so cannot share an identity with another.
+var memoryStores atomic.Int64
+
 // defaultReadConnections is a guess: one connection already keeps reads out of
 // the writers' queue, and more helps only readers that genuinely overlap.
 const defaultReadConnections = 4
@@ -45,7 +51,17 @@ const defaultReadConnections = 4
 // option machinery never sees one.
 type Option func(*openOptions)
 
-type openOptions struct{ readConns int }
+type openOptions struct {
+	readConns int
+	// abs resolves path. A field rather than a package var so the test that
+	// covers an unresolvable path cannot affect a concurrent Open.
+	abs func(string) (string, error)
+}
+
+// withAbs replaces the path resolver, for the test covering its failure.
+func withAbs(f func(string) (string, error)) Option {
+	return func(o *openOptions) { o.abs = f }
+}
 
 // WithReadConnections sets how many connections serve reads. This bounds read
 // concurrency, not total connections — the writer is always one. Below 1 is
@@ -60,18 +76,30 @@ func WithReadConnections(n int) Option {
 // pending schema migrations before returning. Reads that are not inside a
 // transaction run on their own pool; see WithReadConnections.
 func Open(path string, opts ...Option) (*sqliteStore, error) {
-	o := openOptions{readConns: defaultReadConnections}
+	o := openOptions{readConns: defaultReadConnections, abs: filepath.Abs}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	if o.readConns < 1 {
 		return nil, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
 	}
+	// Before the pools open, so a path that cannot be resolved creates no file.
+	// Resolved because Identity must be one string for one database, whatever
+	// each caller spelled; two names for one file still evade that.
+	full, err := o.abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("beehive/sqlite: resolving %s: %w", path, err)
+	}
 	// The reader opens after the migrations, which run on the writer: one opened
 	// first would hold a schema that does not exist yet.
-	return open(sqlitemigrate.OpenPool(path, 1), func() *sql.DB {
+	s, err := open(sqlitemigrate.OpenPool(path, 1), func() *sql.DB {
 		return sqlitemigrate.OpenReadPool(path, o.readConns)
 	})
+	if err != nil {
+		return nil, err
+	}
+	s.identity = full
+	return s, nil
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
@@ -92,7 +120,12 @@ func OpenMemory() (*sqliteStore, error) {
 	db.SetMaxIdleConns(1)
 	// No read pool: file::memory: is per-connection, so a second would be a
 	// different and empty database. Both statement sets are the one pool's.
-	return open(db, nil)
+	s, err := open(db, nil)
+	if err != nil {
+		return nil, err
+	}
+	s.identity = fmt.Sprintf("memory:%d", memoryStores.Add(1))
+	return s, nil
 }
 
 // open builds a store on db, and on the read pool openRead returns — nil where
