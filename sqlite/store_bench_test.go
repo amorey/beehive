@@ -467,3 +467,68 @@ func BenchmarkUnblockedTargets(b *testing.B) {
 		require.Len(b, out, 8)
 	}
 }
+
+// The two write paths the JSON tuple sets touch, at the sizes a delete cascade
+// runs them: one object, and a full markChunkSize level.
+func BenchmarkDeletionMark(b *testing.B) {
+	for _, n := range []int{1, 128} {
+		b.Run(fmt.Sprintf("ids=%d", n), func(b *testing.B) { benchDeletionMark(b, n) })
+	}
+}
+
+func benchDeletionMark(b *testing.B, n int) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	owner, err := store.Objects().Create(ctx, testGK,
+		beehive.ObjectsCreateInput{Name: "owner", Spec: []byte(`{}`)})
+	require.NoError(b, err)
+	for i := range n {
+		child, err := store.Objects().Create(ctx, testGK,
+			beehive.ObjectsCreateInput{Name: fmt.Sprintf("c-%d", i), Spec: []byte(`{}`)})
+		require.NoError(b, err)
+		_, err = store.Edges().Add(ctx, child.ID, owner.ID, storeapi.RelationOwnedBy)
+		require.NoError(b, err)
+	}
+
+	b.ResetTimer()
+	for range b.N {
+		// The children are already pending after the first pass, so this measures
+		// the statement over a level it re-reads rather than the first mark.
+		if _, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The batched log append, over the row counts the mark hands it.
+func BenchmarkWriteLogAppendBatch(b *testing.B) {
+	for _, n := range []int{1, 128} {
+		b.Run(fmt.Sprintf("rows=%d", n), func(b *testing.B) { benchWriteLogAppendBatch(b, n) })
+	}
+}
+
+func benchWriteLogAppendBatch(b *testing.B, n int) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(b.TempDir(), "bench.db"))
+	require.NoError(b, err)
+	defer store.Close()
+
+	writes := make([]loggedWrite, n)
+	for i := range n {
+		writes[i] = loggedWrite{id: storeapi.ObjectID(i + 1), gk: testGK}
+	}
+
+	b.ResetTimer()
+	for i := range b.N {
+		// Fresh versions per iteration: resource_version is the log's primary key.
+		for j := range writes {
+			writes[j].rv = int64(i*n+j) + 1
+		}
+		if err := store.appendWriteLogUpdates(ctx, writes, 1); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
