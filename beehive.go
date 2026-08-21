@@ -427,7 +427,12 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// and never partially. Which one wins is unspecified and nothing here needs
 	// it pinned, since every stream is ending.
 	// After the drain, or a second Start could take the store while these loops
-	// are still running.
+	// are still running. A blown deadline releases anyway — bh.cancel has run, so
+	// the loops are ending — but that is the one case where the sole-writer
+	// guarantee lapses, so it is announced.
+	if drainErr != nil {
+		bh.log().Warn("store released before its loops drained", "err", drainErr)
+	}
 	releaseStore(bh)
 
 	bh.kindWriteHub.Close()

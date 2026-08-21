@@ -16,6 +16,7 @@ package beehive
 
 import (
 	"context"
+	"log/slog"
 	"runtime"
 	"sync"
 	"testing"
@@ -797,4 +798,28 @@ func TestStopLeavesAnotherBeehivesRegistration(t *testing.T) {
 
 	_, err = newTestBeehive(t, store).Start(ctx)
 	assert.ErrorIs(t, err, ErrStoreInUse, "the never-started stop evicted a live claim")
+}
+
+// A stop whose drain hit its deadline still releases the store. The loops are
+// cancelled and ending, so handing the store on beats locking it out for the
+// life of the process — but this is the one case where the guarantee lapses,
+// and nothing else records it.
+func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
+	logger, logs := captureLogger(slog.LevelWarn)
+	store := &fakeStore{}
+
+	bh := newTestBeehive(t, store, WithFullPassInterval(0), WithLogger(logger))
+	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}))
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err)
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, stop(expired), context.Canceled)
+
+	assert.Contains(t, logs.String(), "store released before its loops drained")
+
+	stop2, err := newTestBeehive(t, store).Start(context.Background())
+	require.NoError(t, err, "a blown deadline must not lock the store out")
+	assert.NoError(t, stop2(context.Background()))
 }
