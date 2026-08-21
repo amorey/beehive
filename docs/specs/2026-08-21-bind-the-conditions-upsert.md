@@ -1,18 +1,16 @@
 # Bind the conditions upsert
 
 - **Status:** Proposed, not decided. Split out from
-  [the four tuple sets](2026-08-21-bind-four-rendered-tuple-sets.md), which share
+  [the tuple sets](../adr/2026-08-21-bind-the-tuple-sets-as-json.md), which share
   its mechanism: this is the one carrying free text, so it needs a contract
   decision before it can be built — see *The question this asks*.
 - **Date:** 2026-08-21
 - **Depends on:**
   [bind an id list as JSON](../adr/2026-08-21-bind-an-id-list-as-json.md), whose
   mechanism this is, and whose `ErrInvalidConditionType` this would widen. Also
-  **on [the four tuple sets](2026-08-21-bind-four-rendered-tuple-sets.md)
-  landing first**, which is a real ordering constraint and not a preference: the
-  helper arithmetic below assumes `tupleRows` has already lost its other three
-  callers. Taken first instead, this change leaves `tupleRows` with three callers
-  and moves `renderedSQLSites` from six to five.
+  **on [the tuple sets](../adr/2026-08-21-bind-the-tuple-sets-as-json.md)**,
+  which has landed: `tupleRows` has lost its other three callers, so this change
+  is what deletes it.
 
 ## Why
 
@@ -101,7 +99,7 @@ SELECT ?1, value ->> 0, value ->> 1, value ->> 2, value ->> 3, value ->> 4, ?2, 
 ### The helper it adds
 
 None of
-[the four tuple sets](2026-08-21-bind-four-rendered-tuple-sets.md)' helpers
+[the tuple sets](../adr/2026-08-21-bind-the-tuple-sets-as-json.md)' helpers
 covers `[[type, status, reason, message, liveness], …]`, so this needs its own —
 `jsonConditionRows(conds []storeapi.Condition) string`.
 
@@ -153,7 +151,7 @@ text and catches a miss.
 else can.** `tupleRows` (`:3386`) has four callers, not three: this,
 `appendWriteLogUpdates`, `markManyForDeletionChunk` and `kindTuples`. The other
 three go with
-[the four tuple sets](2026-08-21-bind-four-rendered-tuple-sets.md), leaving this
+[the tuple sets](../adr/2026-08-21-bind-the-tuple-sets-as-json.md), leaving this
 one — so `tupleRows` survives that change and dies with this one. `placeholders`
 (`:3380`) has a single caller, `tupleRows`, and follows it.
 

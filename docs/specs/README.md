@@ -16,7 +16,7 @@ work we have decided to do.
 
 ## In flight
 
-Twenty. Seventeen came from one audit of what the
+Nineteen. Seventeen came from one audit of what the
 [sole-writer constraint](../adr/2026-08-05-one-process-one-beehive-sole-writer.md)
 buys and the code does not yet spend; three follow on from the JSON id lists.
 Each is one PR. They are grouped by what they have in common, not by the order they must land in; the dependencies each
@@ -72,12 +72,10 @@ that makes the steady state store-free.
 **Statements that are still rendered.** What the statement cache could not
 reach, because of how the SQL is written rather than anything about the store.
 
-18. [Bind four rendered tuple sets](2026-08-21-bind-four-rendered-tuple-sets.md) —
-    −13% to −67%, one mechanism, four statements
-19. [Bind the conditions upsert](2026-08-21-bind-the-conditions-upsert.md) — −51%,
+18. [Bind the conditions upsert](2026-08-21-bind-the-conditions-upsert.md) — −51%,
     and an API contract question to settle first. Separate so the four above do
     not wait on it; lands after 18, and is what finally deletes `tupleRows`.
-20. [Let the tripwire see a PRAGMA](2026-08-21-let-the-tripwire-see-a-pragma.md) —
+19. [Let the tripwire see a PRAGMA](2026-08-21-let-the-tripwire-see-a-pragma.md) —
     no conversions and no win: it closes the hole that hid six statements from
     the check, and records why two constant ones still cannot be prepared.
 
