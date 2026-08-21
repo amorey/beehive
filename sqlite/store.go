@@ -2536,8 +2536,8 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 	var clearedLast bool
 	// Within keeps the read-modify-write of the finalizer list atomic.
 	err := s.Within(ctx, func(ctx context.Context) error {
-		c, err := s.conn(ctx)
-		if err != nil {
+		// conn for its refusal, before the absent-finalizer return below.
+		if _, err := s.conn(ctx); err != nil {
 			return err
 		}
 		// Scoped read enforces the kind boundary while loading the finalizer list —
@@ -2565,11 +2565,12 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 		if err != nil {
 			return err
 		}
+		ps, err := s.stmtFor(ctx, stmtSetFinalizers)
+		if err != nil {
+			return err
+		}
 		// No RETURNING: no row reported, and the scoped read proved existence.
-		_, err = c.ExecContext(ctx, `
-			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
-			WHERE id = ?`,
-			jsonText(marshalFinalizers(remaining)), rv, now, id)
+		_, err = ps.ExecContext(ctx, jsonText(marshalFinalizers(remaining)), rv, now, id)
 		return err
 	})
 	if err != nil {
@@ -2810,10 +2811,11 @@ func (s sqliteDeletionRequests) CreateFromOwner(ctx context.Context, ownerID sto
 }
 
 func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) (storeapi.DeletionCascadeResult, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT o.id, o."group", o.kind, o.deletion_requested_at
-		FROM edges r JOIN objects o ON o.id = r.from_id
-		WHERE r.to_id = ? AND r.relation = ?`+edgeOrderByReferrer, ownerID, string(storeapi.RelationOwnedBy))
+	ps, err := s.stmtFor(ctx, stmtListOwnedChildren)
+	if err != nil {
+		return storeapi.DeletionCascadeResult{}, err
+	}
+	rows, err := ps.QueryContext(ctx, ownerID, string(storeapi.RelationOwnedBy))
 	if err != nil {
 		return storeapi.DeletionCascadeResult{}, err
 	}
@@ -2875,10 +2877,6 @@ func (s sqliteObjects) Delete(ctx context.Context, id storeapi.ObjectID) error {
 // without one the entry could not be ordered against the rest of the log. The
 // counter is shared with the event log, so collection moves that too.
 func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) error {
-	c, err := s.conn(ctx)
-	if err != nil {
-		return err
-	}
 	// Read before the DELETE: the conditions cascade with the row, so this is the
 	// last moment the image can be assembled.
 	image, err := s.Objects().Get(ctx, id)
@@ -2896,7 +2894,11 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	}
 	// Conditions, events and edges cascade. No zero-row check: the read above
 	// already returned ErrNotFound for an id this transaction cannot see.
-	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {
+	del, err := s.stmtFor(ctx, stmtDeleteObject)
+	if err != nil {
+		return err
+	}
+	if _, err := del.ExecContext(ctx, id); err != nil {
 		return err
 	}
 	rv, err := s.nextResourceVersion(ctx)
@@ -3010,13 +3012,11 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 // last condition because Edges().HasIncoming already discounts an edge from a
 // deletion-pending source.
 func (s sqliteEdges) Delete(ctx context.Context, fromID, toID storeapi.ObjectID, relation storeapi.Relation) (storeapi.EdgesDeleteResult, error) {
-	c, err := s.conn(ctx)
+	del, err := s.stmtFor(ctx, stmtDeleteEdge)
 	if err != nil {
 		return storeapi.EdgesDeleteResult{}, err
 	}
-	res, err := c.ExecContext(ctx,
-		`DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
-		fromID, toID, string(relation))
+	res, err := del.ExecContext(ctx, fromID, toID, string(relation))
 	if err != nil {
 		return storeapi.EdgesDeleteResult{}, err
 	}
@@ -3445,7 +3445,7 @@ func (s sqliteObjectWrites) Sweep(ctx context.Context, perKind int, maxAge time.
 	var deleted int
 	err := s.Within(ctx, func(ctx context.Context) error {
 		if maxAge > 0 {
-			n, err := s.trimWriteLog(ctx, `written_at < ?`,
+			n, err := s.trimWriteLog(ctx, stmtTrimWriteLogByAge,
 				toMillis(time.Now().UTC().Add(-maxAge)))
 			if err != nil {
 				return err
@@ -3463,10 +3463,7 @@ func (s sqliteObjectWrites) Sweep(ctx context.Context, perKind int, maxAge time.
 				return err
 			}
 			for _, gk := range kinds {
-				n, err := s.trimWriteLog(ctx, `"group" = ? AND kind = ? AND resource_version <= (
-					SELECT resource_version FROM object_writes
-					 WHERE "group" = ? AND kind = ?
-					 ORDER BY resource_version DESC LIMIT 1 OFFSET ?)`,
+				n, err := s.trimWriteLog(ctx, stmtTrimWriteLogOverCap,
 					gk.Group, gk.Kind, gk.Group, gk.Kind, perKind)
 				if err != nil {
 					return err
@@ -3505,12 +3502,13 @@ func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, 
 // deleteWriteLogRows deletes the entries matching where and reports the highest
 // version removed per kind, with the total. Closes its rows before returning, so
 // the horizon writes that follow get the transaction's connection back.
-func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, c dbtx, where string, args ...any) (map[storeapi.GroupKind]int64, int, error) {
-	// c comes from conn, not read: a DELETE ... RETURNING is a write however it is
-	// issued.
-	rows, err := c.QueryContext(ctx,
-		`DELETE FROM object_writes WHERE `+where+`
-		 RETURNING "group", kind, resource_version`, args...)
+func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, stmt stmtID, args ...any) (map[storeapi.GroupKind]int64, int, error) {
+	// A write id, not a read: a DELETE ... RETURNING is a write however it is issued.
+	ps, err := s.stmtFor(ctx, stmt)
+	if err != nil {
+		return nil, 0, err
+	}
+	rows, err := ps.QueryContext(ctx, args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -3530,12 +3528,8 @@ func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, c dbtx, where stri
 
 // trimWriteLog deletes the entries matching where and raises each affected
 // kind's horizon to the highest version it removed there.
-func (s *sqliteStore) trimWriteLog(ctx context.Context, where string, args ...any) (int, error) {
-	c, err := s.conn(ctx)
-	if err != nil {
-		return 0, err
-	}
-	highest, deleted, err := s.deleteWriteLogRows(ctx, c, where, args...)
+func (s *sqliteStore) trimWriteLog(ctx context.Context, stmt stmtID, args ...any) (int, error) {
+	highest, deleted, err := s.deleteWriteLogRows(ctx, stmt, args...)
 	if err != nil {
 		return 0, err
 	}

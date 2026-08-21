@@ -95,6 +95,12 @@ const (
 	stmtInsertEventRun
 	stmtMarkForDeletionByID
 	stmtMarkForDeletionByName
+	stmtSetFinalizers
+	stmtDeleteObject
+	stmtListOwnedChildren
+	// deleteWriteLogRows runs one of two predicates, both RETURNING.
+	stmtTrimWriteLogByAge
+	stmtTrimWriteLogOverCap
 
 	numStmts
 )
@@ -285,6 +291,20 @@ var stmtSQL = [numStmts]string{
 	stmtMarkForDeletionByID:   markForDeletionSQL(`id = ? AND "group" = ? AND kind = ?`),
 	stmtMarkForDeletionByName: markForDeletionSQL(`"group" = ? AND kind = ? AND name = ?`),
 
+	stmtSetFinalizers: `
+			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
+			WHERE id = ?`,
+	stmtDeleteObject: `DELETE FROM objects WHERE id = ?`,
+	stmtListOwnedChildren: `
+		SELECT o.id, o."group", o.kind, o.deletion_requested_at
+		FROM edges r JOIN objects o ON o.id = r.from_id
+		WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer,
+	stmtTrimWriteLogByAge: trimWriteLogSQL(`written_at < ?`),
+	stmtTrimWriteLogOverCap: trimWriteLogSQL(`"group" = ? AND kind = ? AND resource_version <= (
+					SELECT resource_version FROM object_writes
+					 WHERE "group" = ? AND kind = ?
+					 ORDER BY resource_version DESC LIMIT 1 OFFSET ?)`),
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -332,6 +352,13 @@ func markForDeletionSQL(where string) string {
 		RETURNING id, "group", kind`
 }
 
+// trimWriteLogSQL builds the log delete over where. RETURNING because the caller
+// raises each affected kind's horizon to the highest version it removed there.
+func trimWriteLogSQL(where string) string {
+	return `DELETE FROM object_writes WHERE ` + where + `
+		 RETURNING "group", kind, resource_version`
+}
+
 // scopedSQL builds selectScoped's read: the kind gate's two columns, plus
 // whatever the caller scans beside them.
 func scopedSQL(cols string) string {
@@ -373,6 +400,10 @@ var stmtWrites = [numStmts]bool{
 	stmtInsertEventRun:                 true,
 	stmtMarkForDeletionByID:            true,
 	stmtMarkForDeletionByName:          true,
+	stmtSetFinalizers:                  true,
+	stmtDeleteObject:                   true,
+	stmtTrimWriteLogByAge:              true,
+	stmtTrimWriteLogOverCap:            true,
 }
 
 // stmtSet is one pool's preparations.
