@@ -175,12 +175,9 @@ type Beehive struct {
 	tailMu  sync.Mutex
 	tailers map[GroupKind]*objectTailer
 
-	state beehiveState
-	// claimed records that this Beehive holds its store's claim, so a release
-	// drops its own and never a successor's.
-	claimed bool
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	state  beehiveState
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // log returns a non-nil logger; Stop and tests can run before Start resolves it.
@@ -437,13 +434,15 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	bh.eventWriteHub.Close()
 
 	// Last, so nothing this Beehive owns is still live when another may claim
-	// the store. A blown deadline releases anyway — bh.cancel has run, so the
-	// loops are ending — and announces itself, being the one case where the
-	// sole-writer guarantee lapses.
-	if drainErr != nil {
-		bh.log().Warn("store released before its loops drained", "err", drainErr)
+	// the store, and only if this one claimed. A blown deadline releases anyway
+	// — bh.cancel has run, so the loops are ending — and announces itself, being
+	// the one case where the sole-writer guarantee lapses.
+	if running {
+		if drainErr != nil {
+			bh.log().Warn("store released before its loops drained", "err", drainErr)
+		}
+		bh.releaseStore()
 	}
-	bh.releaseStore()
 
 	// The watch tailers are not counted in wg: each ends with its own last
 	// subscriber, or with the hub close above. WatchSchedule streams
@@ -457,24 +456,19 @@ func (bh *Beehive) stop(ctx context.Context) error {
 // decorator wrapping a store claims what it wraps. Only this process is
 // covered: isolating the process from another is the embedder's, and README.md
 // says so.
-var beehiveClaims claim.Set[string]
+var beehiveClaims claim.Set
 
 // claimStore reserves bh.store's database for bh.
 func (bh *Beehive) claimStore() error {
 	if !beehiveClaims.Take(bh.store.Identity()) {
 		return ErrStoreInUse
 	}
-	bh.claimed = true
 	return nil
 }
 
-// releaseStore drops bh's claim, and only bh's: a Beehive that never started
-// also reaches this, and must not evict a running one.
+// releaseStore drops bh's claim. Owed by every path that claimed, and by no
+// other: a Beehive that never started must not evict a running one.
 func (bh *Beehive) releaseStore() {
-	if !bh.claimed {
-		return
-	}
-	bh.claimed = false
 	beehiveClaims.Drop(bh.store.Identity())
 }
 

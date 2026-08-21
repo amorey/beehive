@@ -133,7 +133,7 @@ type sqliteStore struct {
 func (s *sqliteStore) Close() error {
 	// Deferred, so a failed close still releases — but not before the closes, or
 	// a concurrent Open could begin migrating over pools still shutting down.
-	defer s.releasePath()
+	defer s.releaseClaim()
 	// Readers first: they hold snapshots the writer's checkpoint waits on. The
 	// writer closes whatever happened above it, so a failed reader cannot leak it.
 	// Statements first: closing them frees the driver's compiled programs.
@@ -144,9 +144,9 @@ func (s *sqliteStore) Close() error {
 	return errors.Join(err, s.db.Close())
 }
 
-// releasePath drops this store's claim, and only its own: a second Close would
+// releaseClaim drops this store's claim, and only its own: a second Close would
 // otherwise release whatever reopened the file.
-func (s *sqliteStore) releasePath() {
+func (s *sqliteStore) releaseClaim() {
 	if !s.claimed {
 		return
 	}

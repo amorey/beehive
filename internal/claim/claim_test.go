@@ -23,7 +23,7 @@ import (
 )
 
 func TestTakeHoldsOneKeyAtATime(t *testing.T) {
-	var s Set[string]
+	var s Set
 
 	require.True(t, s.Take("a"), "the zero value is ready to use")
 	assert.False(t, s.Take("a"))
@@ -33,34 +33,21 @@ func TestTakeHoldsOneKeyAtATime(t *testing.T) {
 	assert.True(t, s.Take("a"), "the drop released it")
 }
 
-// Dropping a key nobody took is a no-op, which is what lets a holder call Drop
-// on a path it may never have claimed.
+// Dropping a key nobody took is a no-op rather than a panic.
 func TestDropIsSafeWithoutATake(t *testing.T) {
-	var s Set[string]
+	var s Set
 	s.Drop("a")
 	assert.True(t, s.Take("a"))
 }
 
-// Every key an interface holds is a different claim, which is what the running
-// store registry keys on.
-func TestTakeKeysOnAnInterfaceValue(t *testing.T) {
-	type key any
-	first, second := new(int), new(int)
-
-	var s Set[key]
-	require.True(t, s.Take(first))
-	assert.False(t, s.Take(first))
-	assert.True(t, s.Take(second), "a distinct pointer is a distinct claim")
-}
-
 func TestTakeIsSafeForConcurrentUse(t *testing.T) {
-	var s Set[int]
+	var s Set
 	var taken sync.WaitGroup
 	wins := make(chan struct{}, 8)
 
 	for range 8 {
 		taken.Go(func() {
-			if s.Take(0) {
+			if s.Take("a") {
 				wins <- struct{}{}
 			}
 		})

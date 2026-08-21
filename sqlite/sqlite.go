@@ -48,7 +48,7 @@ var abs = filepath.Abs
 
 // storeClaims is the databases open in this process, so one process opens a
 // database once. A store records its own claim in sqliteStore.claimed.
-var storeClaims claim.Set[string]
+var storeClaims claim.Set
 
 // memoryStores numbers the memory stores, since each file::memory: is its own
 // database and so cannot share an identity with another.

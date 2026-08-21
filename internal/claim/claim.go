@@ -20,34 +20,29 @@ import "sync"
 
 // Set is a set of held keys. The zero value is ready to use, and a Set is safe
 // for concurrent use.
-//
-// An interface type argument satisfies comparable but is not strictly
-// comparable: a key whose dynamic type cannot be a map key panics here, as it
-// would in any map. Callers holding interface keys reject those before the
-// first Take.
-type Set[K comparable] struct {
+type Set struct {
 	mu sync.Mutex
-	m  map[K]struct{}
+	m  map[string]struct{}
 }
 
 // Take claims k, reporting false if it is already held.
-func (s *Set[K]) Take(k K) bool {
+func (s *Set) Take(k string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, held := s.m[k]; held {
 		return false
 	}
 	if s.m == nil {
-		s.m = make(map[K]struct{})
+		s.m = make(map[string]struct{})
 	}
 	s.m[k] = struct{}{}
 	return true
 }
 
 // Drop releases k. Owed exactly once per successful Take: a second Drop would
-// release whatever took k in between, so a holder records its own claim and
-// clears that record here.
-func (s *Set[K]) Drop(k K) {
+// release whatever took k in between, so a holder that may release twice
+// records its own claim and checks that record first.
+func (s *Set) Drop(k string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.m, k)
