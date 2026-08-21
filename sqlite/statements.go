@@ -93,6 +93,8 @@ const (
 	stmtUpdateSpec
 	stmtExtendEventRun
 	stmtInsertEventRun
+	stmtMarkForDeletionByID
+	stmtMarkForDeletionByName
 
 	numStmts
 )
@@ -280,6 +282,9 @@ var stmtSQL = [numStmts]string{
 				 count, first_at, last_at, resource_version)
 			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
 
+	stmtMarkForDeletionByID:   markForDeletionSQL(`id = ? AND "group" = ? AND kind = ?`),
+	stmtMarkForDeletionByName: markForDeletionSQL(`"group" = ? AND kind = ? AND name = ?`),
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -312,6 +317,19 @@ func raiseEventHorizonSQL(where string) string {
 		 GROUP BY object_id, category
 		    ON CONFLICT(object_id, category) DO UPDATE SET trimmed_through = excluded.trimmed_through
 		 WHERE excluded.trimmed_through > events_horizon.trimmed_through`
+}
+
+// markForDeletionSQL builds the soft delete over where. RETURNING, not
+// RowsAffected: the write log entry needs the row's identity, and where is a
+// predicate rather than a known id.
+func markForDeletionSQL(where string) string {
+	return `
+		UPDATE objects
+		SET deletion_requested_at = ?,
+		    resource_version = ?,
+		    updated_at = ?
+		WHERE (` + where + `) AND deletion_requested_at IS NULL
+		RETURNING id, "group", kind`
 }
 
 // scopedSQL builds selectScoped's read: the kind gate's two columns, plus
@@ -353,6 +371,8 @@ var stmtWrites = [numStmts]bool{
 	stmtUpdateSpec:                     true,
 	stmtExtendEventRun:                 true,
 	stmtInsertEventRun:                 true,
+	stmtMarkForDeletionByID:            true,
+	stmtMarkForDeletionByName:          true,
 }
 
 // stmtSet is one pool's preparations.

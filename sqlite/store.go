@@ -2586,9 +2586,9 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 //
 // The version is drawn before the stamp, so a mark blocked by the guard burns one.
 // Gaps are free: every cursor compares `>`.
-func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (storeapi.ObjectID, bool, error) {
-	c, err := s.conn(ctx)
-	if err != nil {
+func (s *sqliteStore) markForDeletion(ctx context.Context, stmt stmtID, whereArgs ...any) (storeapi.ObjectID, bool, error) {
+	// conn for its refusal, before the draw below burns a version.
+	if _, err := s.conn(ctx); err != nil {
 		return 0, false, err
 	}
 	rv, err := s.nextResourceVersion(ctx)
@@ -2596,16 +2596,11 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 		return 0, false, err
 	}
 	now := toMillis(time.Now().UTC())
-	args := append([]any{now, rv, now}, whereArgs...)
-	// RETURNING, not RowsAffected: the write log entry needs the row's identity,
-	// and the where here is a predicate rather than a known id.
-	row := c.QueryRowContext(ctx, `
-		UPDATE objects
-		SET deletion_requested_at = ?,
-		    resource_version = ?,
-		    updated_at = ?
-		WHERE (`+where+`) AND deletion_requested_at IS NULL
-		RETURNING id, "group", kind`, args...)
+	ps, err := s.stmtFor(ctx, stmt)
+	if err != nil {
+		return 0, false, err
+	}
+	row := ps.QueryRowContext(ctx, append([]any{now, rv, now}, whereArgs...)...)
 	var id storeapi.ObjectID
 	var gk storeapi.GroupKind
 	if err := row.Scan(&id, &gk.Group, &gk.Kind); errors.Is(err, sql.ErrNoRows) {
@@ -2718,7 +2713,7 @@ func (s *sqliteStore) probeDeletionByName(ctx context.Context, gk storeapi.Group
 func (s *sqliteStore) requestDeletion(
 	ctx context.Context,
 	probe func(context.Context) (pending bool, err error),
-	where string, whereArgs ...any,
+	stmt stmtID, whereArgs ...any,
 ) (storeapi.DeletionRequestResult, error) {
 	if pending, err := probe(ctx); err != nil || pending {
 		return storeapi.DeletionRequestResult{}, err
@@ -2726,7 +2721,7 @@ func (s *sqliteStore) requestDeletion(
 	var res storeapi.DeletionRequestResult
 	err := s.Within(ctx, func(ctx context.Context) error {
 		var err error
-		if res.ID, res.Marked, err = s.markForDeletion(ctx, where, whereArgs...); err != nil {
+		if res.ID, res.Marked, err = s.markForDeletion(ctx, stmt, whereArgs...); err != nil {
 			return err
 		}
 		if !res.Marked {
@@ -2785,7 +2780,7 @@ func (s *sqliteStore) unblockedTargetsChunk(ctx context.Context, fromIDs []store
 func (s sqliteDeletionRequests) Create(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) (storeapi.DeletionRequestResult, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeObjectScoped(ctx, gk, id) },
-		`id = ? AND "group" = ? AND kind = ?`, id, gk.Group, gk.Kind)
+		stmtMarkForDeletionByID, id, gk.Group, gk.Kind)
 }
 
 // DeletionRequests().CreateByName marks the gk row holding name; the resolve and the mark
@@ -2793,7 +2788,7 @@ func (s sqliteDeletionRequests) Create(ctx context.Context, gk storeapi.GroupKin
 func (s sqliteDeletionRequests) CreateByName(ctx context.Context, gk storeapi.GroupKind, name string) (storeapi.DeletionRequestResult, error) {
 	return s.requestDeletion(ctx,
 		func(ctx context.Context) (bool, error) { return s.probeDeletionByName(ctx, gk, name) },
-		`"group" = ? AND kind = ? AND name = ?`, gk.Group, gk.Kind, name)
+		stmtMarkForDeletionByName, gk.Group, gk.Kind, name)
 }
 
 // DeletionRequests().CreateFromOwner cascades deletion to ownerID's owned children,

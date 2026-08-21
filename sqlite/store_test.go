@@ -7685,7 +7685,7 @@ func TestRequestDeletionResolvesARowThatMovedAfterTheProbe(t *testing.T) {
 		return calls > 1, nil
 	}
 
-	res, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	res, err := store.requestDeletion(ctx, probe, stmtMarkForDeletionByID, 99999, testGK.Group, testGK.Kind)
 
 	require.NoError(t, err, "the row was collected or marked by someone else; that is success")
 	assert.False(t, res.Marked, "this call stamped nothing")
@@ -7707,7 +7707,7 @@ func TestRequestDeletionReportsARowCollectedAfterTheProbe(t *testing.T) {
 		return false, storeapi.ErrNotFound // gone
 	}
 
-	res, err := store.requestDeletion(ctx, probe, `id = ?`, 99999)
+	res, err := store.requestDeletion(ctx, probe, stmtMarkForDeletionByID, 99999, testGK.Group, testGK.Kind)
 
 	require.ErrorIs(t, err, storeapi.ErrNotFound)
 	assert.False(t, res.Marked)
@@ -9164,7 +9164,7 @@ func TestNoWriteBypassesConn(t *testing.T) {
 		"sqliteStore.upsertConditions", "sqliteStore.deleteWriteLogRows",
 		"sqliteStore.markManyForDeletionChunk",
 		"sqliteEvents.Sweep", "sqliteStore.trimEventsToCap",
-		"reconcileOwedSweepQuery", "raiseEventHorizonSQL",
+		"reconcileOwedSweepQuery", "raiseEventHorizonSQL", "markForDeletionSQL",
 	} {
 		takesConn[fn] = true
 	}
