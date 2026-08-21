@@ -171,7 +171,8 @@ func freePagesRelease(ctx context.Context, c dbtx, maxPages int) (int, error) {
 		return 0, nil
 	}
 
-	// Exec, not Query — see above.
+	// Exec, not Query — see above. Interpolated, not bound: a pragma argument
+	// takes no parameter, and the ? form fails at prepare rather than execution.
 	if _, err := c.ExecContext(ctx, `PRAGMA incremental_vacuum(`+strconv.Itoa(maxPages)+`)`); err != nil {
 		return 0, fmt.Errorf("free pages: incremental_vacuum: %w", err)
 	}
@@ -188,7 +189,10 @@ func freePagesRelease(ctx context.Context, c dbtx, maxPages int) (int, error) {
 	return released, nil
 }
 
-// pageCounters reads page_count and freelist_count off one connection.
+// pageCounters reads page_count and freelist_count off one connection. Both are
+// constant and neither is prepared: freePagesRelease subtracts them across its
+// vacuum, so they must run on the connection it holds, and a prepared read would
+// route to the reader pool.
 func pageCounters(ctx context.Context, c dbtx) (pages, free int, err error) {
 	if err := c.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pages); err != nil {
 		return 0, 0, fmt.Errorf("free pages: read page_count: %w", err)
