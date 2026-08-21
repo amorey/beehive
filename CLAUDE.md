@@ -425,10 +425,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   versions; four of the five grouped reads moved. `Events().Sweep` did not — its
   scan and the trim after it are one transaction — and the waker's `ListSinceAll`
   is ungrouped so a commit wake mid-scan is seen. `ReadOnly` only picks the begin
-  verb, and `OpenMemory` has no reader pool to apply `query_only` — so **`conn`
-  refuses a read frame outright**, which holds in both modes and covers the
+  verb, and `OpenMemory` has no reader pool to apply `query_only` — so **a write
+  in a read frame is refused outright**, which holds in both modes and covers the
   `UPDATE … RETURNING` a read-only interface cannot. It rests on every data write
-  taking its connection from `conn`.
+  taking its connection from `writeStmt`, or from `refuseWriteInReadFrame` where
+  the answer is owed before an early return.
   → [ADR](docs/adr/2026-08-20-reads-get-their-own-connections.md),
   [ADR](docs/adr/2026-08-20-a-read-that-groups-is-a-read-transaction.md)
 - **Resource versions are reserved in blocks, and are unique and increasing but

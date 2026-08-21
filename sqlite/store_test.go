@@ -6467,9 +6467,7 @@ func TestWithinReportsACommitFailure(t *testing.T) {
 		// End the transaction underneath database/sql, so its own Commit finds no
 		// transaction to commit. This is the one failure Within cannot rule out by
 		// construction: the statement it runs last is the one it cannot check first.
-		c, err := store.conn(ctx)
-		require.NoError(t, err)
-		_, err = c.ExecContext(ctx, `ROLLBACK`)
+		_, err := liveTx(ctx).tx.ExecContext(ctx, `ROLLBACK`)
 		return err
 	})
 	require.Error(t, err, "a failed commit must reach the caller")
@@ -9132,22 +9130,23 @@ func TestTheGroupedReadsAreTheOnesThatMoved(t *testing.T) {
 		"a fifth grouped read on the reader needs its own argument")
 }
 
-// No write statement bypasses conn, which is what makes refusing a read frame
-// there refuse every write. A runtime roster cannot hold this: a verb added
-// without going through conn is also a verb nobody adds to the roster.
+// No write statement bypasses the statement accessors, which is what makes
+// refusing a read frame there refuse every write. A runtime roster cannot hold
+// this: a verb added without going through them is also a verb nobody adds to
+// the roster.
 //
 // Blind to SQL built by concatenation and to writes outside this package.
-func TestNoWriteBypassesConn(t *testing.T) {
+func TestNoWriteBypassesTheAccessors(t *testing.T) {
 	writesData := regexp.MustCompile(`(?is)\b(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
 
 	// Receiver-qualified on both sides: Add, Delete, Set and Sweep each name a
 	// write on more than one sub-API, so a bare name would let a new one pass on
 	// an existing one's behalf.
 	takesConn := map[string]bool{}
-	// Beside conn: a prepared write reaches its connection through writeStmt, or
-	// through one of the shapes wrapping it, and all of them refuse a write in a
-	// read frame the same way.
-	for _, fn := range callSites(t, "conn", "writeStmt", "stmt", "exec", "query", "queryRow") {
+	// A prepared write reaches its connection through writeStmt, or through one of
+	// the shapes wrapping it, and all of them refuse a write in a read frame the
+	// same way.
+	for _, fn := range callSites(t, "writeStmt", "stmt", "exec", "query", "queryRow") {
 		takesConn[fn] = true
 	}
 	// Functions that name a write without issuing it: helpers handed a dbtx by a
@@ -9170,14 +9169,14 @@ func TestNoWriteBypassesConn(t *testing.T) {
 		}
 		bypass = append(bypass, fn)
 	}
-	assert.Empty(t, bypass, "a write here takes its connection from somewhere conn cannot refuse")
+	assert.Empty(t, bypass, "a write here takes its connection from somewhere that cannot refuse it")
 }
 
-// The transaction handle is reachable only through conn, read and the two
-// statement accessors, plus the savepoint statements. conn and stmtFor are where
-// a write into a read frame is refused; readStmt carries no write to refuse. A
-// statement issued on st.tx directly would reach none of them.
-func TestTheTransactionHandleHasFiveUsers(t *testing.T) {
+// The transaction handle is reachable only through read, the two statement
+// accessors and the savepoint statements. writeStmt is where a write into a read
+// frame is refused; readStmt carries no write to refuse. A statement issued on
+// st.tx directly would reach neither.
+func TestTheTransactionHandleHasFourUsers(t *testing.T) {
 	seen := map[string]bool{}
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
 		sel, ok := n.(*ast.SelectorExpr)
@@ -9191,12 +9190,11 @@ func TestTheTransactionHandleHasFiveUsers(t *testing.T) {
 	}
 
 	assert.ElementsMatch(t, []string{
-		"sqliteStore.conn",     // hands it to writes, and refuses a read frame
 		"sqliteStore.read",     // hands it to reads
-		"bindStmt",             // binds a write's statement; stmtFor refuses the same
+		"bindStmt",             // binds a write's statement; writeStmt refuses first
 		"sqliteStore.readStmt", // binds a read's; there is nothing to refuse
 		"txState.nested",       // SAVEPOINT, ROLLBACK TO, RELEASE — no data write
-	}, users, "a sixth user of st.tx is a write nothing can refuse")
+	}, users, "a fifth user of st.tx is a write nothing can refuse")
 }
 
 // A write inside a read transaction is refused before any statement runs, in both
@@ -9385,7 +9383,7 @@ func TestAReadTransactionRefusesToCommitBadly(t *testing.T) {
 	})
 }
 
-// Every write verb refuses a read frame. TestNoWriteBypassesConn is what holds
+// Every write verb refuses a read frame. TestNoWriteBypassesTheAccessors is what holds
 // the set closed — this walks it, so each verb's refusal is exercised rather than
 // argued from the one in conn.
 func TestEveryWriteVerbRefusesAReadTransaction(t *testing.T) {
@@ -9970,35 +9968,6 @@ func TestTheBatchedWriteLogAppendRecordsEveryWrite(t *testing.T) {
 		assert.False(t, seen[w.ResourceVersion], "each row takes its own version")
 		seen[w.ResourceVersion] = true
 	}
-}
-
-// conn's two pool routes, neither of which any caller takes today: every write
-// left that goes through it runs inside Within. Both are contract, not accident —
-// the second is what an AfterCommit hook's detached ctx relies on, and without it
-// a write issued there would fail with sql.ErrTxDone instead of committing
-// standalone.
-func TestConnFallsBackToThePoolWithoutALiveTransaction(t *testing.T) {
-	store := newRawStore(t)
-	ctx := context.Background()
-
-	c, err := store.conn(ctx)
-	require.NoError(t, err)
-	pool, ok := c.(*sql.DB)
-	require.True(t, ok, "no transaction: the pool")
-	assert.Same(t, store.db, pool)
-
-	// A ctx that outlives its transaction, which is what a hook is handed.
-	var expired context.Context
-	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
-		expired = ctx
-		return nil
-	}))
-
-	c, err = store.conn(expired)
-	require.NoError(t, err)
-	pool, ok = c.(*sql.DB)
-	require.True(t, ok, "closed transaction: the pool, not a handle that is done")
-	assert.Same(t, store.db, pool)
 }
 
 // Non-ASCII text round-trips: the gate refuses bytes that are not UTF-8, not

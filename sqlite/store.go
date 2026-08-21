@@ -519,31 +519,13 @@ type roDBTX interface {
 
 // refuseWriteInReadFrame reports whether a write may be issued on ctx. Callers
 // take it for the refusal alone, before a compare that may return without
-// writing: stmtFor cannot stand in there, since it is only reached once a
+// writing: writeStmt cannot stand in there, since it is only reached once a
 // statement is actually issued.
 func (s *sqliteStore) refuseWriteInReadFrame(ctx context.Context) error {
 	if st := liveTx(ctx); st != nil && st.readOnly {
 		return errWroteInReadTx
 	}
 	return nil
-}
-
-// conn returns the ambient transaction if ctx carries a live one, else the pool.
-// A closed txState degrades to the pool — the ctx outlives its transaction, so a
-// write issued on it commits standalone rather than failing with sql.ErrTxDone.
-// Hooks should use the detached ctx AfterCommit hands them.
-func (s *sqliteStore) conn(ctx context.Context) (dbtx, error) {
-	st := liveTx(ctx)
-	if st == nil {
-		return s.db, nil
-	}
-	// Every data write takes its connection from here — only the savepoint
-	// statements use st.tx directly — so refusing a read frame refuses all of
-	// them, before any statement runs. TestNoWriteBypassesConn holds that.
-	if st.readOnly {
-		return nil, errWroteInReadTx
-	}
-	return st.tx, nil
 }
 
 // read returns the connection a read-only statement runs on: the ambient
