@@ -410,6 +410,11 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   `NOT IN (VALUES)` is a syntax error. Three non-generic marshal helpers, one per
   shape — never one widened generic, which is what let condition types reach a
   lossy encoder. → [ADR](docs/adr/2026-08-21-bind-the-tuple-sets-as-json.md)
+  **A condition's text must be valid UTF-8** (`ErrInvalidCondition`, all four
+  columns), which is what let the last tuple set — the conditions upsert — bind
+  as JSON too: the encoding substitutes U+FFFD for bytes it cannot carry, so the
+  gate is what makes the write lossless rather than the helper's shape.
+  → [ADR](docs/adr/2026-08-21-a-condition-is-utf8-text.md)
 - **Reads run on their own connections.** The writer is one connection; reads
   that are not inside a transaction run on a read-only pool of
   `WithReadConnections` (4 by default), so they no longer queue behind writes.
