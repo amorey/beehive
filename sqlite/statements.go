@@ -68,6 +68,7 @@ const (
 	stmtStampOwed
 
 	stmtLoadConditions
+	stmtConditionsByIDs
 	stmtDeleteCondition
 
 	stmtGetDriverCursor
@@ -236,6 +237,11 @@ var stmtSQL = [numStmts]string{
 		  FROM conditions
 		 WHERE object_id = ?
 		 ORDER BY type`,
+	stmtConditionsByIDs: `
+		SELECT ` + conditionColumns + `
+		  FROM conditions
+		 WHERE object_id IN (SELECT value FROM json_each(?))
+		 ORDER BY object_id, type`,
 	stmtDeleteCondition: `
 		DELETE FROM conditions
 		 WHERE object_id = ? AND type = ?`,

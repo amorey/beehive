@@ -1159,16 +1159,7 @@ func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.Object
 // result set so the next chunk reuses that connection rather than taking
 // another from the read pool.
 func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, out map[storeapi.ObjectID][]storeapi.Condition) error {
-	args := make([]any, len(ids))
-	placeholders := make([]string, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT `+conditionColumns+` FROM conditions
-		 WHERE object_id IN (`+strings.Join(placeholders, ",")+`)
-		 ORDER BY object_id, type`, args...)
+	rows, err := s.query(ctx, stmtConditionsByIDs, jsonList(ids))
 	if err != nil {
 		return err
 	}

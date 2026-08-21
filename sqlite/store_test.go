@@ -9645,7 +9645,6 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 // statement per arity would fill the table with single-use entries.
 var renderedSQLSites = []string{
 	"appendWriteLogUpdates",
-	"sqliteStore.conditionsByIDsChunk",
 	"reconcileOwedSweepQuery",
 	"sqliteDependencies.ListStaleSince",
 	"conditionSetLoad",
@@ -9888,4 +9887,14 @@ func TestAnIDListBindsAsNumbers(t *testing.T) {
 	require.NoError(t, store.db.QueryRowContext(ctx,
 		`SELECT typeof(value) FROM json_each(?)`, jsonList([]string{"Ready"})).Scan(&typ))
 	assert.Equal(t, "text", typ)
+}
+
+// The batched conditions read orders by the column its IN list constrains, so
+// the index delivers that order and the JSON list does not cost a sort.
+func TestTheBatchedConditionsReadInheritsTheIndexOrder(t *testing.T) {
+	store := newTestStore(t).(*sqliteStore)
+
+	plan := queryPlan(t, store, stmtSQL[stmtConditionsByIDs], jsonList([]storeapi.ObjectID{1, 2}))
+
+	assert.NotContains(t, plan, "ORDER BY", "the conditions index already delivers this order:\n"+plan)
 }
