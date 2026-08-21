@@ -165,10 +165,11 @@ may matter more:
   the writer is wrong on its face, and stays wrong however little it costs
   today — the cost grows with write pressure, where a read-pool read is flat.
 
-Neither is urgent. If the list is ranked by measured value this sits below
-[the spec write's read](2026-08-20-a-spec-write-writes-before-it-reads.md), and
-that is how the README now orders it. Resource version blocks outranked it and
-have [shipped](../adr/2026-08-20-reserve-resource-versions-in-blocks.md).
+Neither is urgent, and both of the specs that outranked it are gone: resource
+version blocks [shipped](../adr/2026-08-20-reserve-resource-versions-in-blocks.md),
+and folding the spec write's read into its `UPDATE` was
+[measured and declined](../adr/2026-08-20-a-spec-write-reads-before-it-writes.md).
+That leaves this first, which the README now reflects.
 
 ## Exported, or not
 
