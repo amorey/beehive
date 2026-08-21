@@ -3068,10 +3068,11 @@ func (s sqliteEdges) Delete(ctx context.Context, fromID, toID storeapi.ObjectID,
 // Edges().ListIncoming returns the objects pointing at toID through relation, joining edges
 // to objects so each carries the GroupKind needed to route a requeue.
 func (s sqliteEdges) ListIncoming(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.from_id
-		WHERE r.to_id = ? AND r.relation = ?`+edgeOrderByReferrer, toID, string(relation))
+	ps, err := s.stmtFor(ctx, stmtEdgesListIncoming)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, toID, string(relation))
 	if err != nil {
 		return nil, err
 	}
@@ -3137,10 +3138,11 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 // ListOutgoing returns the distinct objects fromID points at (any
 // relation); DISTINCT collapses an object reached through several relations.
 func (s sqliteEdges) ListOutgoing(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT DISTINCT o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id = ?`+edgeOrderByTarget, fromID)
+	ps, err := s.stmtFor(ctx, stmtEdgesListOutgoing)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, fromID)
 	if err != nil {
 		return nil, err
 	}
@@ -3150,10 +3152,11 @@ func (s sqliteEdges) ListOutgoing(ctx context.Context, fromID storeapi.ObjectID)
 // Edges().ListOutgoingByRelation returns the objects fromID points at through relation. No
 // DISTINCT needed: (from_id, to_id, relation) is unique.
 func (s sqliteEdges) ListOutgoingByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id = ? AND r.relation = ?`+edgeOrderByTarget, fromID, string(relation))
+	ps, err := s.stmtFor(ctx, stmtEdgesListOutgoingByRelation)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ps.QueryContext(ctx, fromID, string(relation))
 	if err != nil {
 		return nil, err
 	}
@@ -3206,15 +3209,11 @@ func scanLoggedWrites(rows *sql.Rows, err error) ([]loggedWrite, error) {
 // itself deletion-pending, breaking the mutual-RESTRICT deadlock between
 // finalizing objects. Bumps no version.
 func (s sqliteEdges) DeleteFinalizingDependsOn(ctx context.Context, toID storeapi.ObjectID) error {
-	c, err := s.conn(ctx)
+	ps, err := s.stmtFor(ctx, stmtEdgesDeleteFinalizingDependsOn)
 	if err != nil {
 		return err
 	}
-	_, err = c.ExecContext(ctx, `
-		DELETE FROM edges
-		WHERE to_id = ? AND relation = ?
-		  AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
-		toID, string(storeapi.RelationDependsOn))
+	_, err = ps.ExecContext(ctx, toID, string(storeapi.RelationDependsOn))
 	return err
 }
 
@@ -3223,14 +3222,12 @@ func (s sqliteEdges) DeleteFinalizingDependsOn(ctx context.Context, toID storeap
 // finalizing objects depending on each other would never clear. owned_by always
 // counts: the foreground cascade waits for physical removal.
 func (s sqliteEdges) HasIncoming(ctx context.Context, id storeapi.ObjectID) (bool, error) {
+	ps, err := s.stmtFor(ctx, stmtEdgesHasIncoming)
+	if err != nil {
+		return false, err
+	}
 	var exists int
-	err := s.read(ctx).QueryRowContext(ctx, `
-		SELECT EXISTS(
-			SELECT 1 FROM edges r
-			WHERE r.to_id = ?
-			  AND NOT (r.relation = ? AND r.from_id IN
-			           (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)))`,
-		id, string(storeapi.RelationDependsOn)).Scan(&exists)
+	err = ps.QueryRowContext(ctx, id, string(storeapi.RelationDependsOn)).Scan(&exists)
 	if err != nil {
 		return false, err
 	}

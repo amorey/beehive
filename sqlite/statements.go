@@ -59,6 +59,11 @@ const (
 	stmtLatestEventRun
 	stmtLatestEventKey
 	stmtEventsMaxVersion
+	stmtEdgesListIncoming
+	stmtEdgesListOutgoing
+	stmtEdgesListOutgoingByRelation
+	stmtEdgesHasIncoming
+	stmtEdgesDeleteFinalizingDependsOn
 
 	numStmts
 )
@@ -138,6 +143,29 @@ var stmtSQL = [numStmts]string{
 		 ORDER BY id DESC LIMIT 1`,
 	stmtEventsMaxVersion: `SELECT MAX(resource_version) FROM events WHERE object_id = ?`,
 
+	stmtEdgesListIncoming: `
+		SELECT o.id, o."group", o.kind
+		FROM edges r JOIN objects o ON o.id = r.from_id
+		WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer,
+	stmtEdgesListOutgoing: `
+		SELECT DISTINCT o.id, o."group", o.kind
+		FROM edges r JOIN objects o ON o.id = r.to_id
+		WHERE r.from_id = ?` + edgeOrderByTarget,
+	stmtEdgesListOutgoingByRelation: `
+		SELECT o.id, o."group", o.kind
+		FROM edges r JOIN objects o ON o.id = r.to_id
+		WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget,
+	stmtEdgesHasIncoming: `
+		SELECT EXISTS(
+			SELECT 1 FROM edges r
+			WHERE r.to_id = ?
+			  AND NOT (r.relation = ? AND r.from_id IN
+			           (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)))`,
+	stmtEdgesDeleteFinalizingDependsOn: `
+		DELETE FROM edges
+		WHERE to_id = ? AND relation = ?
+		  AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -170,6 +198,8 @@ var stmtWrites = [numStmts]bool{
 	stmtUpdateStatus:          true,
 	stmtDeleteCondition:       true,
 	stmtSetDriverCursor:       true,
+
+	stmtEdgesDeleteFinalizingDependsOn: true,
 }
 
 // stmtSet is one pool's preparations.
