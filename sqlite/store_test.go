@@ -9637,7 +9637,8 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 		"SQL inside a function must be rendered from a runtime count; everything else is a field")
 }
 
-// renderedSQLSites is the thirteen call sites whose text varies with data. Each
+// renderedSQLSites is the twelve functions holding SQL whose text varies with
+// data. Each
 // renders an IN list, a VALUES tuple set or an optional predicate, so one
 // statement per arity would fill the table with single-use entries.
 var renderedSQLSites = []string{

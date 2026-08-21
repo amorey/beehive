@@ -46,9 +46,11 @@ before that binds to the writer. `OpenMemory` aliases both to one pool.
 
 **Text rendered from a runtime count is not a field.** One statement per arity
 would fill the set with single-use entries, and a batch already amortises one
-preparation over every row it binds. Thirteen sites render an `IN` list, a
-`VALUES` tuple set or an optional predicate.
-`TestOnlyRenderedSQLLivesInAFunction` lists them and fails on a fourteenth: with
+preparation over every row it binds. Twelve functions hold SQL that renders an
+`IN` list, a `VALUES` tuple set or an optional predicate — thirteen sites render,
+but `Objects().ListByIDs` builds only a fragment, and a fragment carries no verb
+to recognise it by.
+`TestOnlyRenderedSQLLivesInAFunction` lists them and fails on a thirteenth: with
 every constant statement hoisted, SQL text left inside a function means a
 statement someone forgot to prepare.
 
@@ -88,7 +90,7 @@ Measured on disk, against the commit this work started from:
 | changed spec write | 151 µs | 83.3 µs | **−45%** |
 
 **A connection holding prepared statements taxes everything running on it**,
-prepared and unprepared alike, and the thirteen rendered statements pay it with
+prepared and unprepared alike, and the rendered statements pay it with
 nothing against them. Measured alternating (`BenchmarkResidencyToll`): +9% on an
 unprepared execution, +3% on a prepared one, against a ~17 µs saving per prepared
 execution. It is a step rather than a slope — nearly all of it arrives by fifteen
