@@ -62,6 +62,11 @@ var ErrWrongKind = errors.New("beehive: object belongs to a different kind")
 // is refused rather than resolved.
 var ErrDuplicateConditionType = errors.New("beehive: condition type set twice in one write")
 
+// ErrInvalidConditionType is returned by Conditions().Set for a type that is not
+// valid UTF-8. The type is a lookup key as well as a stored value, and the
+// lookups that carry it may not survive bytes that are not text.
+var ErrInvalidConditionType = errors.New("beehive: condition type must be valid UTF-8")
+
 // ErrStaleTxContext is returned by a nested Within whose ctx is not the
 // transaction's live innermost frame: another goroutine's frame, an enclosing
 // frame used while deeper ones are open, or a frame that already unwound.
@@ -873,8 +878,8 @@ type Conditions interface {
 	// Set inserts or updates the conditions keyed by (id, cond.Type), together:
 	// they land in one transaction under a single ResourceVersion bump, and a
 	// batch whose every condition matches what is stored writes nothing. A type
-	// named twice → ErrDuplicateConditionType; no conditions at all writes
-	// nothing. Scoped to gk: wrong kind → ErrWrongKind, missing id →
+	// named twice → ErrDuplicateConditionType, a type that is not valid UTF-8 →
+	// ErrInvalidConditionType; no conditions at all writes nothing. Scoped to gk: wrong kind → ErrWrongKind, missing id →
 	// ErrNotFound. Returns no row; read conditions back with Objects().Get.
 	Set(ctx context.Context, gk GroupKind, id ObjectID, conds ...Condition) error
 }

@@ -1019,7 +1019,7 @@ func TestConditionSetLoadsTheGateAndTheConditionsTogether(t *testing.T) {
 	store := newTestStore(t).(*sqliteStore)
 
 	plan := queryPlan(t, store, stmtSQL[stmtConditionSetLoad],
-		jsonList([]string{"Ready", "Healthy"}), int64(1))
+		conditionTypeList([]string{"Ready", "Healthy"}), int64(1))
 
 	assert.Contains(t, plan, "USING INTEGER PRIMARY KEY",
 		"objects must be reached by rowid:\n"+plan)
@@ -9852,7 +9852,7 @@ func TestAnIDListBindsAsNumbers(t *testing.T) {
 	assert.Equal(t, int64(1<<53+1), got)
 
 	require.NoError(t, store.db.QueryRowContext(ctx,
-		`SELECT typeof(value) FROM json_each(?)`, jsonList([]string{"Ready"})).Scan(&typ))
+		`SELECT typeof(value) FROM json_each(?)`, conditionTypeList([]string{"Ready"})).Scan(&typ))
 	assert.Equal(t, "text", typ)
 
 	// And through a call site, which is where the conversion that breaks it would be.
@@ -9889,4 +9889,40 @@ func TestTheUnblockedTargetsReadSorts(t *testing.T) {
 
 	assert.Contains(t, plan, "USE TEMP B-TREE FOR ORDER BY", plan)
 	assert.Contains(t, plan, "SEARCH r USING PRIMARY KEY", "the edges seek survives:\n"+plan)
+}
+
+// A condition type is a lookup key as well as a stored value: the upsert binds
+// it raw, and the load looks it up through JSON. JSON has no representation for
+// bytes that are not UTF-8 and json.Marshal substitutes U+FFFD, so a type that
+// survived the write would never be found again — and every Set would read the
+// condition as new, rewriting it and waking every watcher. Refused instead.
+func TestASetRefusesAConditionTypeThatIsNotText(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	err := store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Ready\xff", Status: "True"})
+
+	assert.ErrorIs(t, err, storeapi.ErrInvalidConditionType)
+}
+
+// The no-op suppression rests on the load finding what the upsert stored, so a
+// type carrying non-ASCII text must round-trip through the JSON list intact.
+func TestASecondSetOfANonASCIIConditionTypeWritesNothing(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+	cond := storeapi.Condition{Type: "Prêt→✓", Status: "True"}
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, cond))
+	first, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID, cond))
+	second, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+
+	assert.Equal(t, first.ResourceVersion, second.ResourceVersion,
+		"the load must find the stored type, or the write repeats forever")
 }

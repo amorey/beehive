@@ -26,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/amorey/beehive/internal/storeapi"
 	"modernc.org/sqlite"
@@ -1813,7 +1814,7 @@ func (s *sqliteStore) loadForConditionSetChunk(
 	for i, cond := range conds {
 		types[i] = cond.Type
 	}
-	rows, err := s.query(ctx, stmtConditionSetLoad, jsonList(types), id)
+	rows, err := s.query(ctx, stmtConditionSetLoad, conditionTypeList(types), id)
 	if err != nil {
 		return err
 	}
@@ -1896,6 +1897,11 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 	}
 	seen := make(map[string]bool, len(conds))
 	for _, cond := range conds {
+		// The type is a lookup key, and conditionTypeList cannot carry one that
+		// is not text.
+		if !utf8.ValidString(cond.Type) {
+			return fmt.Errorf("%w: %q", storeapi.ErrInvalidConditionType, cond.Type)
+		}
 		if seen[cond.Type] {
 			return fmt.Errorf("%w: %q", storeapi.ErrDuplicateConditionType, cond.Type)
 		}
@@ -3349,12 +3355,22 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 	return s.listObjects(ctx, stmtListObjectsByIDs, jsonList(ids), gk.Group, gk.Kind)
 }
 
-// jsonList marshals an IN list's values as one JSON array, for
+// jsonList marshals an IN list's ids as one JSON array, for
 // `IN (SELECT value FROM json_each(?))`. Numbers stay numbers: json_each gives a
-// JSON string TEXT affinity, which matches no INTEGER column. Marshalling a
-// slice of integers or strings cannot fail, so the error is discarded.
-func jsonList[T ~int64 | ~string](values []T) string {
+// JSON string TEXT affinity, which matches no INTEGER column. Integers cannot
+// fail to marshal, so the error is discarded.
+func jsonList[T ~int64](values []T) string {
 	out, _ := json.Marshal(values)
+	return string(out)
+}
+
+// conditionTypeList is jsonList for condition types, which are text and need
+// their own path: JSON cannot represent a byte sequence that is not UTF-8, and
+// json.Marshal substitutes U+FFFD instead of failing. The lookup would then miss
+// the raw bytes the upsert stored, and every Set would read the condition as
+// new. Conditions().Set refuses such a type, which is what makes this lossless.
+func conditionTypeList(types []string) string {
+	out, _ := json.Marshal(types)
 	return string(out)
 }
 

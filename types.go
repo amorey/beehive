@@ -116,6 +116,10 @@ var ErrDeletionPending = storeapi.ErrDeletionPending
 // condition type twice, whose outcome would otherwise depend on apply order.
 var ErrDuplicateConditionType = storeapi.ErrDuplicateConditionType
 
+// ErrInvalidConditionType is returned by SetConditions for a condition type that
+// is not valid UTF-8. The type is a lookup key, not only a stored value.
+var ErrInvalidConditionType = storeapi.ErrInvalidConditionType
+
 // ErrStaleTxContext is returned by a nested Within whose ctx is not the
 // transaction's live innermost frame. Deep nesting on one goroutine is fine;
 // using a ctx from outside the frame you are in is not.
