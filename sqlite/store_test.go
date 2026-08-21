@@ -9582,9 +9582,11 @@ func TestOpenFailsOnAStatementItCannotPrepare(t *testing.T) {
 	t.Cleanup(func() { reopened.Close() })
 }
 
-// The two sides of listObjectsWhere. Objects().List has a constant tail and is
-// prepared; Objects().ListByIDs renders its IN list per arity and cannot be.
-func TestOnlyTheConstantObjectListingIsPrepared(t *testing.T) {
+// Both multi-row object reads go through listObjects now, so the JSON list must
+// still find what the plain listing finds — and an id past 2^53 proves the list
+// reached SQLite as numbers: stringified, it would match nothing and report an
+// empty result rather than an error.
+func TestBothObjectListingsReadTheSameRow(t *testing.T) {
 	store := newDiskStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -9598,11 +9600,19 @@ func TestOnlyTheConstantObjectListingIsPrepared(t *testing.T) {
 	require.Len(t, byID, 1)
 	assert.Equal(t, listed[0].ID, byID[0].ID, "both halves of the split read the same row")
 
-	// Which half is prepared is a static fact about the call graph: the rendered
-	// tail has exactly one caller, and the constant ones go through listObjects.
-	assert.Equal(t, []string{"sqliteObjects.ListByIDs"}, callSites(t, "listObjectsWhere"))
-	assert.ElementsMatch(t, []string{"sqliteObjects.List", "sqliteObjects.ListByIncomingEdge"},
+	assert.ElementsMatch(t,
+		[]string{"sqliteObjects.List", "sqliteObjects.ListByIncomingEdge", "sqliteObjects.ListByIDs"},
 		callSites(t, "listObjects"))
+
+	big := storeapi.ObjectID(1<<53 + 1)
+	_, err = store.db.ExecContext(ctx,
+		`UPDATE objects SET id = ? WHERE id = ?`, big, obj.ID)
+	require.NoError(t, err)
+
+	byID, err = store.Objects().ListByIDs(ctx, testGK, []storeapi.ObjectID{big})
+	require.NoError(t, err)
+	require.Len(t, byID, 1, "a stringified id would match nothing")
+	assert.Equal(t, big, byID[0].ID)
 }
 
 // Every statement whose text is constant is prepared, so the only SQL left
@@ -9821,20 +9831,6 @@ func TestGetObjectRowScopedGatesTheKind(t *testing.T) {
 	_, err := store.getObjectRowScoped(context.Background(),
 		beehive.GroupKind{Kind: "Other"}, obj.ID)
 	assert.ErrorIs(t, err, beehive.ErrWrongKind)
-}
-
-// Objects().ListByIDs renders one placeholder per id, so a caller that ignores
-// the chunk size reaches SQLite's parameter limit. The read reports it rather
-// than truncating.
-func TestAnOversizedIDListIsReported(t *testing.T) {
-	store := newRawStore(t)
-
-	ids := make([]storeapi.ObjectID, 40000)
-	for i := range ids {
-		ids[i] = storeapi.ObjectID(i + 1)
-	}
-	_, err := store.Objects().ListByIDs(context.Background(), testGK, ids)
-	assert.Error(t, err, "past the parameter limit the statement cannot be prepared")
 }
 
 // A goroutine can outlive Close — a watch tailer stopping is not ordered against

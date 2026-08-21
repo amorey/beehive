@@ -46,6 +46,7 @@ const (
 	// The multi-row object reads.
 	stmtListObjects
 	stmtListObjectsByIncomingEdge
+	stmtListObjectsByIDs
 
 	// The object writes.
 	stmtInsertObject
@@ -178,6 +179,9 @@ var stmtSQL = [numStmts]string{
 		 WHERE o."group" = ? AND o.kind = ?`),
 	stmtListObjectsByIncomingEdge: listObjectsSQL(`
 		 WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
+		   AND o."group" = ? AND o.kind = ?`),
+	stmtListObjectsByIDs: listObjectsSQL(`
+		 WHERE o.id IN (SELECT value FROM json_each(?))
 		   AND o."group" = ? AND o.kind = ?`),
 
 	stmtInsertObject: `
@@ -450,8 +454,7 @@ var stmtSQL = [numStmts]string{
 		RETURNING value`,
 }
 
-// listObjectsSQL builds the shared multi-row object read. Objects().ListByIDs
-// renders its own tail and cannot be prepared, so it keeps listObjectsWhere.
+// listObjectsSQL builds the shared multi-row object read: one field per tail.
 func listObjectsSQL(tail string) string {
 	return `
 		SELECT ` + objectColumns + `

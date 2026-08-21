@@ -1092,19 +1092,8 @@ func (s sqliteObjects) ListByIncomingEdge(ctx context.Context, gk storeapi.Group
 		toID, string(relation), gk.Group, gk.Kind)
 }
 
-// listObjectsWhere is the shared multi-row object read: rows matching tail,
-// ordered by id, conditions attached. tail is a fixed internal fragment, never
-// user input; only its bound arguments come from the caller.
-func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ...any) ([]*storeapi.RawObject, error) {
-	rows, err := s.read(ctx).QueryContext(ctx, listObjectsSQL(tail), args...)
-	if err != nil {
-		return nil, err
-	}
-	return s.attachConditionsToRows(ctx, rows)
-}
-
-// listObjects is listObjectsWhere over a prepared statement, for the callers
-// whose tail is constant.
+// listObjects is the shared multi-row object read: rows matching stmt's tail,
+// ordered by id, conditions attached.
 func (s *sqliteStore) listObjects(ctx context.Context, stmt stmtID, args ...any) ([]*storeapi.RawObject, error) {
 	ps := s.readStmt(ctx, stmt)
 	rows, err := ps.QueryContext(ctx, args...)
@@ -3355,13 +3344,7 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	args := make([]any, 0, len(ids)+2)
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	args = append(args, gk.Group, gk.Kind)
-	return s.listObjectsWhere(ctx,
-		`WHERE o.id IN (`+placeholders(len(ids))+`) AND o."group" = ? AND o.kind = ?`, args...)
+	return s.listObjects(ctx, stmtListObjectsByIDs, jsonList(ids), gk.Group, gk.Kind)
 }
 
 // jsonList marshals an IN list's values as one JSON array, for
