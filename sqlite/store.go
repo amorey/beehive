@@ -716,14 +716,14 @@ const (
 )
 
 // nextResourceVersion advances and returns the global write cursor.
-func (s *sqliteStore) nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
-	return s.advanceResourceVersion(ctx, c, 1)
+func (s *sqliteStore) nextResourceVersion(ctx context.Context) (int64, error) {
+	return s.advanceResourceVersion(ctx, 1)
 }
 
 // advanceResourceVersion advances the cursor by n and returns the highest value
 // drawn, so the range taken is [value-n+1, value]. n must be positive. Served
 // from the reserved block where it fits, and from the table otherwise.
-func (s *sqliteStore) advanceResourceVersion(ctx context.Context, c dbtx, n int) (int64, error) {
+func (s *sqliteStore) advanceResourceVersion(ctx context.Context, n int) (int64, error) {
 	hi, ok := s.versions.take(n)
 	if !ok {
 		var err error
@@ -838,11 +838,12 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 		return nil, fmt.Errorf("%w: pass the name the object should be addressable by", storeapi.ErrInvalidName)
 	}
 	finalizers := marshalFinalizers(in.Finalizers)
-	c, err := s.conn(ctx)
-	if err != nil {
+	// conn for its refusal alone: a write in a read frame must be refused before
+	// the draw, so a refused create burns no resource_version.
+	if _, err := s.conn(ctx); err != nil {
 		return nil, err
 	}
-	rv, err := s.nextResourceVersion(ctx, c)
+	rv, err := s.nextResourceVersion(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -879,12 +880,11 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 // so those three call appendWriteLog directly.
 func (s *sqliteStore) recordObjectWrite(
 	ctx context.Context,
-	c dbtx,
 	gk storeapi.GroupKind,
 	id storeapi.ObjectID,
 	op int,
 ) (rv, now int64, err error) {
-	if rv, err = s.nextResourceVersion(ctx, c); err != nil {
+	if rv, err = s.nextResourceVersion(ctx); err != nil {
 		return 0, 0, err
 	}
 	now = toMillis(time.Now().UTC())
@@ -1678,7 +1678,7 @@ func (s *sqliteStore) updateSpec(
 			return err // changed stays false: nothing was written
 		}
 		gk := storeapi.GroupKind{Group: obj.Group, Kind: obj.Kind}
-		rv, now, err := s.recordObjectWrite(ctx, c, gk, obj.ID, writeOpUpdate)
+		rv, now, err := s.recordObjectWrite(ctx, gk, obj.ID, writeOpUpdate)
 		if err != nil {
 			return err
 		}
@@ -1733,11 +1733,10 @@ func (s *sqliteStore) advanceObserved(ctx context.Context, gk storeapi.GroupKind
 	if recorded.Valid && recorded.Int64 >= observedGeneration {
 		return false, nil
 	}
-	c, err := s.conn(ctx)
-	if err != nil {
+	if _, err := s.conn(ctx); err != nil {
 		return false, err
 	}
-	rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
+	rv, now, err := s.recordObjectWrite(ctx, gk, id, writeOpUpdate)
 	if err != nil {
 		return false, err
 	}
@@ -1776,8 +1775,7 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 	// Within keeps the read-compare-write atomic.
 	err := s.Within(ctx, func(ctx context.Context) error {
 		// Before the no-op compare below: see updateSpec.
-		c, err := s.conn(ctx)
-		if err != nil {
+		if _, err := s.conn(ctx); err != nil {
 			return err
 		}
 		// Scoped read enforces the kind boundary while doubling as the compare's
@@ -1801,7 +1799,7 @@ func (s sqliteObjects) UpdateStatus(ctx context.Context, gk storeapi.GroupKind, 
 		if stamp == storedVersion && bytes.Equal(storedStatus, status) {
 			return nil // no version bump, so no watch diff and no wake
 		}
-		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
+		rv, now, err := s.recordObjectWrite(ctx, gk, id, writeOpUpdate)
 		if err != nil {
 			return err
 		}
@@ -1997,14 +1995,16 @@ func (s *sqliteStore) loadForConditionSetChunk(
 
 // bumpObject advances id's resource_version — the visibility half of the
 // condition mutators, whose semantic write lives in another table.
-func (s *sqliteStore) bumpObject(ctx context.Context, c dbtx, gk storeapi.GroupKind, id storeapi.ObjectID) error {
-	rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
+func (s *sqliteStore) bumpObject(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID) error {
+	rv, now, err := s.recordObjectWrite(ctx, gk, id, writeOpUpdate)
 	if err != nil {
 		return err
 	}
-	_, err = c.ExecContext(ctx, `
-		UPDATE objects SET resource_version = ?, updated_at = ?
-		WHERE id = ?`, rv, now, id)
+	ps, err := s.stmtFor(ctx, stmtBumpObject)
+	if err != nil {
+		return err
+	}
+	_, err = ps.ExecContext(ctx, rv, now, id)
 	return err
 }
 
@@ -2072,7 +2072,7 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 		// A condition change bumps resource_version — what watch polls and the
 		// dependency waker look at. One bump for the batch: a caller writing several
 		// conditions is reporting one pass, and a reader must never see half of it.
-		return s.bumpObject(ctx, c, gk, id)
+		return s.bumpObject(ctx, gk, id)
 	})
 }
 
@@ -2114,8 +2114,7 @@ func (s *sqliteStore) upsertConditions(
 func (s sqliteConditions) Delete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) error {
 	// Within keeps the delete and the version bump atomic (see Conditions().Set).
 	return s.Within(ctx, func(ctx context.Context) error {
-		c, err := s.conn(ctx)
-		if err != nil {
+		if _, err := s.conn(ctx); err != nil {
 			return err
 		}
 		// Same metadata-only gate as Conditions().Set.
@@ -2135,7 +2134,7 @@ func (s sqliteConditions) Delete(ctx context.Context, gk storeapi.GroupKind, id 
 		if n == 0 {
 			return nil
 		}
-		return s.bumpObject(ctx, c, gk, id)
+		return s.bumpObject(ctx, gk, id)
 	})
 }
 
@@ -2221,7 +2220,7 @@ func (s sqliteEvents) Add(ctx context.Context, gk storeapi.GroupKind, id storeap
 		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
-		rv, err := s.nextResourceVersion(ctx, c)
+		rv, err := s.nextResourceVersion(ctx)
 		if err != nil {
 			return err
 		}
@@ -2569,7 +2568,7 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 			return nil
 		}
 		clearedLast = len(remaining) == 0 && deletionPending
-		rv, now, err := s.recordObjectWrite(ctx, c, gk, id, writeOpUpdate)
+		rv, now, err := s.recordObjectWrite(ctx, gk, id, writeOpUpdate)
 		if err != nil {
 			return err
 		}
@@ -2599,7 +2598,7 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereAr
 	if err != nil {
 		return 0, false, err
 	}
-	rv, err := s.nextResourceVersion(ctx, c)
+	rv, err := s.nextResourceVersion(ctx)
 	if err != nil {
 		return 0, false, err
 	}
@@ -2649,7 +2648,7 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 		return nil, err
 	}
 	now := toMillis(time.Now().UTC())
-	end, err := s.advanceResourceVersion(ctx, c, len(ids))
+	end, err := s.advanceResourceVersion(ctx, len(ids))
 	if err != nil {
 		return nil, err
 	}
@@ -2912,7 +2911,7 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {
 		return err
 	}
-	rv, err := s.nextResourceVersion(ctx, c)
+	rv, err := s.nextResourceVersion(ctx)
 	if err != nil {
 		return err
 	}

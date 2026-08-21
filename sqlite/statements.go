@@ -77,6 +77,7 @@ const (
 	stmtAppendWriteLog
 	stmtAppendWriteLogDelete
 	stmtDrawResourceVersions
+	stmtBumpObject
 
 	numStmts
 )
@@ -217,6 +218,10 @@ var stmtSQL = [numStmts]string{
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	stmtDrawResourceVersions: `UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value`,
 
+	stmtBumpObject: `
+		UPDATE objects SET resource_version = ?, updated_at = ?
+		WHERE id = ?`,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -260,6 +265,7 @@ var stmtWrites = [numStmts]bool{
 	stmtAppendWriteLog:                 true,
 	stmtAppendWriteLogDelete:           true,
 	stmtDrawResourceVersions:           true,
+	stmtBumpObject:                     true,
 }
 
 // stmtSet is one pool's preparations.
