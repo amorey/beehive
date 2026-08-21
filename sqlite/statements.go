@@ -529,7 +529,13 @@ func (s *sqliteStore) prepareReadStatements(ctx context.Context) error {
 }
 
 // closeStatements releases both sets, freeing the driver's compiled programs.
-// Idempotent, as Close is; a set aliased to the other is closed once.
+// Idempotent, as Close is, because Stmt.Close is; a set aliased to the other is
+// closed once.
+//
+// It clears no slot. The sets are written once, while the store is still the
+// constructor's, and read without a lock by every caller after that — so a write
+// here would race them all, and a goroutine outliving Close would find nil
+// rather than a closed statement to report.
 func (s *sqliteStore) closeStatements() error {
 	var err error
 	for id := stmtID(0); id < numStmts; id++ {
@@ -539,7 +545,6 @@ func (s *sqliteStore) closeStatements() error {
 		if s.writeStmts[id] != nil {
 			err = errors.Join(err, s.writeStmts[id].Close())
 		}
-		s.readStmts[id], s.writeStmts[id] = nil, nil
 	}
 	return err
 }

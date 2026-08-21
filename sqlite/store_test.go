@@ -9850,3 +9850,17 @@ func TestAnOversizedIDListIsReported(t *testing.T) {
 	_, err := store.Objects().ListByIDs(context.Background(), testGK, ids)
 	assert.Error(t, err, "past the parameter limit the statement cannot be prepared")
 }
+
+// A goroutine can outlive Close — a watch tailer stopping is not ordered against
+// it — and what it finds must be a closed statement to report, not a cleared
+// slot to dereference.
+func TestAReadAfterCloseReportsRatherThanPanics(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	require.NoError(t, err)
+	obj := newRefObject(t, store)
+	require.NoError(t, store.Close())
+
+	_, err = store.Objects().GetMeta(context.Background(), obj.ID)
+	assert.Error(t, err)
+	assert.NoError(t, store.Close(), "closing twice closes each statement once")
+}
