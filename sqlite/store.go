@@ -126,10 +126,11 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
-	// Before the closes, so a reader-pool failure cannot leave the path claimed
-	// for the life of the process.
+	// Deferred, so a failed close still releases the path — but not before the
+	// closes, or a concurrent Open could begin migrating while these pools are
+	// still open.
 	if s.path != "" {
-		releasePath(s.path, s)
+		defer releasePath(s.path, s)
 	}
 	// Readers first: they hold snapshots the writer's checkpoint waits on. The
 	// writer closes whatever happened above it, so a failed reader cannot leak it.
