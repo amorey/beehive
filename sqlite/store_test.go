@@ -9671,3 +9671,70 @@ func TestOnlyTheConstantObjectListingIsPrepared(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, before, store.stmtUses.Load(), "a rendered tail is not")
 }
+
+// Every statement whose text is constant is prepared, so the only SQL left
+// inside a function is rendered from a runtime count. This is what keeps a new
+// hot read from being silently unprepared: add one with its SQL inline and it
+// shows up here.
+func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
+	anySQL := regexp.MustCompile(`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+
+	var inFunctions []string
+	for _, fn := range sqlLiteralSites(t, anySQL.MatchString) {
+		// The *SQL builders hold the text of prepared statements.
+		if strings.HasSuffix(fn, "SQL") {
+			continue
+		}
+		inFunctions = append(inFunctions, fn)
+	}
+
+	assert.ElementsMatch(t, renderedSQLSites, unique(inFunctions),
+		"SQL inside a function must be rendered from a runtime count; everything else is a field")
+}
+
+// renderedSQLSites is the thirteen call sites whose text varies with data. Each
+// renders an IN list, a VALUES tuple set or an optional predicate, so one
+// statement per arity would fill the table with single-use entries.
+var renderedSQLSites = []string{
+	"appendWriteLogUpdates",
+	"sqliteStore.conditionsByIDsChunk",
+	"sqliteReconcileOwed.Stamp",
+	"reconcileOwedSweepQuery",
+	"sqliteDependencies.ListStaleSince",
+	"sqliteStore.readImages",
+	"conditionSetLoad",
+	"sqliteStore.upsertConditions",
+	"sqliteEvents.List",
+	"sqliteStore.markManyForDeletionChunk",
+	"sqliteStore.unblockedTargetsChunk",
+	"sqliteStore.edgesByIDsChunk",
+	// Objects().ListByIDs renders only an IN list; the SELECT it fills is here.
+	"sqliteStore.listObjectsWhere",
+}
+
+// sqlLiteralSites names every function holding a string literal match accepts.
+// Unlike sqlSites it does not follow a statement id: this asks which functions
+// carry SQL *text*, not which issue SQL.
+func sqlLiteralSites(t *testing.T, match func(sql string) bool) []string {
+	t.Helper()
+	var sites []string
+	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
+		lit, ok := n.(*ast.BasicLit)
+		if ok && fn != "" && lit.Kind == token.STRING && match(lit.Value) {
+			sites = append(sites, qualify(recv, fn))
+		}
+	}))
+	return sites
+}
+
+func unique(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range in {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
