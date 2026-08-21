@@ -8516,7 +8516,7 @@ func TestReadImagesSurfacesADBError(t *testing.T) {
 	store := newRawStore(t)
 	store.db.Close()
 
-	_, err := store.readImages(context.Background(), []any{int64(1)})
+	_, err := store.readImages(context.Background(), []int64{1})
 
 	require.Error(t, err)
 }
@@ -9648,7 +9648,6 @@ var renderedSQLSites = []string{
 	"sqliteStore.conditionsByIDsChunk",
 	"reconcileOwedSweepQuery",
 	"sqliteDependencies.ListStaleSince",
-	"sqliteStore.readImages",
 	"conditionSetLoad",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",

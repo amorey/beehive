@@ -80,6 +80,7 @@ const (
 	stmtWriteLogTrimmedThrough
 	stmtWriteLogKinds
 	stmtWriteLogPage
+	stmtWriteLogImages
 	stmtAppendWriteLog
 	stmtAppendWriteLogDelete
 	stmtRaiseWriteLogHorizon
@@ -278,6 +279,9 @@ var stmtSQL = [numStmts]string{
 		  FROM object_writes
 		 WHERE "group" = ? AND kind = ? AND resource_version > ?
 		 ORDER BY resource_version LIMIT ?`,
+	stmtWriteLogImages: `
+		SELECT resource_version, final FROM object_writes
+		 WHERE resource_version IN (SELECT value FROM json_each(?))`,
 	stmtAppendWriteLog: `
 		INSERT INTO object_writes (` + objectWritesColumns + `)
 		VALUES (?, ?, ?, ?, ?, ?)`,

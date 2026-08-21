@@ -1451,7 +1451,7 @@ func writeLogPageCap(limit int) int { return min(limit, 1024) }
 // nothing when the page has none. op identifies them without reading the blob,
 // which is why it is in the covering index.
 func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWrite) error {
-	var deletes []any
+	var deletes []int64
 	for _, w := range page {
 		if w.Op == storeapi.WriteDelete {
 			deletes = append(deletes, w.ResourceVersion)
@@ -1475,10 +1475,8 @@ func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWr
 }
 
 // readImages decodes the row images stored against the given versions.
-func (s *sqliteStore) readImages(ctx context.Context, versions []any) (map[int64]*storeapi.RawObject, error) {
-	rows, err := s.read(ctx).QueryContext(ctx,
-		`SELECT resource_version, final FROM object_writes
-		  WHERE resource_version IN (`+placeholders(len(versions))+`)`, versions...)
+func (s *sqliteStore) readImages(ctx context.Context, versions []int64) (map[int64]*storeapi.RawObject, error) {
+	rows, err := s.query(ctx, stmtWriteLogImages, jsonList(versions))
 	if err != nil {
 		return nil, err
 	}
