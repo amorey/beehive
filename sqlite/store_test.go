@@ -9621,7 +9621,6 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 // data: a VALUES tuple set and an assembled WHERE, so one statement per arity or
 // per predicate combination would fill the table with single-use entries.
 var renderedSQLSites = []string{
-	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
 }
 
@@ -10000,4 +9999,21 @@ func TestConnFallsBackToThePoolWithoutALiveTransaction(t *testing.T) {
 	pool, ok = c.(*sql.DB)
 	require.True(t, ok, "closed transaction: the pool, not a handle that is done")
 	assert.Same(t, store.db, pool)
+}
+
+// Non-ASCII text round-trips: the gate refuses bytes that are not UTF-8, not
+// text that merely is not ASCII.
+func TestTheConditionUpsertCarriesNonASCIIText(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	obj := newRefObject(t, store)
+
+	require.NoError(t, store.Conditions().Set(ctx, testGK, obj.ID,
+		storeapi.Condition{Type: "Pret", Status: "True", Message: "demarre \u2192\u2713"}))
+
+	got, err := store.Objects().Get(ctx, obj.ID)
+	require.NoError(t, err)
+	require.Len(t, got.Conditions, 1)
+	assert.Equal(t, "Pret", got.Conditions[0].Type)
+	assert.Equal(t, "demarre \u2192\u2713", got.Conditions[0].Message)
 }

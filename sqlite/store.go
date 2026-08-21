@@ -1850,9 +1850,10 @@ func (s *sqliteStore) conditionUnchanged(existing map[string]storeapi.Condition,
 		stored.Liveness == want.Liveness
 }
 
-// conditionChunkSize bounds the conditions bound per statement — the gate read
-// and the upsert both — under SQLite's parameter limit at eight parameters a
-// row. A var so tests can shrink it.
+// conditionChunkSize bounds the conditions carried per statement — the gate read
+// and the upsert both. Each binds one JSON array now, so what it bounds is the
+// array built and the rows written, not a parameter count. A var so tests can
+// shrink it.
 var conditionChunkSize = 512
 
 func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, conds ...storeapi.Condition) error {
@@ -1876,8 +1877,7 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 	// Within keeps the condition writes and the object's version bump atomic.
 	return s.Within(ctx, func(ctx context.Context) error {
 		// Before the no-op return below: see updateSpec.
-		c, err := s.conn(ctx)
-		if err != nil {
+		if err := s.refuseWriteInReadFrame(ctx); err != nil {
 			return err
 		}
 		// One read: a metadata-only gate — clean ErrNotFound/ErrWrongKind instead of
@@ -1897,7 +1897,7 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 		if len(changed) == 0 {
 			return nil
 		}
-		if err := s.upsertConditions(ctx, c, id, changed); err != nil {
+		if err := s.upsertConditions(ctx, id, changed); err != nil {
 			return err
 		}
 		// A condition change bumps resource_version — what watch polls and the
@@ -1911,35 +1911,33 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 // splitting their clocks would date the same observation differently.
 func (s *sqliteStore) upsertConditions(
 	ctx context.Context,
-	c dbtx,
 	id storeapi.ObjectID,
 	conds []storeapi.Condition,
 ) error {
 	now := toMillis(time.Now().UTC())
 	for start := 0; start < len(conds); start += conditionChunkSize {
 		chunk := conds[start:min(start+conditionChunkSize, len(conds))]
-		args := make([]any, 0, len(chunk)*8)
-		for _, cond := range chunk {
-			args = append(args, id, cond.Type, cond.Status, cond.Reason, cond.Message,
-				cond.Liveness, now, now)
-		}
-		if _, err := c.ExecContext(ctx, `
-			INSERT INTO conditions
-				(object_id, type, status, reason, message, liveness,
-				 transitioned_at, updated_at)
-			VALUES `+tupleRows(len(chunk), 8)+`
-			ON CONFLICT(object_id, type) DO UPDATE SET
-				status = excluded.status, reason = excluded.reason,
-				message = excluded.message, liveness = excluded.liveness,
-				-- transitioned_at tracks when status last CHANGED: keep the prior value
-				-- unless the status differs from what's stored.
-				transitioned_at = CASE WHEN conditions.status <> excluded.status
-					THEN excluded.transitioned_at ELSE conditions.transitioned_at END,
-				updated_at = excluded.updated_at`, args...); err != nil {
+		if _, err := s.exec(ctx, stmtUpsertConditions, id, now, jsonConditionRows(chunk)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// jsonConditionRows marshals conditions as one JSON array of
+// [type, status, reason, message, liveness] rows.
+//
+// The one marshal helper that can be handed free text: message is whatever a
+// controller wrote. What makes it lossless is not the helper but the gate in
+// Conditions().Set, which refuses text that is not UTF-8 — JSON substitutes
+// U+FFFD for such bytes rather than failing.
+func jsonConditionRows(conds []storeapi.Condition) string {
+	rows := make([][5]any, len(conds))
+	for i, c := range conds {
+		rows[i] = [5]any{c.Type, c.Status, c.Reason, c.Message, c.Liveness}
+	}
+	out, _ := json.Marshal(rows)
+	return string(out)
 }
 
 func (s sqliteConditions) Delete(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, condType string) error {
@@ -3359,15 +3357,4 @@ func jsonList[T ~int64](values []T) string {
 func conditionTypeList(types []string) string {
 	out, _ := json.Marshal(types)
 	return string(out)
-}
-
-// placeholders builds "?, ?, ?" for n values, one row of a VALUES tuple set.
-func placeholders(n int) string {
-	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
-}
-
-// tupleRows builds "(?, ?), (?, ?)" for a VALUES list of rows tuples of cols
-// each. Zero rows yields an empty string, which no caller may emit.
-func tupleRows(rows, cols int) string {
-	return strings.TrimSuffix(strings.Repeat("("+placeholders(cols)+"), ", rows), ", ")
 }
