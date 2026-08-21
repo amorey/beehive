@@ -56,6 +56,9 @@ const (
 	stmtWriteLogMaxVersion
 	stmtWriteLogTrimmedThrough
 	stmtWriteLogKinds
+	stmtLatestEventRun
+	stmtLatestEventKey
+	stmtEventsMaxVersion
 
 	numStmts
 )
@@ -128,6 +131,12 @@ var stmtSQL = [numStmts]string{
 		SELECT trimmed_through FROM object_writes_horizon
 		 WHERE "group" = ? AND kind = ?`,
 	stmtWriteLogKinds: `SELECT DISTINCT "group", kind FROM object_writes`,
+
+	stmtLatestEventRun: `SELECT ` + eventColumns + ` FROM events WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`,
+	stmtLatestEventKey: `SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`,
+	stmtEventsMaxVersion: `SELECT MAX(resource_version) FROM events WHERE object_id = ?`,
 
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),

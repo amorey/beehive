@@ -2177,10 +2177,11 @@ func scanEventInto(sc scanner, e *storeapi.Event, extra ...any) error {
 // step could name an older run latest — and Events().Add would extend a run the log
 // has moved past. idx_events_latest serves this order.
 func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
-	row := s.read(ctx).QueryRowContext(ctx,
-		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
-		 ORDER BY id DESC LIMIT 1`, id, category)
-	e, err := scanEvent(row)
+	ps, err := s.stmtFor(ctx, stmtLatestEventRun)
+	if err != nil {
+		return nil, err
+	}
+	e, err := scanEvent(ps.QueryRowContext(ctx, id, category))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -2194,10 +2195,11 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 // ok=false on an empty timeline. Events().Add needs only the key; decoding columns
 // it would discard would let a decode fault mask the write.
 func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
-	row := s.read(ctx).QueryRowContext(ctx,
-		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
-		 ORDER BY id DESC LIMIT 1`, id, category)
-	err = row.Scan(&evID, &typ, &reason)
+	ps, err := s.stmtFor(ctx, stmtLatestEventKey)
+	if err != nil {
+		return 0, "", "", false, err
+	}
+	err = ps.QueryRowContext(ctx, id, category).Scan(&evID, &typ, &reason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, "", "", false, nil
 	}
@@ -2401,9 +2403,12 @@ func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, ca
 // alone; without it the plan fetches one table row per run, past overflow chains
 // (TestEventsMaxVersionUsesCoveringIndex pins the plan).
 func (s sqliteEvents) MaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
+	ps, err := s.stmtFor(ctx, stmtEventsMaxVersion)
+	if err != nil {
+		return 0, err
+	}
 	var rv sql.NullInt64
-	err := s.read(ctx).QueryRowContext(ctx,
-		`SELECT MAX(resource_version) FROM events WHERE object_id = ?`, id).Scan(&rv)
+	err = ps.QueryRowContext(ctx, id).Scan(&rv)
 	return rv.Int64, err
 }
 
