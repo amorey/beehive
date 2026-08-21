@@ -97,6 +97,10 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
+	// path is the absolute path this store holds in openPaths, empty for a
+	// memory store, which has no file to collide on.
+	path string
+
 	// readDB serves reads that are not inside a transaction. Aliased to db where
 	// the database cannot be opened twice (see OpenMemory).
 	readDB *sql.DB
@@ -122,6 +126,11 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
+	// Before the closes, so a reader-pool failure cannot leave the path claimed
+	// for the life of the process.
+	if s.path != "" {
+		releasePath(s.path, s)
+	}
 	// Readers first: they hold snapshots the writer's checkpoint waits on. The
 	// writer closes whatever happened above it, so a failed reader cannot leak it.
 	// Statements first: closing them frees the driver's compiled programs.

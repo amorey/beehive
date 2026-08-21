@@ -23,6 +23,8 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/amorey/beehive/internal/sqlitemigrate"
@@ -35,6 +37,51 @@ var migrations embed.FS
 // ErrInvalidOption reports an option value that has no meaning. Local to this
 // package: the store must not import the control plane.
 var ErrInvalidOption = errors.New("beehive/sqlite: option value is invalid")
+
+// ErrAlreadyOpen reports a second Open on a path this process already holds.
+var ErrAlreadyOpen = errors.New("beehive/sqlite: database is already open in this process")
+
+// abs is filepath.Abs, swapped by the test that covers an unresolvable path.
+var abs = filepath.Abs
+
+// openPaths is the store open on each path, so one process opens a database
+// once. Values, not a set: Close releases only its own claim, or a double Close
+// after a reopen would release the store that replaced it.
+var openPaths struct {
+	mu sync.Mutex
+	m  map[string]*sqliteStore
+}
+
+// claimPath reserves path for a store not yet built, so the claim covers the
+// migrations and the version seed rather than starting after them.
+func claimPath(path string) error {
+	openPaths.mu.Lock()
+	defer openPaths.mu.Unlock()
+	if _, held := openPaths.m[path]; held {
+		return fmt.Errorf("%w: %s", ErrAlreadyOpen, path)
+	}
+	if openPaths.m == nil {
+		openPaths.m = make(map[string]*sqliteStore)
+	}
+	openPaths.m[path] = nil
+	return nil
+}
+
+// holdPath names the store holding an already-claimed path.
+func holdPath(path string, s *sqliteStore) {
+	openPaths.mu.Lock()
+	defer openPaths.mu.Unlock()
+	openPaths.m[path] = s
+}
+
+// releasePath drops path if s holds it. A nil s releases a claim no store took.
+func releasePath(path string, s *sqliteStore) {
+	openPaths.mu.Lock()
+	defer openPaths.mu.Unlock()
+	if openPaths.m[path] == s {
+		delete(openPaths.m, path)
+	}
+}
 
 // defaultReadConnections is a guess: one connection already keeps reads out of
 // the writers' queue, and more helps only readers that genuinely overlap.
@@ -67,11 +114,28 @@ func Open(path string, opts ...Option) (*sqliteStore, error) {
 	if o.readConns < 1 {
 		return nil, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
 	}
+	// Two names for one file still evade this; it is a guardrail, not a boundary.
+	full, err := abs(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := claimPath(full); err != nil {
+		return nil, err
+	}
 	// The reader opens after the migrations, which run on the writer: one opened
 	// first would hold a schema that does not exist yet.
-	return open(sqlitemigrate.OpenPool(path, 1), func() *sql.DB {
+	s, err := open(sqlitemigrate.OpenPool(path, 1), func() *sql.DB {
 		return sqlitemigrate.OpenReadPool(path, o.readConns)
 	})
+	if err != nil {
+		// Here rather than in open's unwinds: three of the four close the pool
+		// directly and only the fourth reaches Close.
+		releasePath(full, nil)
+		return nil, err
+	}
+	s.path = full
+	holdPath(full, s)
+	return s, nil
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;

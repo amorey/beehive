@@ -176,3 +176,44 @@ func TestOpenReportsAMigrationFailure(t *testing.T) {
 	assert.Nil(t, store)
 	assert.Contains(t, err.Error(), "newer than binary supports")
 }
+
+// One process opens a store once. The path is the key, so two stores over one
+// file collide and two over different files do not.
+func TestOpenRefusesAPathAlreadyOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "b.db")
+
+	first, err := Open(path)
+	require.NoError(t, err)
+
+	_, err = Open(path)
+	require.ErrorIs(t, err, ErrAlreadyOpen)
+
+	require.NoError(t, first.Close())
+	reopened, err := Open(path)
+	require.NoError(t, err, "Close releases the path")
+	t.Cleanup(func() { assert.NoError(t, reopened.Close()) })
+}
+
+// A path that cannot be made absolute fails the open. Registering the raw path
+// would weaken the key and skipping registration would disable the check, so
+// neither silent answer is available.
+func TestOpenReportsAnUnresolvablePath(t *testing.T) {
+	restore := abs
+	abs = func(string) (string, error) { return "", errors.New("no working directory") }
+	t.Cleanup(func() { abs = restore })
+
+	_, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	require.ErrorContains(t, err, "no working directory")
+}
+
+// Every file::memory: store is its own database, so there is no path to collide
+// on — which is what keeps the suite running.
+func TestOpenMemoryStoresDoNotCollide(t *testing.T) {
+	first, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, first.Close()) })
+
+	second, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, second.Close()) })
+}
