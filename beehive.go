@@ -201,11 +201,18 @@ func (bh *Beehive) log() *slog.Logger {
 // that expires while the store is busy fails the start — a store *error* there
 // does not, since the waker is an optimisation.
 //
-// A store another Beehive is already running is ErrStoreInUse. That covers this
-// process only; keeping a second process off the database is the embedder's.
+// A store another Beehive is already running is ErrStoreInUse, and one whose
+// Identity is empty is ErrInvalidStoreIdentity. Both cover this process only;
+// keeping a second process off the database is the embedder's.
 //
 // The stop function returns ErrDrainIncomplete when its own ctx expired before
 // the loops drained. The store's claim is released either way.
+//
+// Calling stop more than once is safe, but only the first call owns the
+// teardown: the rest return nil at once rather than waiting for it. So a nil
+// from a second, concurrent call does not mean the claim is released, and a
+// caller starting another Beehive over the same store must wait on the owning
+// call's return.
 func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error, error) {
 	bh.mu.Lock()
 	defer bh.mu.Unlock()
@@ -468,9 +475,8 @@ var beehiveClaims claim.Set
 // claimStore reserves bh.store's database for bh.
 func (bh *Beehive) claimStore() error {
 	id := bh.store.Identity()
-	// "" names no database, so two unrelated stores would collide on it.
 	if id == "" {
-		return fmt.Errorf("beehive: store %T reports no identity", bh.store)
+		return fmt.Errorf("%w: %T", ErrInvalidStoreIdentity, bh.store)
 	}
 	held, ok := beehiveClaims.Take(id)
 	if !ok {

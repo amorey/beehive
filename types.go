@@ -191,6 +191,10 @@ var ErrNotLoaded = errors.New("beehive: secondary lookup not loaded")
 // cancelled and ending, but they have not ended.
 var ErrDrainIncomplete = errors.New("beehive: stopped before the reconcile loops drained")
 
+// ErrInvalidStoreIdentity is returned by Start when the store's Identity is
+// empty. "" names no database, so two unrelated stores would collide on it.
+var ErrInvalidStoreIdentity = errors.New("beehive: store reports no identity")
+
 // ErrStoreInUse is returned by Start when another Beehive is already running
 // over the store. Distinct from the "already started" error beside it: that one
 // reports misuse of this Beehive, which its caller can already see.

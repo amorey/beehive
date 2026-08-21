@@ -805,16 +805,29 @@ func TestStopLeavesAnotherBeehivesRegistration(t *testing.T) {
 // life of the process — but this is the one case where the guarantee lapses,
 // and nothing else records it.
 func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
 	logger, logs := captureLogger(slog.LevelWarn)
-	store := &fakeStore{}
+	store := newClientTestStore(t)
+
+	// A drain that cannot finish, so stop's select has one ready case. A
+	// controller that returns leaves both ready and the branch taken at random.
+	ctrl := &blockingController[cSpec, cStatus]{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(ctrl.release) })
 
 	bh := newTestBeehive(t, store, WithFullPassInterval(0), WithLogger(logger))
-	require.NoError(t, Register(bh, GroupKind{Kind: "Widget"}, &noopController[tSpec, tStatus]{}))
-	stop, err := bh.Start(context.Background())
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+	stop, err := bh.Start(ctx)
 	require.NoError(t, err)
 
-	expired, cancel := context.WithCancel(context.Background())
-	cancel()
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "held", cSpec{})
+	<-ctrl.entered
+
+	expired, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
 	err = stop(expired)
 	require.ErrorIs(t, err, context.Canceled, "the cause survives the wrap")
 	require.ErrorIs(t, err, ErrDrainIncomplete,
@@ -822,9 +835,9 @@ func TestStopReleasesTheStoreOnABlownDeadline(t *testing.T) {
 
 	assert.Contains(t, logs.String(), "store released before its loops drained")
 
-	stop2, err := newTestBeehive(t, store).Start(context.Background())
+	stop2, err := newTestBeehive(t, store).Start(ctx)
 	require.NoError(t, err, "a blown deadline must not lock the store out")
-	assert.NoError(t, stop2(context.Background()))
+	assert.NoError(t, stop2(ctx))
 }
 
 // A decorator reports what it wraps, so two beehives over one store through two
@@ -884,14 +897,63 @@ func TestStartRefusesAStoreWithNoIdentity(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := newTestBeehive(t, namelessStore{Store: &fakeStore{}}).Start(ctx)
-	require.ErrorContains(t, err, "reports no identity")
+	require.ErrorIs(t, err, ErrInvalidStoreIdentity)
 	assert.NotErrorIs(t, err, ErrStoreInUse)
 
 	// Nothing was taken, so the next one is unaffected.
 	_, err = newTestBeehive(t, namelessStore{Store: &fakeStore{}}).Start(ctx)
-	require.ErrorContains(t, err, "reports no identity")
+	require.ErrorIs(t, err, ErrInvalidStoreIdentity)
 
 	stop, err := newTestBeehive(t, &fakeStore{}).Start(ctx)
 	require.NoError(t, err)
 	assert.NoError(t, stop(ctx))
+}
+
+// A stop that does not own the teardown returns before the owner has released
+// the store — deliberately, since the early return is what keeps a non-owner
+// from blocking. Start's godoc says so, and this is what keeps that true: a
+// caller reading nil as "the store is free" would start the next Beehive too
+// early.
+func TestNonOwningStopReturnsBeforeTheStoreIsReleased(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+	defer cancel()
+
+	ctrl := &blockingController[cSpec, cStatus]{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	store := newClientTestStore(t)
+	bh := newTestBeehive(t, store)
+	require.NoError(t, Register(bh, clientTestGK, ctrl))
+
+	stop, err := bh.Start(ctx)
+	require.NoError(t, err)
+	mustCreate(t, ctx, NewClient[cSpec, cStatus](bh, clientTestGK), "held", cSpec{})
+	<-ctrl.entered // the drain now has something to wait for
+
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- stop(ctx) }()
+
+	// The owner takes the teardown under bh.mu before it drains, so wait for
+	// that rather than racing it.
+	for deadline := time.Now().Add(testTimeout); ; runtime.Gosched() {
+		bh.mu.Lock()
+		owned := bh.state == beehiveStopped
+		bh.mu.Unlock()
+		if owned {
+			break
+		}
+		require.False(t, time.Now().After(deadline), "the owner never took the teardown")
+	}
+
+	require.NoError(t, stop(ctx), "the non-owner returns rather than waiting")
+	_, err = newTestBeehive(t, store).Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse, "nil from a non-owner is not a released store")
+
+	close(ctrl.release)
+	require.NoError(t, <-ownerDone)
+
+	stopNext, err := newTestBeehive(t, store).Start(ctx)
+	require.NoError(t, err, "the owner's return is what frees the store")
+	assert.NoError(t, stopNext(ctx))
 }
