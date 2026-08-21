@@ -1861,10 +1861,12 @@ func (s sqliteConditions) Set(ctx context.Context, gk storeapi.GroupKind, id sto
 	}
 	seen := make(map[string]bool, len(conds))
 	for _, cond := range conds {
-		// The type is a lookup key, and conditionTypeList cannot carry one that
-		// is not text.
-		if !utf8.ValidString(cond.Type) {
-			return fmt.Errorf("%w: %q", storeapi.ErrInvalidConditionType, cond.Type)
+		// Every column below reaches the store through JSON, which substitutes
+		// U+FFFD for bytes that are not UTF-8 rather than failing.
+		for _, text := range []string{cond.Type, cond.Status, cond.Reason, cond.Message} {
+			if !utf8.ValidString(text) {
+				return fmt.Errorf("%w: %q", storeapi.ErrInvalidCondition, text)
+			}
 		}
 		if seen[cond.Type] {
 			return fmt.Errorf("%w: %q", storeapi.ErrDuplicateConditionType, cond.Type)

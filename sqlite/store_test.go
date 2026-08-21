@@ -9888,15 +9888,27 @@ func TestTheUnblockedTargetsReadSorts(t *testing.T) {
 // bytes that are not UTF-8 and json.Marshal substitutes U+FFFD, so a type that
 // survived the write would never be found again — and every Set would read the
 // condition as new, rewriting it and waking every watcher. Refused instead.
-func TestASetRefusesAConditionTypeThatIsNotText(t *testing.T) {
+func TestASetRefusesConditionTextThatIsNotText(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 
-	err := store.Conditions().Set(ctx, testGK, obj.ID,
-		storeapi.Condition{Type: "Ready\xff", Status: "True"})
-
-	assert.ErrorIs(t, err, storeapi.ErrInvalidConditionType)
+	// One case per column: a gate covering some of them is the failure mode, since
+	// every one of the four rides the same JSON array into the upsert.
+	for _, tc := range []struct {
+		name string
+		cond storeapi.Condition
+	}{
+		{"type", storeapi.Condition{Type: "Ready\xff", Status: "True"}},
+		{"status", storeapi.Condition{Type: "Ready", Status: "True\xff"}},
+		{"reason", storeapi.Condition{Type: "Ready", Status: "True", Reason: "Why\xff"}},
+		{"message", storeapi.Condition{Type: "Ready", Status: "True", Message: "bad\xffbyte"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := store.Conditions().Set(ctx, testGK, obj.ID, tc.cond)
+			assert.ErrorIs(t, err, storeapi.ErrInvalidCondition)
+		})
+	}
 }
 
 // The no-op suppression rests on the load finding what the upsert stored, so a
