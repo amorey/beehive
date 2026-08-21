@@ -470,6 +470,10 @@ func BenchmarkUnblockedTargets(b *testing.B) {
 
 // The two write paths the JSON tuple sets touch, at the sizes a delete cascade
 // runs them: one object, and a full markChunkSize level.
+//
+// The mark is measured directly, not through the cascade: a second cascade over
+// the same owner finds every child already pending and marks nothing, so driving
+// it that way would time the cascade's SELECT and never reach the statement.
 func BenchmarkDeletionMark(b *testing.B) {
 	for _, n := range []int{1, 128} {
 		b.Run(fmt.Sprintf("ids=%d", n), func(b *testing.B) { benchDeletionMark(b, n) })
@@ -482,24 +486,27 @@ func benchDeletionMark(b *testing.B, n int) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	owner, err := store.Objects().Create(ctx, testGK,
-		beehive.ObjectsCreateInput{Name: "owner", Spec: []byte(`{}`)})
-	require.NoError(b, err)
+	ids := make([]storeapi.ObjectID, 0, n)
 	for i := range n {
-		child, err := store.Objects().Create(ctx, testGK,
+		obj, err := store.Objects().Create(ctx, testGK,
 			beehive.ObjectsCreateInput{Name: fmt.Sprintf("c-%d", i), Spec: []byte(`{}`)})
 		require.NoError(b, err)
-		_, err = store.Edges().Add(ctx, child.ID, owner.ID, storeapi.RelationOwnedBy)
-		require.NoError(b, err)
+		ids = append(ids, obj.ID)
 	}
 
 	b.ResetTimer()
 	for range b.N {
-		// The children are already pending after the first pass, so this measures
-		// the statement over a level it re-reads rather than the first mark.
-		if _, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID); err != nil {
+		marked, err := store.markManyForDeletion(ctx, ids)
+		if err != nil {
 			b.Fatal(err)
 		}
+		if len(marked) != n {
+			b.Fatalf("marked %d of %d: the statement is not being exercised", len(marked), n)
+		}
+		b.StopTimer()
+		_, err = store.db.ExecContext(ctx, `UPDATE objects SET deletion_requested_at = NULL`)
+		require.NoError(b, err)
+		b.StartTimer()
 	}
 }
 
