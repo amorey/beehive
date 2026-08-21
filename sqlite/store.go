@@ -1432,7 +1432,9 @@ func writeLogPageCap(limit int) int { return min(limit, 1024) }
 // nothing when the page has none. op identifies them without reading the blob,
 // which is why it is in the covering index.
 func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWrite) error {
-	deletes := make([]int64, 0, len(page))
+	// Nil until a delete turns up: a page holds none in the common case, and
+	// this runs on every page both the waker and the tailers read.
+	var deletes []int64
 	for _, w := range page {
 		if w.Op == storeapi.WriteDelete {
 			deletes = append(deletes, w.ResourceVersion)
