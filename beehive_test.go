@@ -729,3 +729,54 @@ func TestRegisterInheritsIndividualPassInterval(t *testing.T) {
 	assert.NotNil(t, bh.reconcilers[inherited].individualPassRand, "the jitter source is seeded")
 	assert.Equal(t, time.Second, bh.reconcilers[overridden].individualPassInterval)
 }
+
+// One store, one running Beehive. The in-memory indexes a later pass builds are
+// correct only under that rule, so a second Start says so rather than running.
+func TestStartRefusesAStoreAlreadyRunning(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	first := newTestBeehive(t, store)
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, stop(ctx)) })
+
+	second := newTestBeehive(t, store)
+	_, err = second.Start(ctx)
+	assert.ErrorIs(t, err, ErrStoreInUse)
+	assert.NotErrorIs(t, err, context.Canceled,
+		"a store owned elsewhere is not a start that began work and aborted")
+}
+
+// The restart: a stopped Beehive leaves its store to the next one. This is the
+// ordinary process restart, and it must stay easy.
+func TestStartAfterStopReclaimsTheStore(t *testing.T) {
+	store := &fakeStore{}
+	ctx := context.Background()
+
+	first := newTestBeehive(t, store)
+	stop, err := first.Start(ctx)
+	require.NoError(t, err)
+	require.NoError(t, stop(ctx))
+
+	second := newTestBeehive(t, store)
+	stop2, err := second.Start(ctx)
+	require.NoError(t, err)
+	assert.NoError(t, stop2(ctx))
+}
+
+// A start that claimed the store and then failed leaves it startable. abort
+// does not set bh.state, so the retry is a supported path.
+func TestStartAbortReleasesTheStore(t *testing.T) {
+	store := &fakeStore{}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	bh := newTestBeehive(t, store)
+	_, err := bh.Start(cancelled)
+	require.ErrorIs(t, err, context.Canceled)
+
+	stop, err := bh.Start(context.Background())
+	require.NoError(t, err, "the aborted start released the store")
+	assert.NoError(t, stop(context.Background()))
+}

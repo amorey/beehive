@@ -206,6 +206,12 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 		return nil, fmt.Errorf("beehive: already started")
 	}
 
+	// Before the first store read, and returned bare: abort frames a start that
+	// began work, and this one never did.
+	if err := claimStore(bh); err != nil {
+		return nil, err
+	}
+
 	bh.logger = logging.Resolve(bh.logger, bh.logLevel)
 
 	// runCtx lives for the lifetime of the control plane; Stop cancels it.
@@ -215,6 +221,9 @@ func (bh *Beehive) Start(startCtx context.Context) (func(context.Context) error,
 	abort := func(err error) error {
 		bh.waker.teardown() // a no-op before prime
 		cancel()
+		// bh.state is not set here, so the caller may retry — which needs the
+		// store back.
+		releaseStore(bh)
 		return fmt.Errorf("beehive: start aborted: %w", err)
 	}
 	if err := startCtx.Err(); err != nil {
@@ -417,6 +426,10 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// allows: the racing send either publishes or answers ErrClosed, never both
 	// and never partially. Which one wins is unspecified and nothing here needs
 	// it pinned, since every stream is ending.
+	// After the drain, or a second Start could take the store while these loops
+	// are still running.
+	releaseStore(bh)
+
 	bh.kindWriteHub.Close()
 	bh.eventWriteHub.Close()
 
@@ -425,6 +438,36 @@ func (bh *Beehive) stop(ctx context.Context) error {
 	// report the work queue instead and end here, after their final value.
 	bh.log().Info("control plane stopped")
 	return drainErr
+}
+
+// runningStores is the Beehive running over each store, so one store has one
+// control plane. Only this process is covered: isolating the process from
+// another is the embedder's, and README.md says so.
+var runningStores struct {
+	mu sync.Mutex
+	m  map[Store]*Beehive
+}
+
+// claimStore reserves bh.store for bh. A non-comparable Store would panic as a
+// key; every implementation is a pointer.
+func claimStore(bh *Beehive) error {
+	runningStores.mu.Lock()
+	defer runningStores.mu.Unlock()
+	if held, running := runningStores.m[bh.store]; running {
+		return fmt.Errorf("%w (running %p)", ErrStoreInUse, held)
+	}
+	if runningStores.m == nil {
+		runningStores.m = make(map[Store]*Beehive)
+	}
+	runningStores.m[bh.store] = bh
+	return nil
+}
+
+// releaseStore drops bh's claim.
+func releaseStore(bh *Beehive) {
+	runningStores.mu.Lock()
+	defer runningStores.mu.Unlock()
+	delete(runningStores.m, bh.store)
 }
 
 // New creates a control plane backed by store s. Register controllers on the
