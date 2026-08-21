@@ -468,6 +468,11 @@ var beehiveClaims claim.Set
 // claimStore reserves bh.store's database for bh.
 func (bh *Beehive) claimStore() error {
 	id := bh.store.Identity()
+	// Refused rather than claimed: "" names no database, so two unrelated
+	// stores would collide on it — and it is what an unclaimed bh.claim is.
+	if id == "" {
+		return fmt.Errorf("beehive: store %T reports no identity", bh.store)
+	}
 	if !beehiveClaims.Take(id) {
 		return ErrStoreInUse
 	}

@@ -871,3 +871,27 @@ func TestConcurrentStopReleasesTheStoreOnce(t *testing.T) {
 	_, err = newTestBeehive(t, store).Start(ctx)
 	assert.ErrorIs(t, err, ErrStoreInUse)
 }
+
+// namelessStore reports the identity of no database.
+type namelessStore struct{ Store }
+
+func (namelessStore) Identity() string { return "" }
+
+// "" is both a claim nobody can hold and the record of holding none, so taking
+// it would strand the key for the life of the process. Refused at the claim,
+// which is also the only way two unrelated stores do not collide on it.
+func TestStartRefusesAStoreWithNoIdentity(t *testing.T) {
+	ctx := context.Background()
+
+	_, err := newTestBeehive(t, namelessStore{Store: &fakeStore{}}).Start(ctx)
+	require.ErrorContains(t, err, "reports no identity")
+	assert.NotErrorIs(t, err, ErrStoreInUse)
+
+	// Nothing was taken, so the next one is unaffected.
+	_, err = newTestBeehive(t, namelessStore{Store: &fakeStore{}}).Start(ctx)
+	require.ErrorContains(t, err, "reports no identity")
+
+	stop, err := newTestBeehive(t, &fakeStore{}).Start(ctx)
+	require.NoError(t, err)
+	assert.NoError(t, stop(ctx))
+}
