@@ -64,6 +64,10 @@ const (
 	stmtEdgesListOutgoingByRelation
 	stmtEdgesHasIncoming
 	stmtEdgesDeleteFinalizingDependsOn
+	stmtDecrementOwed
+	stmtWatermarkSet
+	stmtProbeDeletionByName
+	stmtOverCapTimelines
 
 	numStmts
 )
@@ -166,6 +170,20 @@ var stmtSQL = [numStmts]string{
 		WHERE to_id = ? AND relation = ?
 		  AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
 
+	stmtDecrementOwed: `UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0)
+		 WHERE id = ? AND "group" = ? AND kind = ?`,
+	stmtWatermarkSet: `
+		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
+		SELECT ?, ?, ?
+		 WHERE EXISTS (SELECT 1 FROM edges WHERE from_id = ? AND relation = 'depends_on')
+		    ON CONFLICT(object_id) DO UPDATE
+		   SET reconciled_against = excluded.reconciled_against,
+		       reconciled_at      = excluded.reconciled_at
+		 WHERE excluded.reconciled_against > dependency_watermarks.reconciled_against`,
+	stmtProbeDeletionByName: `SELECT deletion_requested_at FROM objects
+		 WHERE "group" = ? AND kind = ? AND name = ?`,
+	stmtOverCapTimelines: eventCapCandidates,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -200,6 +218,8 @@ var stmtWrites = [numStmts]bool{
 	stmtSetDriverCursor:       true,
 
 	stmtEdgesDeleteFinalizingDependsOn: true,
+	stmtDecrementOwed:                  true,
+	stmtWatermarkSet:                   true,
 }
 
 // stmtSet is one pool's preparations.
