@@ -393,7 +393,7 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   through it; the reader's once `Open` has a read pool. Preparing compiles on the
   one connection it grabs, so the reader's others compile at first use — a
   warm-up through `Conn.QueryContext` cannot change that and was removed.
-  **Text rendered from a runtime count is not a field** — six functions, pinned
+  **Text rendered from a runtime count is not a field** — two functions, pinned
   by `TestOnlyRenderedSQLLivesInAFunction`, which fails on SQL left inside a
   function. Nothing new is promised about concurrency: a transaction ctx already
   belongs to one goroutine. → [ADR](docs/adr/2026-08-21-prepare-every-constant-statement.md)
@@ -403,7 +403,13 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   JSON string takes TEXT affinity and matches no INTEGER column, silently. The one
   plan traded away is `unblockedTargets`', which sorts at every length now that a
   list of one cannot fold into an equality; it is faster regardless.
-  → [ADR](docs/adr/2026-08-21-bind-an-id-list-as-json.md)
+  → [ADR](docs/adr/2026-08-21-bind-an-id-list-as-json.md) **A `VALUES` tuple set
+  binds the same way**, widened with `->>`: four more statements became fields,
+  the deletion mark's plan improved (no `MATERIALIZE`), and an empty `keep`
+  stopped being a special case, since `NOT IN` over an empty array is valid where
+  `NOT IN (VALUES)` is a syntax error. Three non-generic marshal helpers, one per
+  shape — never one widened generic, which is what let condition types reach a
+  lossy encoder. → [ADR](docs/adr/2026-08-21-bind-the-tuple-sets-as-json.md)
 - **Reads run on their own connections.** The writer is one connection; reads
   that are not inside a transaction run on a read-only pool of
   `WithReadConnections` (4 by default), so they no longer queue behind writes.

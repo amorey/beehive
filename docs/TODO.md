@@ -466,3 +466,41 @@ moves to [`reconcile-triggers.md`](reconcile-triggers.md) once the code exists.
   already has the cadence and the per-sweep budget to hang it on. What would make
   it worth doing: a plan that measurably degrades on a large, long-lived store.
   Nobody has run one that long, which is the actual gap here.
+
+- **`Events().List` stays rendered. Preparation would help it; the rewrite that
+  makes preparation possible costs more than preparation saves.** Its `WHERE` is
+  assembled from four optional predicates and an optional `LIMIT`, so its text
+  varies with the query. The constant form is `(?N IS NULL OR col = ?N)` per
+  predicate with `LIMIT` bound to −1.
+
+  Measured with the two variables separated — today's text and the constant
+  text, each unprepared and prepared. Two runs agreeing within 2%:
+
+  | runs | query | today | today, prepared | constant | constant, prepared |
+  |---|---|---|---|---|---|
+  | 16 | unfiltered | 53.9 µs | 35.4 µs | 98.6 µs | 70.4 µs |
+  | 16 | category | 30.6 µs | 10.1 µs | 79.4 µs | 51.3 µs |
+  | 1000 | unfiltered | 2028 µs | 1996 µs | 3374 µs | 2874 µs |
+  | 1000 | category | 409 µs | 383 µs | 846 µs | 817 µs |
+
+  Preparation behaves here as everywhere else: −34% and −67% on short timelines,
+  fading to 1.5–6% at a thousand runs, because the parse is a fixed cost and
+  matters in proportion to how little else the query does. The rewrite is what
+  loses — 66–160% for the per-row `OR` evaluation, and on the filtered shapes for
+  dropping `idx_events_object_cat (object_id=?, category=?, last_at>?)` to a scan
+  of the whole timeline plus a sort. Net, the rewrite outweighs the win.
+
+  **A statement per query shape would capture the middle column**, since for any
+  fixed shape today's text is already constant. It is declined on shape, not on
+  speed: four optional predicates plus the limit is 32 combinations, against a
+  design that keeps one named slot per statement and no runtime dispatch. And the
+  win inverts with cost — biggest where the call is already cheap, near nothing
+  where it is expensive.
+
+  **What would change this** is a batched events read. `WithEvents` over a list
+  issues one query per object (`client.go:820`, already flagged there as the
+  deliberate exception), and that is where the unfiltered shape compounds. An
+  `Events().ListByIDs` alongside `Objects().ListByIDs` would have constant text,
+  prepare as one statement, and remove the N+1 rather than making it 34% cheaper.
+  That is the spec to write if event reads ever measure hot; preparing this one
+  is not.

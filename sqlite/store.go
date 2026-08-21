@@ -908,17 +908,12 @@ type loggedWrite struct {
 
 // appendWriteLogUpdates records one update entry per write in a single INSERT.
 // Each carries the version its own row took: a batch shares a draw, never a value.
-func appendWriteLogUpdates(ctx context.Context, c dbtx, writes []loggedWrite, now int64) error {
+func (s *sqliteStore) appendWriteLogUpdates(ctx context.Context, writes []loggedWrite, now int64) error {
 	if len(writes) == 0 {
 		return nil
 	}
-	args := make([]any, 0, len(writes)*6)
-	for _, w := range writes {
-		// The soft delete is an update: the row is still live and readable.
-		args = append(args, w.rv, w.id, w.gk.Group, w.gk.Kind, writeOpUpdate, now)
-	}
-	_, err := c.ExecContext(ctx,
-		`INSERT INTO object_writes (`+objectWritesColumns+`) VALUES `+tupleRows(len(writes), 6), args...)
+	// The soft delete is an update: the row is still live and readable.
+	_, err := s.exec(ctx, stmtAppendWriteLogUpdates, writeOpUpdate, now, jsonWriteLogRows(writes))
 	return err
 }
 
@@ -1218,27 +1213,10 @@ func (s sqliteReconcileOwed) Stamp(ctx context.Context, refs []storeapi.ObjectRe
 	return err
 }
 
-// reconcileOwedSweepQuery builds the reclaim. The test that pins its query plan
-// calls this too, so the plan it pins is the one that runs.
-func reconcileOwedSweepQuery(keep []storeapi.GroupKind) (string, []any) {
-	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
-	q := `UPDATE objects SET reconcile_owed = 0 WHERE reconcile_owed != 0`
-	if len(keep) == 0 {
-		return q, nil // NOT IN (VALUES) is a syntax error, and nothing is kept
-	}
-	values, args := kindTuples(keep)
-	return q + ` AND ("group", kind) NOT IN (VALUES ` + values + `)`, args
-}
-
 // ReconcileOwed().Sweep zeroes the owed count outside keep in one no-emit UPDATE
 // (contract on storeapi.Store).
 func (s sqliteReconcileOwed) Sweep(ctx context.Context, keep []storeapi.GroupKind) (int, error) {
-	q, args := reconcileOwedSweepQuery(keep)
-	c, err := s.conn(ctx)
-	if err != nil {
-		return 0, err
-	}
-	res, err := c.ExecContext(ctx, q, args...)
+	res, err := s.exec(ctx, stmtOwedSweep, jsonKinds(keep))
 	if err != nil {
 		return 0, err
 	}
@@ -1291,24 +1269,8 @@ func (s sqliteDependencies) ListStaleSince(ctx context.Context, kinds []storeapi
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, after, nil
 	}
-	values, kindArgs := kindTuples(kinds)
-	args := make([]any, 0, len(kinds)*2+5)
-	args = append(args, after.TargetVersion, after.TargetID, after.DependentID, through)
-	args = append(args, kindArgs...)
-	args = append(args, limit)
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
-		  FROM objects t
-		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
-		  CROSS JOIN objects d ON d.id = e.from_id
-		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
-		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
-		   AND t.resource_version <= ?
-		   AND e.from_id != e.to_id
-		   AND (d."group", d.kind) IN (VALUES `+values+`)
-		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
-		 ORDER BY t.resource_version, t.id, e.from_id
-		 LIMIT ?`, args...)
+	rows, err := s.query(ctx, stmtListStaleSince,
+		after.TargetVersion, after.TargetID, after.DependentID, through, jsonKinds(kinds), limit)
 	if err != nil {
 		return nil, after, err
 	}
@@ -2457,9 +2419,9 @@ func (s *sqliteStore) markForDeletion(ctx context.Context, stmt stmtID, whereArg
 	return id, true, nil
 }
 
-// markChunkSize bounds the ids bound per batched deletion mark: a measured
-// optimum, and the mark still renders a tuple per id. A var so tests can shrink
-// it. See docs/adr/2026-07-30-store-write-shapes.md.
+// markChunkSize bounds the ids per batched deletion mark: a measured optimum for
+// the write, never a parameter ceiling. A var so tests can shrink it.
+// See docs/adr/2026-07-30-store-write-shapes.md.
 var markChunkSize = 128
 
 // markManyForDeletion is markForDeletion over a set: it stamps every id whose
@@ -2473,8 +2435,8 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	c, err := s.conn(ctx)
-	if err != nil {
+	// Ahead of the draw, so a doomed call burns no versions.
+	if err := s.refuseWriteInReadFrame(ctx); err != nil {
 		return nil, err
 	}
 	now := toMillis(time.Now().UTC())
@@ -2486,7 +2448,7 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 	marked := make(map[storeapi.ObjectID]bool, len(ids))
 	for start := 0; start < len(ids); start += markChunkSize {
 		chunk := ids[start:min(start+markChunkSize, len(ids))]
-		if err := s.markManyForDeletionChunk(ctx, c, chunk, first+int64(start), now, marked); err != nil {
+		if err := s.markManyForDeletionChunk(ctx, chunk, first+int64(start), now, marked); err != nil {
 			return nil, err
 		}
 	}
@@ -2494,38 +2456,22 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 }
 
 // markManyForDeletionChunk stamps one chunk, handing chunk[i] version first+i.
-// The assignment rides a joined VALUES list, never a CASE over the id, which is
-// quadratic in the chunk. A row the IS NULL guard skips leaves its assigned
-// version unused; the resulting gap is harmless, since consumers seek with `>`.
 // See docs/adr/2026-07-30-store-write-shapes.md.
 func (s *sqliteStore) markManyForDeletionChunk(
 	ctx context.Context,
-	c dbtx,
 	ids []storeapi.ObjectID,
 	first, now int64,
 	marked map[storeapi.ObjectID]bool,
 ) error {
-	args := make([]any, 0, len(ids)*2+2)
-	for i, id := range ids {
-		args = append(args, id, first+int64(i))
-	}
-	args = append(args, now, now)
-	// RETURNING, not RowsAffected: the log entries need each row's identity and
-	// the version it actually took.
 	// Drained and closed before the insert below, which needs the single conn.
-	stamped, err := scanLoggedWrites(c.QueryContext(ctx,
-		`WITH assigned(mark_id, mark_rv) AS (VALUES `+tupleRows(len(ids), 2)+`)
-		UPDATE objects SET deletion_requested_at = ?, updated_at = ?, resource_version = assigned.mark_rv
-		FROM assigned
-		WHERE objects.id = assigned.mark_id AND objects.deletion_requested_at IS NULL
-		RETURNING objects.id, objects."group", objects.kind, objects.resource_version`, args...))
+	stamped, err := scanLoggedWrites(s.query(ctx, stmtMarkManyForDeletion, now, jsonMarkPairs(ids, first)))
 	if err != nil {
 		return err
 	}
 	for _, w := range stamped {
 		marked[w.id] = true
 	}
-	return appendWriteLogUpdates(ctx, c, stamped, now)
+	return s.appendWriteLogUpdates(ctx, stamped, now)
 }
 
 // probeDeletionByName is probeObjectScoped keyed by name; a name this kind does
@@ -3357,6 +3303,43 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 	return s.listObjects(ctx, stmtListObjectsByIDs, jsonList(ids), gk.Group, gk.Kind)
 }
 
+// jsonWriteLogRows marshals a batch of log entries as one JSON array, in
+// objectWritesColumns' order. group and kind are identifiers from Register, not
+// caller data, so JSON carries them whole.
+func jsonWriteLogRows(writes []loggedWrite) string {
+	rows := make([][4]any, len(writes))
+	for i, w := range writes {
+		rows[i] = [4]any{w.rv, int64(w.id), w.gk.Group, w.gk.Kind}
+	}
+	out, _ := json.Marshal(rows)
+	return string(out)
+}
+
+// jsonMarkPairs marshals the deletion mark's assignments as one JSON array of
+// [id, version] pairs: chunk[i] takes first+i. Integers only, so marshalling
+// cannot fail.
+func jsonMarkPairs(ids []storeapi.ObjectID, first int64) string {
+	pairs := make([][2]int64, len(ids))
+	for i, id := range ids {
+		pairs[i] = [2]int64{int64(id), first + int64(i)}
+	}
+	out, _ := json.Marshal(pairs)
+	return string(out)
+}
+
+// jsonKinds marshals kinds as one JSON array of [group, kind] pairs, for a
+// `(group, kind) IN (SELECT value ->> 0, value ->> 1 FROM json_each(?))` set.
+// The values come from Register, never from caller data, so they are identifiers
+// and marshalling them cannot lose bytes JSON has no room for.
+func jsonKinds(kinds []storeapi.GroupKind) string {
+	pairs := make([][2]string, len(kinds))
+	for i, gk := range kinds {
+		pairs[i] = [2]string{gk.Group, gk.Kind}
+	}
+	out, _ := json.Marshal(pairs)
+	return string(out)
+}
+
 // jsonList marshals an IN list's ids as one JSON array, for
 // `IN (SELECT value FROM json_each(?))`. Numbers stay numbers: json_each gives a
 // JSON string TEXT affinity, which matches no INTEGER column. Integers cannot
@@ -3385,13 +3368,4 @@ func placeholders(n int) string {
 // each. Zero rows yields an empty string, which no caller may emit.
 func tupleRows(rows, cols int) string {
 	return strings.TrimSuffix(strings.Repeat("("+placeholders(cols)+"), ", rows), ", ")
-}
-
-// kindTuples builds a VALUES list of kinds with the args to fill it.
-func kindTuples(kinds []storeapi.GroupKind) (string, []any) {
-	args := make([]any, 0, len(kinds)*2)
-	for _, gk := range kinds {
-		args = append(args, gk.Group, gk.Kind)
-	}
-	return tupleRows(len(kinds), 2), args
 }
