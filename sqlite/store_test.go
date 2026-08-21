@@ -6971,23 +6971,15 @@ func TestDependentsListStaleSinceDrivesFromTheVersionIndex(t *testing.T) {
 	store := newRawStore(t)
 	newDependentObject(t, store, newRefObject(t, store).ID)
 
-	plan := queryPlan(t, store, `
-		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
-		  FROM objects t
-		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
-		  CROSS JOIN objects d ON d.id = e.from_id
-		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
-		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
-		   AND t.resource_version <= ?
-		   AND e.from_id != e.to_id
-		   AND (d."group", d.kind) IN (VALUES (?, ?))
-		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
-		 ORDER BY t.resource_version, t.id, e.from_id
-		 LIMIT ?`,
-		int64(0), int64(0), int64(0), int64(9000), testGK.Group, testGK.Kind, 10)
+	// The field the store issues, not a copy: the text is long-lived now, so a
+	// test carrying its own string would pass while the store ran something else.
+	plan := queryPlan(t, store, stmtSQL[stmtListStaleSince],
+		int64(0), int64(0), int64(0), int64(9000), jsonKinds([]beehive.GroupKind{testGK}), 10)
 
 	assert.Contains(t, plan, "idx_objects_rv", "the scan must seek targets by version:\n"+plan)
 	assert.NotContains(t, plan, "SCAN t", "and must not read every object:\n"+plan)
+	assert.Contains(t, plan, "idx_edges_to", "the edge seek survives the JSON list:\n"+plan)
+	assert.NotContains(t, plan, "TEMP B-TREE", "the cursor still delivers its own order:\n"+plan)
 }
 
 // TestDependentsListStaleSinceSkipsConvergedAndSpentPositions covers the two ways
@@ -9633,7 +9625,6 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 // statement per arity would fill the table with single-use entries.
 var renderedSQLSites = []string{
 	"appendWriteLogUpdates",
-	"sqliteDependencies.ListStaleSince",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
 	"sqliteStore.markManyForDeletionChunk",

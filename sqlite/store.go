@@ -1274,24 +1274,8 @@ func (s sqliteDependencies) ListStaleSince(ctx context.Context, kinds []storeapi
 	if len(kinds) == 0 || limit <= 0 {
 		return nil, after, nil
 	}
-	values, kindArgs := kindTuples(kinds)
-	args := make([]any, 0, len(kinds)*2+5)
-	args = append(args, after.TargetVersion, after.TargetID, after.DependentID, through)
-	args = append(args, kindArgs...)
-	args = append(args, limit)
-	rows, err := s.read(ctx).QueryContext(ctx, `
-		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
-		  FROM objects t
-		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
-		  CROSS JOIN objects d ON d.id = e.from_id
-		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
-		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
-		   AND t.resource_version <= ?
-		   AND e.from_id != e.to_id
-		   AND (d."group", d.kind) IN (VALUES `+values+`)
-		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
-		 ORDER BY t.resource_version, t.id, e.from_id
-		 LIMIT ?`, args...)
+	rows, err := s.query(ctx, stmtListStaleSince,
+		after.TargetVersion, after.TargetID, after.DependentID, through, jsonKinds(kinds), limit)
 	if err != nil {
 		return nil, after, err
 	}
@@ -3381,13 +3365,4 @@ func placeholders(n int) string {
 // each. Zero rows yields an empty string, which no caller may emit.
 func tupleRows(rows, cols int) string {
 	return strings.TrimSuffix(strings.Repeat("("+placeholders(cols)+"), ", rows), ", ")
-}
-
-// kindTuples builds a VALUES list of kinds with the args to fill it.
-func kindTuples(kinds []storeapi.GroupKind) (string, []any) {
-	args := make([]any, 0, len(kinds)*2)
-	for _, gk := range kinds {
-		args = append(args, gk.Group, gk.Kind)
-	}
-	return tupleRows(len(kinds), 2), args
 }

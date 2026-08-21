@@ -127,6 +127,7 @@ const (
 	stmtStampOwedForNewEdge
 	stmtClearWatermarkForNewEdge
 	stmtWatermarkSet
+	stmtListStaleSince
 
 	stmtDrawResourceVersions
 
@@ -446,6 +447,23 @@ var stmtSQL = [numStmts]string{
 	stmtClearWatermarkForNewEdge: `
 		DELETE FROM dependency_watermarks
 		 WHERE object_id = ? AND ` + edgeIsNew,
+	// The CROSS JOINs pin the join order: targets, then incoming edges, then
+	// dependents. Without them the planner reads the whole graph and the cursor
+	// buys nothing. No GROUP BY: a row is one (target, dependent) pair, and the
+	// position needs both to resume.
+	stmtListStaleSince: `
+		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
+		  FROM objects t
+		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
+		  CROSS JOIN objects d ON d.id = e.from_id
+		  LEFT JOIN dependency_watermarks c ON c.object_id = e.from_id
+		 WHERE (t.resource_version, t.id, e.from_id) > (?, ?, ?)
+		   AND t.resource_version <= ?
+		   AND e.from_id != e.to_id
+		   AND (d."group", d.kind) IN (SELECT value ->> 0, value ->> 1 FROM json_each(?))
+		   AND (c.reconciled_against IS NULL OR t.resource_version > c.reconciled_against)
+		 ORDER BY t.resource_version, t.id, e.from_id
+		 LIMIT ?`,
 	stmtWatermarkSet: `
 		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
 		SELECT ?, ?, ?
