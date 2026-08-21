@@ -9686,9 +9686,8 @@ func TestEveryStatementIsClassifiedByItsOwnText(t *testing.T) {
 // The statement sets carry the same hazard st.tx does: reached directly, a
 // write-set statement runs on the writer's pool connection rather than the
 // ambient transaction — the silent wrong-connection read stmtFor exists to
-// prevent. Only the three functions that build, route and release them may
-// name them.
-func TestTheStatementSetsHaveThreeUsers(t *testing.T) {
+// prevent. Only the functions that build, route and release them may name them.
+func TestTheStatementSetsHaveFiveUsers(t *testing.T) {
 	seen := map[string]bool{}
 	require.NoError(t, inspectPackage(t, func(fn, recv string, n ast.Node) {
 		sel, ok := n.(*ast.SelectorExpr)
