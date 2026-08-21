@@ -27,6 +27,7 @@ import (
 type stmtID int
 
 const (
+	// The single-object reads.
 	stmtGetObjectRow stmtID = iota
 	stmtIncrementOwed
 	stmtCheckObjectExists
@@ -34,54 +35,66 @@ const (
 	stmtGetForReconcile
 	stmtListUnsettledIDs
 	stmtListIDs
+
 	// The scoped reads: one per column list selectScoped is asked for.
 	stmtScopedGate
 	stmtScopedDeletion
 	stmtScopedGeneration
 	stmtScopedStatus
 	stmtScopedFinalizers
+
+	// The multi-row object reads.
 	stmtListObjects
 	stmtListObjectsByIncomingEdge
+
+	// The object writes.
 	stmtInsertObject
 	stmtSetObservedGeneration
 	stmtUpdateStatus
+	stmtUpdateSpec
+	stmtBumpObject
+	stmtSetFinalizers
+	stmtDeleteObject
+
+	// The deletion mark and what reads it.
+	stmtMarkForDeletionByID
+	stmtMarkForDeletionByName
+	stmtProbeDeletionByName
 	stmtListDeletionRequests
+
+	// reconcile_owed.
 	stmtListOwedIDs
+	stmtDecrementOwed
+
 	stmtLoadConditions
 	stmtDeleteCondition
+
 	stmtGetDriverCursor
 	stmtSetDriverCursor
+
+	// The write log and its horizon.
 	stmtWriteLogMaxVersionAll
 	stmtWriteLogListSinceAll
 	stmtWriteLogMaxVersion
 	stmtWriteLogTrimmedThrough
 	stmtWriteLogKinds
+	stmtWriteLogPage
+	stmtAppendWriteLog
+	stmtAppendWriteLogDelete
+	stmtRaiseWriteLogHorizon
+	// deleteWriteLogRows runs one of two predicates, both RETURNING.
+	stmtTrimWriteLogByAge
+	stmtTrimWriteLogOverCap
+
+	// The event log and its horizon.
 	stmtLatestEventRun
 	stmtLatestEventKey
 	stmtEventsMaxVersion
-	stmtEdgesListIncoming
-	stmtEdgesListOutgoing
-	stmtEdgesListOutgoingByRelation
-	stmtEdgesHasIncoming
-	stmtEdgesDeleteFinalizingDependsOn
-	stmtDecrementOwed
-	stmtWatermarkSet
-	stmtProbeDeletionByName
-	stmtOverCapTimelines
-	stmtEdgeEndpointsForAdd
-	stmtStampOwedForNewEdge
-	stmtClearWatermarkForNewEdge
-	stmtInsertEdge
-	stmtDeleteEdge
-	stmtEdgeEndpointsForDelete
-	stmtAppendWriteLog
-	stmtAppendWriteLogDelete
-	stmtDrawResourceVersions
-	stmtBumpObject
-	stmtWriteLogPage
 	stmtEventPage
 	stmtEventHorizon
-	stmtRaiseWriteLogHorizon
+	stmtExtendEventRun
+	stmtInsertEventRun
+	stmtOverCapTimelines
 	// trimEvents runs two statements over one predicate: the horizon raise, then
 	// the delete. One pair per predicate, kept adjacent so an edit cannot split
 	// them.
@@ -89,161 +102,170 @@ const (
 	stmtTrimEventsByAge
 	stmtRaiseEventHorizonOverCap
 	stmtTrimEventsOverCap
-	stmtUpdateSpec
-	stmtExtendEventRun
-	stmtInsertEventRun
-	stmtMarkForDeletionByID
-	stmtMarkForDeletionByName
-	stmtSetFinalizers
-	stmtDeleteObject
+
+	// The edges, and the dependency watermark that moves with them.
+	stmtEdgesListIncoming
+	stmtEdgesListOutgoing
+	stmtEdgesListOutgoingByRelation
 	stmtListOwnedChildren
-	// deleteWriteLogRows runs one of two predicates, both RETURNING.
-	stmtTrimWriteLogByAge
-	stmtTrimWriteLogOverCap
+	stmtEdgesHasIncoming
+	stmtEdgesDeleteFinalizingDependsOn
+	stmtEdgeEndpointsForAdd
+	stmtEdgeEndpointsForDelete
+	stmtInsertEdge
+	stmtDeleteEdge
+	stmtStampOwedForNewEdge
+	stmtClearWatermarkForNewEdge
+	stmtWatermarkSet
+
+	stmtDrawResourceVersions
 
 	numStmts
 )
 
 // stmtSQL is every prepared statement's text, indexed by stmtID.
 var stmtSQL = [numStmts]string{
-	stmtGetObjectRow:  `SELECT ` + objectColumns + ` FROM objects WHERE id = ?`,
-	stmtIncrementOwed: `UPDATE objects SET reconcile_owed = reconcile_owed + 1 WHERE id = ?`,
-
-	stmtCheckObjectExists:  `SELECT 1 FROM objects WHERE id = ?`,
-	stmtGetObjectRowByName: `SELECT ` + objectColumns + ` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
+	stmtGetObjectRow: `
+		SELECT ` + objectColumns + `
+		  FROM objects
+		 WHERE id = ?`,
+	stmtIncrementOwed: `
+		UPDATE objects
+		   SET reconcile_owed = reconcile_owed + 1
+		 WHERE id = ?`,
+	stmtCheckObjectExists: `
+		SELECT 1
+		  FROM objects
+		 WHERE id = ?`,
+	stmtGetObjectRowByName: `
+		SELECT ` + objectColumns + `
+		  FROM objects
+		 WHERE "group" = ? AND kind = ? AND name = ?`,
 	stmtGetForReconcile: `
 		SELECT ` + objectColumns + `,
 		       EXISTS (SELECT 1 FROM edges
 		                WHERE from_id = objects.id AND relation = 'depends_on')
-		  FROM objects WHERE id = ?`,
-	stmtListUnsettledIDs: `SELECT id FROM objects
+		  FROM objects
+		 WHERE id = ?`,
+	stmtListUnsettledIDs: `
+		SELECT id
+		  FROM objects
 		 WHERE "group" = ? AND kind = ?
 		   AND (observed_generation IS NULL OR observed_generation < generation)
 		 ORDER BY id`,
-	stmtListIDs: `SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
+	stmtListIDs: `
+		SELECT id
+		  FROM objects
+		 WHERE "group" = ? AND kind = ?
+		 ORDER BY id`,
 
-	stmtListObjects: listObjectsSQL(`WHERE o."group" = ? AND o.kind = ?`),
+	stmtScopedGate:       scopedSQL(``),
+	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
+	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
+	stmtScopedStatus:     scopedSQL(`schema_version_status, status`),
+	stmtScopedFinalizers: scopedSQL(`finalizers, deletion_requested_at IS NOT NULL`),
+
+	stmtListObjects: listObjectsSQL(`
+		 WHERE o."group" = ? AND o.kind = ?`),
 	stmtListObjectsByIncomingEdge: listObjectsSQL(`
-		WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
-		  AND o."group" = ? AND o.kind = ?`),
+		 WHERE o.id IN (SELECT from_id FROM edges WHERE to_id = ? AND relation = ?)
+		   AND o."group" = ? AND o.kind = ?`),
 
 	stmtInsertObject: `
 		INSERT INTO objects
-			("group", kind, name, spec, status, schema_version_spec,
-			 generation, resource_version, finalizers, created_at, updated_at)
+		       ("group", kind, name, spec, status, schema_version_spec,
+		        generation, resource_version, finalizers, created_at, updated_at)
 		VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?, ?, ?)
 		RETURNING ` + objectColumns,
 	stmtSetObservedGeneration: `
 		UPDATE objects
-		SET observed_generation = ?, observed_at = ?, resource_version = ?
-		WHERE id = ?`,
+		   SET observed_generation = ?, observed_at = ?, resource_version = ?
+		 WHERE id = ?`,
 	stmtUpdateStatus: `
 		UPDATE objects
-		SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
-		WHERE id = ?`,
+		   SET status = ?, schema_version_status = ?, resource_version = ?, updated_at = ?
+		 WHERE id = ?`,
+	stmtUpdateSpec: `
+		UPDATE objects
+		   SET spec = ?, schema_version_spec = ?, generation = generation + 1,
+		       resource_version = ?, updated_at = ?
+		 WHERE id = ?
+		RETURNING ` + objectColumns,
+	stmtBumpObject: `
+		UPDATE objects
+		   SET resource_version = ?, updated_at = ?
+		 WHERE id = ?`,
+	stmtSetFinalizers: `
+		UPDATE objects
+		   SET finalizers = ?, resource_version = ?, updated_at = ?
+		 WHERE id = ?`,
+	stmtDeleteObject: `
+		DELETE FROM objects
+		 WHERE id = ?`,
 
-	stmtListDeletionRequests: `SELECT id, "group", kind FROM objects
-		 WHERE deletion_requested_at IS NOT NULL ORDER BY id`,
-	stmtListOwedIDs: `SELECT id FROM objects
+	stmtMarkForDeletionByID:   markForDeletionSQL(`id = ? AND "group" = ? AND kind = ?`),
+	stmtMarkForDeletionByName: markForDeletionSQL(`"group" = ? AND kind = ? AND name = ?`),
+	stmtProbeDeletionByName: `
+		SELECT deletion_requested_at
+		  FROM objects
+		 WHERE "group" = ? AND kind = ? AND name = ?`,
+	stmtListDeletionRequests: `
+		SELECT id, "group", kind
+		  FROM objects
+		 WHERE deletion_requested_at IS NOT NULL
+		 ORDER BY id`,
+
+	stmtListOwedIDs: `
+		SELECT id
+		  FROM objects
 		 WHERE "group" = ? AND kind = ? AND reconcile_owed != 0
 		 ORDER BY id`,
-	stmtLoadConditions:  `SELECT ` + conditionColumns + ` FROM conditions WHERE object_id = ? ORDER BY type`,
-	stmtDeleteCondition: `DELETE FROM conditions WHERE object_id = ? AND type = ?`,
-	stmtGetDriverCursor: `SELECT cursor FROM driver_cursors WHERE name = ?`,
+	stmtDecrementOwed: `
+		UPDATE objects
+		   SET reconcile_owed = max(reconcile_owed - ?, 0)
+		 WHERE id = ? AND "group" = ? AND kind = ?`,
+
+	stmtLoadConditions: `
+		SELECT ` + conditionColumns + `
+		  FROM conditions
+		 WHERE object_id = ?
+		 ORDER BY type`,
+	stmtDeleteCondition: `
+		DELETE FROM conditions
+		 WHERE object_id = ? AND type = ?`,
+
+	stmtGetDriverCursor: `
+		SELECT cursor
+		  FROM driver_cursors
+		 WHERE name = ?`,
 	stmtSetDriverCursor: `
-		INSERT INTO driver_cursors (name, cursor, updated_at) VALUES (?, ?, ?)
+		INSERT INTO driver_cursors (name, cursor, updated_at)
+		VALUES (?, ?, ?)
 		    ON CONFLICT(name) DO UPDATE
 		   SET cursor = excluded.cursor, updated_at = excluded.updated_at
 		 WHERE excluded.cursor > driver_cursors.cursor`,
 
-	stmtWriteLogMaxVersionAll: `SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0), ` +
+	stmtWriteLogMaxVersionAll: `
+		SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0), ` +
 		writeLogHorizonAll,
 	stmtWriteLogListSinceAll: `
 		SELECT ` + writeLogColumns + `, ` + writeLogHorizonAll + `
 		  FROM object_writes
-		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
+		 WHERE resource_version > ?
+		 ORDER BY resource_version LIMIT ?`,
 	stmtWriteLogMaxVersion: `
 		SELECT max(
-			coalesce((SELECT MAX(resource_version) FROM object_writes
-			           WHERE "group" = ? AND kind = ?), 0),
-			coalesce((SELECT trimmed_through FROM object_writes_horizon
-			           WHERE "group" = ? AND kind = ?), 0))`,
+		       coalesce((SELECT MAX(resource_version) FROM object_writes
+		                  WHERE "group" = ? AND kind = ?), 0),
+		       coalesce((SELECT trimmed_through FROM object_writes_horizon
+		                  WHERE "group" = ? AND kind = ?), 0))`,
 	stmtWriteLogTrimmedThrough: `
-		SELECT trimmed_through FROM object_writes_horizon
+		SELECT trimmed_through
+		  FROM object_writes_horizon
 		 WHERE "group" = ? AND kind = ?`,
-	stmtWriteLogKinds: `SELECT DISTINCT "group", kind FROM object_writes`,
-
-	stmtLatestEventRun: `SELECT ` + eventColumns + ` FROM events WHERE object_id = ? AND category = ?
-		 ORDER BY id DESC LIMIT 1`,
-	stmtLatestEventKey: `SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
-		 ORDER BY id DESC LIMIT 1`,
-	stmtEventsMaxVersion: `SELECT MAX(resource_version) FROM events WHERE object_id = ?`,
-
-	stmtEdgesListIncoming: `
-		SELECT o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.from_id
-		WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer,
-	stmtEdgesListOutgoing: `
-		SELECT DISTINCT o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id = ?` + edgeOrderByTarget,
-	stmtEdgesListOutgoingByRelation: `
-		SELECT o.id, o."group", o.kind
-		FROM edges r JOIN objects o ON o.id = r.to_id
-		WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget,
-	stmtEdgesHasIncoming: `
-		SELECT EXISTS(
-			SELECT 1 FROM edges r
-			WHERE r.to_id = ?
-			  AND NOT (r.relation = ? AND r.from_id IN
-			           (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)))`,
-	stmtEdgesDeleteFinalizingDependsOn: `
-		DELETE FROM edges
-		WHERE to_id = ? AND relation = ?
-		  AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
-
-	stmtDecrementOwed: `UPDATE objects SET reconcile_owed = max(reconcile_owed - ?, 0)
-		 WHERE id = ? AND "group" = ? AND kind = ?`,
-	stmtWatermarkSet: `
-		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
-		SELECT ?, ?, ?
-		 WHERE EXISTS (SELECT 1 FROM edges WHERE from_id = ? AND relation = 'depends_on')
-		    ON CONFLICT(object_id) DO UPDATE
-		   SET reconciled_against = excluded.reconciled_against,
-		       reconciled_at      = excluded.reconciled_at
-		 WHERE excluded.reconciled_against > dependency_watermarks.reconciled_against`,
-	stmtProbeDeletionByName: `SELECT deletion_requested_at FROM objects
-		 WHERE "group" = ? AND kind = ? AND name = ?`,
-	stmtOverCapTimelines: eventCapCandidates,
-
-	stmtEdgeEndpointsForAdd: `
-			SELECT t."group", t.kind, t.deletion_requested_at
-			FROM objects f, objects t WHERE f.id = ? AND t.id = ?`,
-	stmtStampOwedForNewEdge: `
-				UPDATE objects SET reconcile_owed = reconcile_owed + 1
-				WHERE id = ? AND ` + edgeIsNew,
-	stmtClearWatermarkForNewEdge: `
-				DELETE FROM dependency_watermarks
-				 WHERE object_id = ? AND ` + edgeIsNew,
-	stmtInsertEdge: `
-			INSERT INTO edges (from_id, to_id, relation) VALUES (?, ?, ?)
-			ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
-	stmtDeleteEdge: `DELETE FROM edges WHERE from_id = ? AND to_id = ? AND relation = ?`,
-	stmtEdgeEndpointsForDelete: `
-		SELECT t."group", t.kind,
-		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
-		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
-
-	stmtAppendWriteLog: `INSERT INTO object_writes (` + objectWritesColumns + `) VALUES (?, ?, ?, ?, ?, ?)`,
-	stmtAppendWriteLogDelete: `
-		INSERT INTO object_writes (resource_version, object_id, "group", kind, op, written_at, final)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-	stmtDrawResourceVersions: `UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value`,
-
-	stmtBumpObject: `
-		UPDATE objects SET resource_version = ?, updated_at = ?
-		WHERE id = ?`,
-
+	stmtWriteLogKinds: `
+		SELECT DISTINCT "group", kind
+		  FROM object_writes`,
 	stmtWriteLogPage: `
 		SELECT ` + writeLogColumns + `,
 		       coalesce((SELECT trimmed_through FROM object_writes_horizon
@@ -251,6 +273,39 @@ var stmtSQL = [numStmts]string{
 		  FROM object_writes
 		 WHERE "group" = ? AND kind = ? AND resource_version > ?
 		 ORDER BY resource_version LIMIT ?`,
+	stmtAppendWriteLog: `
+		INSERT INTO object_writes (` + objectWritesColumns + `)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+	stmtAppendWriteLogDelete: `
+		INSERT INTO object_writes
+		       (resource_version, object_id, "group", kind, op, written_at, final)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	stmtRaiseWriteLogHorizon: `
+		INSERT INTO object_writes_horizon ("group", kind, trimmed_through)
+		VALUES (?, ?, ?)
+		    ON CONFLICT("group", kind) DO UPDATE SET trimmed_through = excluded.trimmed_through
+		 WHERE excluded.trimmed_through > object_writes_horizon.trimmed_through`,
+
+	stmtTrimWriteLogByAge: trimWriteLogSQL(`written_at < ?`),
+	stmtTrimWriteLogOverCap: trimWriteLogSQL(`"group" = ? AND kind = ? AND resource_version <= (
+		       SELECT resource_version FROM object_writes
+		        WHERE "group" = ? AND kind = ?
+		        ORDER BY resource_version DESC LIMIT 1 OFFSET ?)`),
+
+	stmtLatestEventRun: `
+		SELECT ` + eventColumns + `
+		  FROM events
+		 WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`,
+	stmtLatestEventKey: `
+		SELECT id, type, reason
+		  FROM events
+		 WHERE object_id = ? AND category = ?
+		 ORDER BY id DESC LIMIT 1`,
+	stmtEventsMaxVersion: `
+		SELECT MAX(resource_version)
+		  FROM events
+		 WHERE object_id = ?`,
 	stmtEventPage: `
 		SELECT ` + eventColumns + `,
 		       coalesce((SELECT MAX(trimmed_through) FROM events_horizon
@@ -259,63 +314,99 @@ var stmtSQL = [numStmts]string{
 		 WHERE object_id = ?1 AND resource_version > ?3
 		 ORDER BY resource_version LIMIT ?4`,
 	// The optional category rides a numbered parameter, as stmtEventPage's does.
-	stmtEventHorizon: `SELECT MAX(trimmed_through) FROM events_horizon
+	stmtEventHorizon: `
+		SELECT MAX(trimmed_through)
+		  FROM events_horizon
 		 WHERE object_id = ?1 AND (?2 IS NULL OR category = ?2)`,
-	stmtRaiseWriteLogHorizon: `
-			INSERT INTO object_writes_horizon ("group", kind, trimmed_through)
-			VALUES (?, ?, ?)
-			    ON CONFLICT("group", kind) DO UPDATE SET trimmed_through = excluded.trimmed_through
-			 WHERE excluded.trimmed_through > object_writes_horizon.trimmed_through`,
+	stmtExtendEventRun: `
+		UPDATE events
+		   SET count = count + 1, last_at = ?, message = ?,
+		       detail = ?, resource_version = ?
+		 WHERE id = ?`,
+	stmtInsertEventRun: `
+		INSERT INTO events
+		       (object_id, category, type, reason, message, detail,
+		        count, first_at, last_at, resource_version)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+	stmtOverCapTimelines: eventCapCandidates,
 
 	stmtRaiseEventHorizonByAge:   raiseEventHorizonSQL(eventTrimByAge),
 	stmtTrimEventsByAge:          `DELETE FROM events WHERE ` + eventTrimByAge,
 	stmtRaiseEventHorizonOverCap: raiseEventHorizonSQL(eventTrimOverCap),
 	stmtTrimEventsOverCap:        `DELETE FROM events WHERE ` + eventTrimOverCap,
 
-	stmtUpdateSpec: `
-			UPDATE objects
-			SET spec = ?, schema_version_spec = ?, generation = generation + 1,
-			    resource_version = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING ` + objectColumns,
-	stmtExtendEventRun: `
-				UPDATE events SET count = count + 1, last_at = ?, message = ?,
-					detail = ?, resource_version = ?
-				WHERE id = ?`,
-	stmtInsertEventRun: `
-			INSERT INTO events
-				(object_id, category, type, reason, message, detail,
-				 count, first_at, last_at, resource_version)
-			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
-
-	stmtMarkForDeletionByID:   markForDeletionSQL(`id = ? AND "group" = ? AND kind = ?`),
-	stmtMarkForDeletionByName: markForDeletionSQL(`"group" = ? AND kind = ? AND name = ?`),
-
-	stmtSetFinalizers: `
-			UPDATE objects SET finalizers = ?, resource_version = ?, updated_at = ?
-			WHERE id = ?`,
-	stmtDeleteObject: `DELETE FROM objects WHERE id = ?`,
+	stmtEdgesListIncoming: `
+		SELECT o.id, o."group", o.kind
+		  FROM edges r JOIN objects o ON o.id = r.from_id
+		 WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer,
+	stmtEdgesListOutgoing: `
+		SELECT DISTINCT o.id, o."group", o.kind
+		  FROM edges r JOIN objects o ON o.id = r.to_id
+		 WHERE r.from_id = ?` + edgeOrderByTarget,
+	stmtEdgesListOutgoingByRelation: `
+		SELECT o.id, o."group", o.kind
+		  FROM edges r JOIN objects o ON o.id = r.to_id
+		 WHERE r.from_id = ? AND r.relation = ?` + edgeOrderByTarget,
 	stmtListOwnedChildren: `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
-		FROM edges r JOIN objects o ON o.id = r.from_id
-		WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer,
-	stmtTrimWriteLogByAge: trimWriteLogSQL(`written_at < ?`),
-	stmtTrimWriteLogOverCap: trimWriteLogSQL(`"group" = ? AND kind = ? AND resource_version <= (
-					SELECT resource_version FROM object_writes
-					 WHERE "group" = ? AND kind = ?
-					 ORDER BY resource_version DESC LIMIT 1 OFFSET ?)`),
+		  FROM edges r JOIN objects o ON o.id = r.from_id
+		 WHERE r.to_id = ? AND r.relation = ?` + edgeOrderByReferrer,
+	stmtEdgesHasIncoming: `
+		SELECT EXISTS(
+		       SELECT 1 FROM edges r
+		        WHERE r.to_id = ?
+		          AND NOT (r.relation = ? AND r.from_id IN
+		                   (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)))`,
+	stmtEdgesDeleteFinalizingDependsOn: `
+		DELETE FROM edges
+		 WHERE to_id = ? AND relation = ?
+		   AND from_id IN (SELECT id FROM objects WHERE deletion_requested_at IS NOT NULL)`,
+	stmtEdgeEndpointsForAdd: `
+		SELECT t."group", t.kind, t.deletion_requested_at
+		  FROM objects f, objects t
+		 WHERE f.id = ? AND t.id = ?`,
+	stmtEdgeEndpointsForDelete: `
+		SELECT t."group", t.kind,
+		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
+		  FROM objects t, objects f
+		 WHERE t.id = ? AND f.id = ?`,
+	stmtInsertEdge: `
+		INSERT INTO edges (from_id, to_id, relation)
+		VALUES (?, ?, ?)
+		    ON CONFLICT(from_id, to_id, relation) DO NOTHING`,
+	stmtDeleteEdge: `
+		DELETE FROM edges
+		 WHERE from_id = ? AND to_id = ? AND relation = ?`,
+	stmtStampOwedForNewEdge: `
+		UPDATE objects
+		   SET reconcile_owed = reconcile_owed + 1
+		 WHERE id = ? AND ` + edgeIsNew,
+	stmtClearWatermarkForNewEdge: `
+		DELETE FROM dependency_watermarks
+		 WHERE object_id = ? AND ` + edgeIsNew,
+	stmtWatermarkSet: `
+		INSERT INTO dependency_watermarks (object_id, reconciled_against, reconciled_at)
+		SELECT ?, ?, ?
+		 WHERE EXISTS (SELECT 1 FROM edges WHERE from_id = ? AND relation = 'depends_on')
+		    ON CONFLICT(object_id) DO UPDATE
+		   SET reconciled_against = excluded.reconciled_against,
+		       reconciled_at      = excluded.reconciled_at
+		 WHERE excluded.reconciled_against > dependency_watermarks.reconciled_against`,
 
-	stmtScopedGate:       scopedSQL(``),
-	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
-	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
-	stmtScopedStatus:     scopedSQL(`schema_version_status, status`),
-	stmtScopedFinalizers: scopedSQL(`finalizers, deletion_requested_at IS NOT NULL`),
+	stmtDrawResourceVersions: `
+		UPDATE resource_version_seq
+		   SET value = value + ?
+		 WHERE id = 1
+		RETURNING value`,
 }
 
 // listObjectsSQL builds the shared multi-row object read. Objects().ListByIDs
 // renders its own tail and cannot be prepared, so it keeps listObjectsWhere.
 func listObjectsSQL(tail string) string {
-	return `SELECT ` + objectColumns + ` FROM objects o ` + tail + ` ORDER BY o.id`
+	return `
+		SELECT ` + objectColumns + `
+		  FROM objects o ` + tail + `
+		 ORDER BY o.id`
 }
 
 // The two predicates trimEvents runs over. The outer key predicate is what keeps
@@ -323,8 +414,8 @@ func listObjectsSQL(tail string) string {
 const (
 	eventTrimByAge   = `last_at < ?`
 	eventTrimOverCap = `object_id = ? AND category = ? AND id IN (
-			SELECT id FROM events WHERE object_id = ? AND category = ?
-			 ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?)`
+		       SELECT id FROM events WHERE object_id = ? AND category = ?
+		        ORDER BY last_at DESC, id DESC LIMIT -1 OFFSET ?)`
 )
 
 // raiseEventHorizonSQL records what a trim over where is about to remove. It runs
@@ -332,7 +423,8 @@ const (
 func raiseEventHorizonSQL(where string) string {
 	return `
 		INSERT INTO events_horizon (object_id, category, trimmed_through)
-		SELECT object_id, category, MAX(resource_version) FROM events
+		SELECT object_id, category, MAX(resource_version)
+		  FROM events
 		 WHERE ` + where + `
 		 GROUP BY object_id, category
 		    ON CONFLICT(object_id, category) DO UPDATE SET trimmed_through = excluded.trimmed_through
@@ -345,27 +437,32 @@ func raiseEventHorizonSQL(where string) string {
 func markForDeletionSQL(where string) string {
 	return `
 		UPDATE objects
-		SET deletion_requested_at = ?,
-		    resource_version = ?,
-		    updated_at = ?
-		WHERE (` + where + `) AND deletion_requested_at IS NULL
+		   SET deletion_requested_at = ?,
+		       resource_version = ?,
+		       updated_at = ?
+		 WHERE (` + where + `) AND deletion_requested_at IS NULL
 		RETURNING id, "group", kind`
 }
 
 // trimWriteLogSQL builds the log delete over where. RETURNING because the caller
 // raises each affected kind's horizon to the highest version it removed there.
 func trimWriteLogSQL(where string) string {
-	return `DELETE FROM object_writes WHERE ` + where + `
-		 RETURNING "group", kind, resource_version`
+	return `
+		DELETE FROM object_writes
+		 WHERE ` + where + `
+		RETURNING "group", kind, resource_version`
 }
 
 // scopedSQL builds selectScoped's read: the kind gate's two columns, plus
 // whatever the caller scans beside them.
 func scopedSQL(cols string) string {
-	if cols == "" {
-		return `SELECT "group", kind FROM objects WHERE id = ?`
+	if cols != "" {
+		cols = `, ` + cols
 	}
-	return `SELECT "group", kind, ` + cols + ` FROM objects WHERE id = ?`
+	return `
+		SELECT "group", kind` + cols + `
+		  FROM objects
+		 WHERE id = ?`
 }
 
 // stmtWrites marks the ids that write, which are prepared on the writer alone.
@@ -497,7 +594,7 @@ func bindStmt(ctx context.Context, st *txState, ps *sql.Stmt) *sql.Stmt {
 // inside a write transaction runs on the writer's connection. It must run after
 // the migrations and before the version seed, which draws through it.
 func (s *sqliteStore) prepareWriteStatements(ctx context.Context) error {
-	for id := stmtID(0); id < numStmts; id++ {
+	for id := range numStmts {
 		ps, err := s.db.PrepareContext(ctx, stmtSQL[id])
 		if err != nil {
 			return fmt.Errorf("prepare %d on the writer: %w", id, err)
@@ -512,7 +609,7 @@ func (s *sqliteStore) prepareWriteStatements(ctx context.Context) error {
 // the only representation open can check. It must run after s.readDB is
 // assigned, or every read binds to the writer.
 func (s *sqliteStore) prepareReadStatements(ctx context.Context) error {
-	for id := stmtID(0); id < numStmts; id++ {
+	for id := range numStmts {
 		if stmtWrites[id] {
 			continue
 		}
@@ -538,7 +635,7 @@ func (s *sqliteStore) prepareReadStatements(ctx context.Context) error {
 // rather than a closed statement to report.
 func (s *sqliteStore) closeStatements() error {
 	var err error
-	for id := stmtID(0); id < numStmts; id++ {
+	for id := range numStmts {
 		if s.readStmts[id] != nil && s.readStmts[id] != s.writeStmts[id] {
 			err = errors.Join(err, s.readStmts[id].Close())
 		}
