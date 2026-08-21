@@ -9623,7 +9623,6 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 // renders an IN list, a VALUES tuple set or an optional predicate, so one
 // statement per arity would fill the table with single-use entries.
 var renderedSQLSites = []string{
-	"appendWriteLogUpdates",
 	"sqliteStore.upsertConditions",
 	"sqliteEvents.List",
 }
@@ -9934,4 +9933,32 @@ func TestTheDeletionMarkDoesNotMaterialiseItsAssignments(t *testing.T) {
 	assert.NotContains(t, plan, "MATERIALIZE", plan)
 	assert.Contains(t, plan, "SEARCH objects USING INTEGER PRIMARY KEY",
 		"the assignment still seeks by rowid:\n"+plan)
+}
+
+// The batched append writes the same entry the single append does, so a delete
+// cascade's log is indistinguishable from a row-at-a-time one. Each row carries
+// its own version: a batch shares a draw, never a value.
+func TestTheBatchedWriteLogAppendRecordsEveryWrite(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+	owner := newRefObject(t, store)
+	for range 3 {
+		child := newRefObject(t, store)
+		require.NoError(t, addEdge(ctx, store, child.ID, owner.ID, beehive.RelationOwnedBy))
+	}
+	before := markNow(t, store)
+
+	_, err := store.DeletionRequests().CreateFromOwner(ctx, owner.ID)
+	require.NoError(t, err)
+
+	page, _, err := store.ObjectWrites().ListSince(ctx, testGK, before, 100)
+	require.NoError(t, err)
+	require.Len(t, page, 3, "one entry per child the cascade marked")
+
+	seen := map[int64]bool{}
+	for _, w := range page {
+		assert.Equal(t, storeapi.WriteUpdate, w.Op, "a deletion mark is an update")
+		assert.False(t, seen[w.ResourceVersion], "each row takes its own version")
+		seen[w.ResourceVersion] = true
+	}
 }

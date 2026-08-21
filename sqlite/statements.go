@@ -87,6 +87,7 @@ const (
 	stmtWriteLogPage
 	stmtWriteLogImages
 	stmtAppendWriteLog
+	stmtAppendWriteLogUpdates
 	stmtAppendWriteLogDelete
 	stmtRaiseWriteLogHorizon
 	// deleteWriteLogRows runs one of two predicates, both RETURNING.
@@ -322,6 +323,12 @@ var stmtSQL = [numStmts]string{
 	stmtAppendWriteLog: `
 		INSERT INTO object_writes (` + objectWritesColumns + `)
 		VALUES (?, ?, ?, ?, ?, ?)`,
+	// One entry per write in a batch, each carrying the version its own row took.
+	// op and written_at are the batch's, so only the per-row values ride the array.
+	stmtAppendWriteLogUpdates: `
+		INSERT INTO object_writes (` + objectWritesColumns + `)
+		SELECT value ->> 0, value ->> 1, value ->> 2, value ->> 3, ?1, ?2
+		  FROM json_each(?3)`,
 	stmtAppendWriteLogDelete: `
 		INSERT INTO object_writes
 		       (resource_version, object_id, "group", kind, op, written_at, final)
@@ -574,6 +581,7 @@ var stmtWrites = [numStmts]bool{
 	stmtStampOwed:                      true,
 	stmtOwedSweep:                      true,
 	stmtMarkManyForDeletion:            true,
+	stmtAppendWriteLogUpdates:          true,
 	stmtWatermarkSet:                   true,
 	stmtStampOwedForNewEdge:            true,
 	stmtClearWatermarkForNewEdge:       true,

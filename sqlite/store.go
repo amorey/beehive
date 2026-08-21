@@ -908,17 +908,12 @@ type loggedWrite struct {
 
 // appendWriteLogUpdates records one update entry per write in a single INSERT.
 // Each carries the version its own row took: a batch shares a draw, never a value.
-func appendWriteLogUpdates(ctx context.Context, c dbtx, writes []loggedWrite, now int64) error {
+func (s *sqliteStore) appendWriteLogUpdates(ctx context.Context, writes []loggedWrite, now int64) error {
 	if len(writes) == 0 {
 		return nil
 	}
-	args := make([]any, 0, len(writes)*6)
-	for _, w := range writes {
-		// The soft delete is an update: the row is still live and readable.
-		args = append(args, w.rv, w.id, w.gk.Group, w.gk.Kind, writeOpUpdate, now)
-	}
-	_, err := c.ExecContext(ctx,
-		`INSERT INTO object_writes (`+objectWritesColumns+`) VALUES `+tupleRows(len(writes), 6), args...)
+	// The soft delete is an update: the row is still live and readable.
+	_, err := s.exec(ctx, stmtAppendWriteLogUpdates, writeOpUpdate, now, jsonWriteLogRows(writes))
 	return err
 }
 
@@ -2440,8 +2435,8 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	c, err := s.conn(ctx)
-	if err != nil {
+	// Ahead of the draw, so a doomed call burns no versions.
+	if err := s.refuseWriteInReadFrame(ctx); err != nil {
 		return nil, err
 	}
 	now := toMillis(time.Now().UTC())
@@ -2453,7 +2448,7 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 	marked := make(map[storeapi.ObjectID]bool, len(ids))
 	for start := 0; start < len(ids); start += markChunkSize {
 		chunk := ids[start:min(start+markChunkSize, len(ids))]
-		if err := s.markManyForDeletionChunk(ctx, c, chunk, first+int64(start), now, marked); err != nil {
+		if err := s.markManyForDeletionChunk(ctx, chunk, first+int64(start), now, marked); err != nil {
 			return nil, err
 		}
 	}
@@ -2464,7 +2459,6 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 // See docs/adr/2026-07-30-store-write-shapes.md.
 func (s *sqliteStore) markManyForDeletionChunk(
 	ctx context.Context,
-	c dbtx,
 	ids []storeapi.ObjectID,
 	first, now int64,
 	marked map[storeapi.ObjectID]bool,
@@ -2477,7 +2471,7 @@ func (s *sqliteStore) markManyForDeletionChunk(
 	for _, w := range stamped {
 		marked[w.id] = true
 	}
-	return appendWriteLogUpdates(ctx, c, stamped, now)
+	return s.appendWriteLogUpdates(ctx, stamped, now)
 }
 
 // probeDeletionByName is probeObjectScoped keyed by name; a name this kind does
@@ -3307,6 +3301,18 @@ func (s sqliteObjects) ListByIDs(ctx context.Context, gk storeapi.GroupKind, ids
 		return nil, nil
 	}
 	return s.listObjects(ctx, stmtListObjectsByIDs, jsonList(ids), gk.Group, gk.Kind)
+}
+
+// jsonWriteLogRows marshals a batch of log entries as one JSON array, in
+// objectWritesColumns' order. group and kind are identifiers from Register, not
+// caller data, so JSON carries them whole.
+func jsonWriteLogRows(writes []loggedWrite) string {
+	rows := make([][4]any, len(writes))
+	for i, w := range writes {
+		rows[i] = [4]any{w.rv, int64(w.id), w.gk.Group, w.gk.Kind}
+	}
+	out, _ := json.Marshal(rows)
+	return string(out)
 }
 
 // jsonMarkPairs marshals the deletion mark's assignments as one JSON array of
