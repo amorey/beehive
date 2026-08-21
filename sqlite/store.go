@@ -1645,8 +1645,8 @@ func (s *sqliteStore) updateSpec(
 	err := s.Within(ctx, func(ctx context.Context) error {
 		// Before the converged return below: this reports a programming error, and
 		// a write that happens to be converged must not swallow it.
-		c, err := s.conn(ctx)
-		if err != nil {
+		// conn for its refusal, before the compares below return without writing.
+		if _, err := s.conn(ctx); err != nil {
 			return err
 		}
 		obj, err := resolve(ctx)
@@ -1682,13 +1682,11 @@ func (s *sqliteStore) updateSpec(
 		// A real spec change bumps generation. Keyed on id alone: the kind boundary
 		// came from the resolve above, in this same transaction — keep the read if
 		// you move this statement.
-		row := c.QueryRowContext(ctx, `
-			UPDATE objects
-			SET spec = ?, schema_version_spec = ?, generation = generation + 1,
-			    resource_version = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING `+objectColumns,
-			jsonText(spec), stamp, rv, now, obj.ID)
+		ps, err := s.stmtFor(ctx, stmtUpdateSpec)
+		if err != nil {
+			return err
+		}
+		row := ps.QueryRowContext(ctx, jsonText(spec), stamp, rv, now, obj.ID)
 		result, err = s.scanWritten(ctx, row)
 		changed = err == nil
 		return err
@@ -2208,8 +2206,7 @@ func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, 
 func (s sqliteEvents) Add(ctx context.Context, gk storeapi.GroupKind, id storeapi.ObjectID, in storeapi.EventsAddInput) error {
 	// Within serializes read-latest-then-write so the run-boundary decision can't race.
 	return s.Within(ctx, func(ctx context.Context) error {
-		c, err := s.conn(ctx)
-		if err != nil {
+		if _, err := s.conn(ctx); err != nil {
 			return err
 		}
 		// Metadata-only gate: events carries no group/kind to fold in, and an event
@@ -2229,18 +2226,19 @@ func (s sqliteEvents) Add(ctx context.Context, gk storeapi.GroupKind, id storeap
 		}
 		if hasLatest && latestType == in.Type && latestReason == in.Reason {
 			// Extend: bump count and window end, re-sample message/detail, advance rv.
-			_, err = c.ExecContext(ctx, `
-				UPDATE events SET count = count + 1, last_at = ?, message = ?,
-					detail = ?, resource_version = ?
-				WHERE id = ?`, now, in.Message, jsonText(in.Detail), rv, latestID)
+			ps, err := s.stmtFor(ctx, stmtExtendEventRun)
+			if err != nil {
+				return err
+			}
+			_, err = ps.ExecContext(ctx, now, in.Message, jsonText(in.Detail), rv, latestID)
 			return err
 		}
 		// New run (empty timeline or key changed): count 1, point window.
-		_, err = c.ExecContext(ctx, `
-			INSERT INTO events
-				(object_id, category, type, reason, message, detail,
-				 count, first_at, last_at, resource_version)
-			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+		ps, err := s.stmtFor(ctx, stmtInsertEventRun)
+		if err != nil {
+			return err
+		}
+		_, err = ps.ExecContext(ctx,
 			id, in.Category, in.Type, in.Reason, in.Message, jsonText(in.Detail), now, now, rv)
 		return err
 	})

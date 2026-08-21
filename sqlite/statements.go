@@ -90,6 +90,9 @@ const (
 	stmtTrimEventsByAge
 	stmtRaiseEventHorizonOverCap
 	stmtTrimEventsOverCap
+	stmtUpdateSpec
+	stmtExtendEventRun
+	stmtInsertEventRun
 
 	numStmts
 )
@@ -261,6 +264,22 @@ var stmtSQL = [numStmts]string{
 	stmtRaiseEventHorizonOverCap: raiseEventHorizonSQL(eventTrimOverCap),
 	stmtTrimEventsOverCap:        `DELETE FROM events WHERE ` + eventTrimOverCap,
 
+	stmtUpdateSpec: `
+			UPDATE objects
+			SET spec = ?, schema_version_spec = ?, generation = generation + 1,
+			    resource_version = ?, updated_at = ?
+			WHERE id = ?
+			RETURNING ` + objectColumns,
+	stmtExtendEventRun: `
+				UPDATE events SET count = count + 1, last_at = ?, message = ?,
+					detail = ?, resource_version = ?
+				WHERE id = ?`,
+	stmtInsertEventRun: `
+			INSERT INTO events
+				(object_id, category, type, reason, message, detail,
+				 count, first_at, last_at, resource_version)
+			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+
 	stmtScopedGate:       scopedSQL(``),
 	stmtScopedDeletion:   scopedSQL(`deletion_requested_at`),
 	stmtScopedGeneration: scopedSQL(`generation, observed_generation`),
@@ -331,6 +350,9 @@ var stmtWrites = [numStmts]bool{
 	stmtTrimEventsByAge:                true,
 	stmtRaiseEventHorizonOverCap:       true,
 	stmtTrimEventsOverCap:              true,
+	stmtUpdateSpec:                     true,
+	stmtExtendEventRun:                 true,
+	stmtInsertEventRun:                 true,
 }
 
 // stmtSet is one pool's preparations.
