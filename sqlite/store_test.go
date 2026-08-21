@@ -9646,7 +9646,6 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 var renderedSQLSites = []string{
 	"appendWriteLogUpdates",
 	"sqliteStore.conditionsByIDsChunk",
-	"sqliteReconcileOwed.Stamp",
 	"reconcileOwedSweepQuery",
 	"sqliteDependencies.ListStaleSince",
 	"sqliteStore.readImages",

@@ -1229,17 +1229,11 @@ func (s sqliteReconcileOwed) Stamp(ctx context.Context, refs []storeapi.ObjectRe
 	if len(refs) == 0 {
 		return nil
 	}
-	args := make([]any, len(refs))
+	ids := make([]storeapi.ObjectID, len(refs))
 	for i, ref := range refs {
-		args[i] = ref.ID
+		ids[i] = ref.ID
 	}
-	c, err := s.conn(ctx)
-	if err != nil {
-		return err
-	}
-	_, err = c.ExecContext(ctx,
-		`UPDATE objects SET reconcile_owed = reconcile_owed + 1
-		  WHERE id IN (`+placeholders(len(refs))+`)`, args...)
+	_, err := s.exec(ctx, stmtStampOwed, jsonList(ids))
 	return err
 }
 

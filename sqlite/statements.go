@@ -65,6 +65,7 @@ const (
 	// reconcile_owed.
 	stmtListOwedIDs
 	stmtDecrementOwed
+	stmtStampOwed
 
 	stmtLoadConditions
 	stmtDeleteCondition
@@ -224,6 +225,10 @@ var stmtSQL = [numStmts]string{
 		UPDATE objects
 		   SET reconcile_owed = max(reconcile_owed - ?, 0)
 		 WHERE id = ? AND "group" = ? AND kind = ?`,
+	stmtStampOwed: `
+		UPDATE objects
+		   SET reconcile_owed = reconcile_owed + 1
+		 WHERE id IN (SELECT value FROM json_each(?))`,
 
 	stmtLoadConditions: `
 		SELECT ` + conditionColumns + `
@@ -478,6 +483,7 @@ var stmtWrites = [numStmts]bool{
 
 	stmtEdgesDeleteFinalizingDependsOn: true,
 	stmtDecrementOwed:                  true,
+	stmtStampOwed:                      true,
 	stmtWatermarkSet:                   true,
 	stmtStampOwedForNewEdge:            true,
 	stmtClearWatermarkForNewEdge:       true,
