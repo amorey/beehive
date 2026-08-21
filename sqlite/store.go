@@ -104,7 +104,8 @@ type sqliteStore struct {
 	versions versions
 
 	// readStmts and writeStmts hold every constant statement, prepared once per
-	// pool. Filled by prepareStatements, read only through stmtFor.
+	// pool. Written once by the two preparations, read through the two accessors,
+	// and never written again — see closeStatements.
 	readStmts  stmtSet
 	writeStmts stmtSet
 
@@ -924,7 +925,7 @@ func appendWriteLogUpdates(ctx context.Context, c dbtx, writes []loggedWrite, no
 // change reports. image is stamped with the delete's own version: it is the
 // object's last, and the row that held the previous one no longer exists.
 func (s *sqliteStore) appendWriteLogDelete(ctx context.Context, image *storeapi.RawObject, rv, now int64) error {
-	ps, err := s.stmtFor(ctx, stmtAppendWriteLogDelete)
+	ps, err := s.writeStmt(ctx, stmtAppendWriteLogDelete)
 	if err != nil {
 		return err
 	}
@@ -2386,12 +2387,12 @@ func (s *sqliteStore) trimEventsToCap(ctx context.Context, perTimeline, capBudge
 // trimStmts resolves a trim's horizon raise and its delete together, so a caller
 // looping over timelines resolves them once.
 func (s *sqliteStore) trimStmts(ctx context.Context, raise, del stmtID) (*sql.Stmt, *sql.Stmt, error) {
-	raisePS, err := s.stmtFor(ctx, raise)
+	raisePS, err := s.writeStmt(ctx, raise)
 	if err != nil {
 		return nil, nil, err
 	}
 	// Both are writes on one frame, so the check above answers for this one too.
-	delPS, err := s.stmtFor(ctx, del)
+	delPS, err := s.writeStmt(ctx, del)
 	return raisePS, delPS, err
 }
 

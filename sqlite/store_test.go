@@ -8726,7 +8726,9 @@ func collectStmtText(elt ast.Expr, texts map[string]string) {
 	var text strings.Builder
 	ast.Inspect(kv.Value, func(n ast.Node) bool {
 		if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING {
-			text.WriteString(lit.Value)
+			// Unquoted: a caller matching on the SQL would otherwise be reading the
+			// literal's own backticks, and anchoring on the first verb never fires.
+			text.WriteString(strings.Trim(lit.Value, "`\""))
 		}
 		return true
 	})
@@ -9160,10 +9162,10 @@ func TestNoWriteBypassesConn(t *testing.T) {
 	// write on more than one sub-API, so a bare name would let a new one pass on
 	// an existing one's behalf.
 	takesConn := map[string]bool{}
-	// Beside conn: a prepared write reaches its connection through stmtFor, or
-	// through one of the three shapes wrapping it, and all of them refuse a write
-	// in a read frame the same way.
-	for _, fn := range callSites(t, "conn", "stmtFor", "exec", "query", "queryRow") {
+	// Beside conn: a prepared write reaches its connection through writeStmt, or
+	// through one of the shapes wrapping it, and all of them refuse a write in a
+	// read frame the same way.
+	for _, fn := range callSites(t, "conn", "writeStmt", "stmt", "exec", "query", "queryRow") {
 		takesConn[fn] = true
 	}
 	// Functions that name a write without issuing it: helpers handed a dbtx by a
@@ -9705,21 +9707,23 @@ func TestTheStatementSetsHaveFiveUsers(t *testing.T) {
 		"sqliteStore.prepareWriteStatements",
 		"sqliteStore.prepareReadStatements",
 		"sqliteStore.closeStatements",
-		"sqliteStore.stmtFor",
+		"sqliteStore.writeStmt",
 		"sqliteStore.readStmt",
 	}, users, "a statement reached outside the two accessors runs on the wrong connection")
 }
 
-// readsOnly is readStmt and the helpers that forward an id to it. query is not
-// among them: it carries a write for deleteWriteLogRows.
-var readsOnly = map[string]bool{
-	"readStmt": true, "selectScoped": true, "listObjects": true,
-}
+// takesReads and takesWrites are the two accessors and the helpers that forward
+// an id to one of them. stmt is on neither: it dispatches on the id itself.
+var (
+	takesReads  = map[string]bool{"readStmt": true, "selectScoped": true, "listObjects": true}
+	takesWrites = map[string]bool{"writeStmt": true, "trimStmts": true}
+)
 
-// readStmt cannot refuse and cannot fail, both of which hold only for a read: a
-// write reaching it would take the reader's empty slot. Every argument is
-// checked here, since the type cannot say it.
-func TestOnlyReadsTakeTheInfallibleAccessor(t *testing.T) {
+// Each accessor takes one kind, and only the id says which: readStmt cannot
+// refuse and would find the reader's empty slot for a write, and writeStmt
+// refuses a frame a read is entitled to. The type cannot say it, so every
+// argument is checked here.
+func TestEachAccessorTakesItsOwnKind(t *testing.T) {
 	writes := regexp.MustCompile(`(?is)^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
 	text := preparedSQL(t)
 
@@ -9730,22 +9734,24 @@ func TestOnlyReadsTakeTheInfallibleAccessor(t *testing.T) {
 			return
 		}
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || !readsOnly[sel.Sel.Name] {
+		if !ok || !takesReads[sel.Sel.Name] && !takesWrites[sel.Sel.Name] {
 			return
 		}
-		arg, ok := call.Args[1].(*ast.Ident)
-		if !ok {
-			return
+		for _, arg := range call.Args[1:] {
+			id, ok := arg.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			sql, named := text[id.Name]
+			if !named {
+				continue // a parameter forwarding an id; its own callers are checked
+			}
+			assert.Equal(t, takesWrites[sel.Sel.Name], writes.MatchString(sql),
+				"%s passes %s to %s", qualify(recv, fn), id.Name, sel.Sel.Name)
+			checked++
 		}
-		sql, named := text[arg.Name]
-		if !named {
-			return // a parameter forwarding an id; its own callers are checked
-		}
-		assert.False(t, writes.MatchString(sql),
-			"%s passes a write to %s", qualify(recv, fn), sel.Sel.Name)
-		checked++
 	}))
-	assert.NotZero(t, checked, "the walk found no readStmt call, so it proves nothing")
+	assert.NotZero(t, checked, "the walk found no accessor call, so it proves nothing")
 }
 
 // The version seed draws through a prepared statement before Open returns, so a

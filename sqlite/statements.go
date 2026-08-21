@@ -506,10 +506,10 @@ var stmtWrites = [numStmts]bool{
 // stmtSet is one pool's preparations.
 type stmtSet [numStmts]*sql.Stmt
 
-// readStmt is stmtFor for an id that reads. It cannot fail: a read is prepared on
-// both pools, so no route reaches an empty slot, and a read is never refused.
-// Passing a write is a programming error, pinned by
-// TestOnlyReadsTakeTheInfallibleAccessor.
+// readStmt returns a read's preparation, bound to the connection ctx selects. It
+// cannot fail: a read is prepared on both pools, so no route reaches an empty
+// slot, and a read is never refused. Passing a write is a programming error,
+// pinned by TestEachAccessorTakesItsOwnKind.
 func (s *sqliteStore) readStmt(ctx context.Context, id stmtID) *sql.Stmt {
 	st := liveTx(ctx)
 	if st == nil {
@@ -523,32 +523,35 @@ func (s *sqliteStore) readStmt(ctx context.Context, id stmtID) *sql.Stmt {
 	return st.tx.StmtContext(ctx, s.writeStmts[id])
 }
 
-// stmtFor returns id bound to the connection ctx selects: the transaction's own
-// connection while one is live, else the pool the statement was prepared on. A
-// nil slot is a routing bug and is reported here, not at execution.
-func (s *sqliteStore) stmtFor(ctx context.Context, id stmtID) (*sql.Stmt, error) {
+// writeStmt returns a write's preparation, bound to the connection ctx selects.
+// A write always takes the writer's, since the reader has no slot for one — and
+// on a read frame it takes none: refused here, before any statement runs, as
+// conn does and for the same reason. Passing a read is a programming error,
+// pinned by TestEachAccessorTakesItsOwnKind.
+func (s *sqliteStore) writeStmt(ctx context.Context, id stmtID) (*sql.Stmt, error) {
 	st := liveTx(ctx)
-	switch {
-	case st == nil && stmtWrites[id]:
-		return bindStmt(ctx, st, s.writeStmts[id]), nil
-	case st == nil:
-		return bindStmt(ctx, st, s.readStmts[id]), nil
-	case st.readOnly:
-		// Refused before any statement runs, as conn does and for the same reason.
-		if stmtWrites[id] {
-			return nil, errWroteInReadTx
-		}
-		return bindStmt(ctx, st, s.readStmts[id]), nil
-	default:
-		return bindStmt(ctx, st, s.writeStmts[id]), nil
+	if st != nil && st.readOnly {
+		return nil, errWroteInReadTx
 	}
+	return bindStmt(ctx, st, s.writeStmts[id]), nil
+}
+
+// stmt is readStmt or writeStmt by what the id does, for the shapes below that
+// carry either.
+func (s *sqliteStore) stmt(ctx context.Context, id stmtID) (*sql.Stmt, error) {
+	if stmtWrites[id] {
+		return s.writeStmt(ctx, id)
+	}
+	return s.readStmt(ctx, id), nil
 }
 
 // exec, query and queryRow issue id on the connection ctx selects. They are the
-// shapes every call site wants; stmtFor is for the few that need the statement
-// itself, to hoist it out of a loop.
+// shapes every call site wants; the accessors above are for the few that need
+// the statement itself, to hoist it out of a loop.
+//
+// exec is the write shape: only a write reports a Result nobody reads a row from.
 func (s *sqliteStore) exec(ctx context.Context, id stmtID, args ...any) (sql.Result, error) {
-	ps, err := s.stmtFor(ctx, id)
+	ps, err := s.writeStmt(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -556,9 +559,9 @@ func (s *sqliteStore) exec(ctx context.Context, id stmtID, args ...any) (sql.Res
 }
 
 func (s *sqliteStore) query(ctx context.Context, id stmtID, args ...any) (*sql.Rows, error) {
-	// Not readStmt: deleteWriteLogRows issues a DELETE ... RETURNING through here,
-	// so this shape carries writes and owes them their refusal.
-	ps, err := s.stmtFor(ctx, id)
+	// stmt, not readStmt: deleteWriteLogRows issues a DELETE ... RETURNING through
+	// here, so this shape carries either kind.
+	ps, err := s.stmt(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -568,7 +571,7 @@ func (s *sqliteStore) query(ctx context.Context, id stmtID, args ...any) (*sql.R
 // queryRow returns a scanner rather than (*sql.Row, error), so a routing failure
 // surfaces at Scan exactly as a query failure already does.
 func (s *sqliteStore) queryRow(ctx context.Context, id stmtID, args ...any) scanner {
-	ps, err := s.stmtFor(ctx, id)
+	ps, err := s.stmt(ctx, id)
 	if err != nil {
 		return errScanner{err}
 	}
