@@ -47,9 +47,9 @@ uses of `st.tx` are the savepoint statements. Two structural tests hold that.
 takes its connection from `conn` or from a caller that did; both sides are
 receiver-qualified, because `Add`, `Delete`, `Set` and `Sweep` each name a write
 on more than one sub-API and a bare name would let a new one pass on an existing
-one's behalf. `TestTheTransactionHandleHasFourUsers` covers the way around
-`conn`: `st.tx` is reachable from `conn`, `read`, `stmtFor` and the savepoint
-statements, and nowhere else. A roster of verbs could hold neither — a verb added without going
+one's behalf. `TestTheTransactionHandleHasFiveUsers` covers the way around
+`conn`: `st.tx` is reachable from `conn`, `read`, the two statement binders and
+the savepoint statements, and nowhere else. A roster of verbs could hold neither — a verb added without going
 through `conn` is also a verb nobody adds to a roster.
 
 **`conn` is taken before a write's no-op early return**, not at first use. Several
