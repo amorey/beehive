@@ -32,7 +32,7 @@ An entry is written by every successful `Events().Add`, so a timeline that is
 being appended to stays hot. A miss falls through to today's two reads and
 populates the entry.
 
-With [version blocks](2026-08-20-reserve-resource-versions-in-blocks.md) as well,
+With [version blocks](../adr/2026-08-20-reserve-resource-versions-in-blocks.md) as well,
 an event write goes from six round trips to three: `BEGIN`, the write, `COMMIT`.
 
 ## The rules this rests on

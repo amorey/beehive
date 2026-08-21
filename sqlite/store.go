@@ -100,6 +100,9 @@ type sqliteStore struct {
 	// the database cannot be opened twice (see OpenMemory).
 	readDB *sql.DB
 
+	// versions hands out resource versions from a reserved block.
+	versions versions
+
 	// txCount counts transactions begun; a nested Within (savepoint) does not add.
 	// Test-only, to assert a fast path answered without BEGIN IMMEDIATE.
 	txCount atomic.Int64
@@ -226,6 +229,11 @@ type txState struct {
 	// committed records *how* it ended; only flush sets it. A hook runs iff its
 	// transaction committed, so "over" and "over and durable" differ.
 	committed bool
+
+	// drawn is the highest resource version this transaction has taken, which is
+	// what its commit publishes. Nested frames share it, rolled-back draws
+	// included: a burned version belongs to no write, so publishing over it is safe.
+	drawn int64
 
 	// sealed latches just before the commit; pushSavepoint refuses on it. Not
 	// closed: a hook arriving between seal and drain must still queue and run.
@@ -569,6 +577,12 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Both before the hooks. Publishing after them lets the waker's dependent sample
+	// the cursor below its target's version; refilling after them puts the draw
+	// behind whatever transaction a hook has opened on the connection this commit
+	// just released.
+	s.versions.publish(st.highestDraw())
+	s.refillVersions(ctx)
 	// flush latches closed before the hooks below run — a close deferred to return
 	// would read false while a hook can hand its captured tx ctx back to the store.
 	hooks := st.flush()
@@ -577,6 +591,22 @@ func (s *sqliteStore) Within(ctx context.Context, fn func(ctx context.Context) e
 		hook.fn()
 	}
 	return nil
+}
+
+// noteDraw records a resource version this transaction took.
+func (st *txState) noteDraw(rv int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if rv > st.drawn {
+		st.drawn = rv
+	}
+}
+
+// highestDraw is the highest version this transaction took, 0 if it took none.
+func (st *txState) highestDraw() int64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.drawn
 }
 
 // AfterCommit defers fn to the outermost transaction's commit. Outside a
@@ -615,20 +645,84 @@ const (
 )
 
 // nextResourceVersion advances and returns the global write cursor.
-func nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
-	return advanceResourceVersion(ctx, c, 1)
+func (s *sqliteStore) nextResourceVersion(ctx context.Context, c dbtx) (int64, error) {
+	return s.advanceResourceVersion(ctx, c, 1)
 }
 
 // advanceResourceVersion advances the cursor by n and returns the highest value
-// drawn, so the range taken is [value-n+1, value]. n must be positive. A
-// standalone counter, not MAX(objects.resource_version): deleting the
+// drawn, so the range taken is [value-n+1, value]. n must be positive. Served
+// from the reserved block where it fits, and from the table otherwise.
+func (s *sqliteStore) advanceResourceVersion(ctx context.Context, c dbtx, n int) (int64, error) {
+	hi, ok := s.versions.take(n)
+	if !ok {
+		var err error
+		if hi, err = drawResourceVersions(ctx, c, n); err != nil {
+			return 0, err
+		}
+		s.versions.record(hi)
+	}
+	// The transaction publishes its own draws at commit. A draw outside one is
+	// never published, which stalls the cursor rather than overstating it.
+	if st := liveTx(ctx); st != nil {
+		st.noteDraw(hi)
+	}
+	return hi, nil
+}
+
+// drawResourceVersions advances the counter by n and returns the highest value
+// drawn. A standalone counter, not MAX(objects.resource_version): deleting the
 // highest-versioned row must never regress the cursor and hand out a reused
 // version.
-func advanceResourceVersion(ctx context.Context, c dbtx, n int) (int64, error) {
+func drawResourceVersions(ctx context.Context, c dbtx, n int) (int64, error) {
 	var rv int64
 	err := c.QueryRowContext(ctx,
 		`UPDATE resource_version_seq SET value = value + ? WHERE id = 1 RETURNING value`, n).Scan(&rv)
 	return rv, err
+}
+
+// refillVersions waits no longer than this for the writer connection. Matches the
+// DSN's busy_timeout, which bounds the lock wait but not the pool wait. Expiring
+// costs one fallback draw. A var so tests can shrink it.
+var refillTimeout = 5 * time.Second
+
+// refillVersions reserves the next block. It must run where no transaction is
+// open: a reservation that rolls back leaves the allocator handing out versions
+// the counter no longer covers.
+//
+// The draw is outside the allocator's lock. It waits for the writer connection,
+// which a sibling transaction may hold while itself waiting to take a version.
+func (s *sqliteStore) refillVersions(ctx context.Context) {
+	if blockSize <= 0 || !s.versions.spent() {
+		return
+	}
+	// Detached from the caller's deadline, since a cancelled refill leaves the block
+	// spent and puts every later write back on the fallback draw — but bounded, or a
+	// hook that left a sibling transaction open holds this commit for that
+	// transaction's whole life waiting on the one writer connection.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refillTimeout)
+	defer cancel()
+	hi, err := drawResourceVersions(ctx, s.db, blockSize)
+	if err != nil {
+		// Swallowed: the commit already landed, so this cannot be reported. The
+		// block stays spent and the next draw raises it where a caller can act.
+		return
+	}
+	s.versions.reserve(hi, blockSize)
+}
+
+// seedVersions puts the allocator above every version the previous process used.
+// The reservation doubles as the read: the draw reports the block's end, and what
+// sits below it is where that process left the counter.
+func (s *sqliteStore) seedVersions(ctx context.Context) error {
+	n := max(blockSize, 0)
+	hi, err := drawResourceVersions(ctx, s.db, n)
+	if err != nil {
+		return err
+	}
+	s.versions.reserve(hi, n)
+	// The counter's value before the draw: where the previous process left it.
+	s.versions.publish(hi - int64(n))
+	return nil
 }
 
 // scanWritten scans a mutator's RETURNING row and attaches its conditions,
@@ -668,7 +762,7 @@ func (s *sqliteStore) objectsCreate(ctx context.Context, gk storeapi.GroupKind, 
 	}
 	finalizers := marshalFinalizers(in.Finalizers)
 	c := s.conn(ctx)
-	rv, err := nextResourceVersion(ctx, c)
+	rv, err := s.nextResourceVersion(ctx, c)
 	if err != nil {
 		return nil, err
 	}
@@ -711,7 +805,7 @@ func (s *sqliteStore) recordObjectWrite(
 	id storeapi.ObjectID,
 	op int,
 ) (rv, now int64, err error) {
-	if rv, err = nextResourceVersion(ctx, c); err != nil {
+	if rv, err = s.nextResourceVersion(ctx, c); err != nil {
 		return 0, 0, err
 	}
 	now = toMillis(time.Now().UTC())
@@ -873,17 +967,19 @@ func (s sqliteObjects) Get(ctx context.Context, id storeapi.ObjectID) (*storeapi
 }
 
 // Objects().GetForReconcile is the reconcile loop's opening read (see the contract
-// on storeapi.Store). The cursor and the dependency flag are correlated
-// subqueries, riding the row read rather than adding round trips.
+// on storeapi.Store). The dependency flag is a correlated subquery, riding the row
+// read rather than adding a round trip.
+//
+// The cursor is read before the row, never after: a write committing in between
+// would be both unobserved by this load and at or below the watermark it stamps.
 func (s sqliteObjects) GetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
-	var load storeapi.ReconcileLoad
+	load := storeapi.ReconcileLoad{Cursor: s.versions.latest()}
 	row := s.read(ctx).QueryRowContext(ctx, `
 		SELECT `+objectColumns+`,
-		       (SELECT value FROM resource_version_seq WHERE id = 1),
 		       EXISTS (SELECT 1 FROM edges
 		                WHERE from_id = objects.id AND relation = 'depends_on')
 		  FROM objects WHERE id = ?`, id)
-	obj, err := scanObject(row, &load.Cursor, &load.HasDependencies)
+	obj, err := scanObject(row, &load.HasDependencies)
 	if err != nil {
 		return storeapi.ReconcileLoad{}, err
 	}
@@ -1057,13 +1153,11 @@ func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind)
 	return scanIDs(rows)
 }
 
-// GetLatestResourceVersion reads the sequence itself (contract on
-// storeapi.Store). One row, always present: the migration seeds it.
+// GetLatestResourceVersion reports the highest version a committed write took
+// (contract on storeapi.Store). A cursor above what was handed out would strand
+// every write in the gap.
 func (s *sqliteStore) GetLatestResourceVersion(ctx context.Context) (int64, error) {
-	var rv int64
-	err := s.read(ctx).QueryRowContext(ctx,
-		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)
-	return rv, err
+	return s.versions.latest(), nil
 }
 
 // Stamp records a page of findings in one statement (contract on
@@ -1977,7 +2071,7 @@ func (s sqliteEvents) Add(ctx context.Context, gk storeapi.GroupKind, id storeap
 		if err := s.checkObjectScoped(ctx, gk, id); err != nil {
 			return err
 		}
-		rv, err := nextResourceVersion(ctx, c)
+		rv, err := s.nextResourceVersion(ctx, c)
 		if err != nil {
 			return err
 		}
@@ -2335,36 +2429,30 @@ func (s sqliteObjects) DeleteFinalizer(ctx context.Context, gk storeapi.GroupKin
 // the IS NULL. It reports only whether it stamped; requestDeletion's probe
 // disambiguates a zero-row result (guard, scope or missing).
 //
-// The version is drawn lazily — calling nextResourceVersion first would make
-// every repeat delete commit a counter write to stamp nothing. The inline
-// `value + 1` matches the later draw exactly: same transaction, one connection.
-// The subquery tolerates a multi-row match only because every where here keys on
-// a unique column.
+// The version is drawn before the stamp, so a mark blocked by the guard burns one.
+// Gaps are free: every cursor compares `>`.
 func (s *sqliteStore) markForDeletion(ctx context.Context, where string, whereArgs ...any) (storeapi.ObjectID, bool, error) {
 	c := s.conn(ctx)
+	rv, err := s.nextResourceVersion(ctx, c)
+	if err != nil {
+		return 0, false, err
+	}
 	now := toMillis(time.Now().UTC())
-	args := append([]any{now, now}, whereArgs...)
+	args := append([]any{now, rv, now}, whereArgs...)
 	// RETURNING, not RowsAffected: the write log entry needs the row's identity,
 	// and the where here is a predicate rather than a known id.
 	row := c.QueryRowContext(ctx, `
 		UPDATE objects
 		SET deletion_requested_at = ?,
-		    resource_version = (SELECT value + 1 FROM resource_version_seq WHERE id = 1),
+		    resource_version = ?,
 		    updated_at = ?
 		WHERE (`+where+`) AND deletion_requested_at IS NULL
-		RETURNING id, "group", kind, resource_version`, args...)
+		RETURNING id, "group", kind`, args...)
 	var id storeapi.ObjectID
 	var gk storeapi.GroupKind
-	var rv int64
-	err := row.Scan(&id, &gk.Group, &gk.Kind, &rv)
-	if errors.Is(err, sql.ErrNoRows) {
+	if err := row.Scan(&id, &gk.Group, &gk.Kind); errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	// Commit the value the row above just took; same transaction, same connection.
-	if _, err := nextResourceVersion(ctx, c); err != nil {
+	} else if err != nil {
 		return 0, false, err
 	}
 	// The soft delete is an update: the row is still live and readable.
@@ -2392,7 +2480,7 @@ func (s *sqliteStore) markManyForDeletion(ctx context.Context, ids []storeapi.Ob
 	}
 	c := s.conn(ctx)
 	now := toMillis(time.Now().UTC())
-	end, err := advanceResourceVersion(ctx, c, len(ids))
+	end, err := s.advanceResourceVersion(ctx, c, len(ids))
 	if err != nil {
 		return nil, err
 	}
@@ -2650,7 +2738,7 @@ func (s *sqliteStore) objectsDelete(ctx context.Context, id storeapi.ObjectID) e
 	if _, err := c.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, id); err != nil {
 		return err
 	}
-	rv, err := nextResourceVersion(ctx, c)
+	rv, err := s.nextResourceVersion(ctx, c)
 	if err != nil {
 		return err
 	}

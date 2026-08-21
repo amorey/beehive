@@ -717,6 +717,7 @@ func breakEventRowRead(t *testing.T, store *sqliteStore) {
 
 // EventsAdd surfaces store faults from each of its steps.
 func TestAddEventStoreErrors(t *testing.T) {
+	withoutVersionBlocks(t)
 	ctx := context.Background()
 	ev := storeapi.EventsAddInput{Category: "c", Type: "Normal", Reason: "R"}
 
@@ -2141,9 +2142,25 @@ func TestRepeatDeletionRequestsCreateDoesNotBumpResourceVersion(t *testing.T) {
 	assert.Equal(t, first.UpdatedAt, second.UpdatedAt)
 }
 
-// seqValue reads the global write cursor's counter directly. Tests use it to tell
+// handedOut is the highest version the allocator has issued. Tests use it to tell
 // "this write consumed a version" from "the row's version did not move", which the
-// object row alone cannot distinguish: a drawn-but-unused value leaves no trace on it.
+// object row alone cannot distinguish: a drawn-but-unused value leaves no trace on
+// it. The counter row cannot answer it — that holds the reservation's end.
+func handedOut(store *sqliteStore) int64 {
+	store.versions.mu.Lock()
+	defer store.versions.mu.Unlock()
+	return store.versions.next - 1
+}
+
+// withoutVersionBlocks sends every draw to the counter row, which is the only way
+// to reach the fallback's error branch. Call it before the store is built: open
+// reserves a block.
+func withoutVersionBlocks(t *testing.T) {
+	t.Helper()
+	withBlockSize(t, 0)
+}
+
+// seqValue reads the counter row: the reservation's end, not what was handed out.
 func seqValue(t *testing.T, store *sqliteStore) int64 {
 	t.Helper()
 	var v int64
@@ -2152,24 +2169,25 @@ func seqValue(t *testing.T, store *sqliteStore) int64 {
 	return v
 }
 
-// A mark stamps the row with exactly the version it then commits to the counter, and
-// a mark blocked by the IS NULL guard draws nothing at all. The second half is the
-// point: the version is drawn lazily, so the already-pending path — the steady state
-// for a controller that idempotently deletes a child — writes no counter page and
-// leaves no gap in the cursor.
+// A mark stamps the row with the version it drew, and a mark that never reaches the
+// stamp draws nothing. The second half is the point: the probe answers an
+// already-pending row — the steady state for a controller that idempotently deletes
+// a child — before markForDeletion draws, so that path leaves no gap in the cursor.
+// A mark that reaches the stamp and is then blocked by the IS NULL guard does burn
+// one; gaps are free.
 func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	res, err := store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.True(t, res.Marked)
 
 	marked, err := store.Objects().Get(ctx, obj.ID)
 	require.NoError(t, err)
-	after := seqValue(t, store)
+	after := handedOut(store)
 	assert.Equal(t, before+1, after, "a stamped mark consumes exactly one version")
 	assert.Equal(t, after, marked.ResourceVersion,
 		"the row carries the value the counter committed, not one beside it")
@@ -2178,12 +2196,12 @@ func TestDeletionMarkDrawsAVersionOnlyWhenItStamps(t *testing.T) {
 	res, err = store.DeletionRequests().Create(ctx, testGK, obj.ID)
 	require.NoError(t, err)
 	require.False(t, res.Marked)
-	assert.Equal(t, after, seqValue(t, store), "a guard-blocked mark draws no version")
+	assert.Equal(t, after, handedOut(store), "the probe answers before the draw")
 
 	// Same for a mark that matches no row at all, via the other keying.
 	_, err = store.DeletionRequests().CreateByName(ctx, testGK, "no-such-name")
 	require.ErrorIs(t, err, beehive.ErrNotFound)
-	assert.Equal(t, after, seqValue(t, store), "a mark that matches nothing draws none either")
+	assert.Equal(t, after, handedOut(store), "a mark that matches nothing draws none either")
 }
 
 // ObjectsGetMeta returns the same row as ObjectsGet but skips assembling
@@ -4164,6 +4182,7 @@ func TestDeleteFinalizerRefusesAnUndecodableList(t *testing.T) {
 // must roll the whole thing back rather than leaving a row stamped with a version the
 // cursor never committed.
 func TestDeletionRequestsCreateVersionDrawError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5650,6 +5669,7 @@ func TestConditionAssemblyError(t *testing.T) {
 // bump: when the bump fails, the condition change is rolled back rather than
 // left applied without a version bump or watch event.
 func TestConditionResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newConditionObject(t, store, "rv-error")
@@ -5754,6 +5774,7 @@ func TestConditionsByIDsQueryError(t *testing.T) {
 // branch: the scoped read succeeds and the spec differs, then the version bump
 // fails because the sequence table is gone.
 func TestObjectsUpdateSpecResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5766,6 +5787,7 @@ func TestObjectsUpdateSpecResourceVersionError(t *testing.T) {
 // TestUpdateStatusResourceVersionError covers UpdateStatus's nextResourceVersion
 // branch (its first statement inside Within).
 func TestUpdateStatusResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5876,6 +5898,7 @@ func TestDeleteConditionDeleteExecError(t *testing.T) {
 // nextResourceVersion branch: a present finalizer is removed (a real change),
 // then the version bump fails.
 func TestDeleteFinalizerResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj, err := store.Objects().Create(ctx, testGK, beehive.ObjectsCreateInput{
@@ -5894,6 +5917,7 @@ func TestDeleteFinalizerResourceVersionError(t *testing.T) {
 // nextResourceVersion branch, reached via DeletionRequestsCreate on a live object whose
 // version bump fails.
 func TestDeletionRequestsCreateResourceVersionError(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -5916,6 +5940,7 @@ func TestDeletionRequestsCreateFromOwnerQueryError(t *testing.T) {
 // swallowed, and each leaves the level unstamped: a swallowed append in
 // particular is what would make a write invisible to every watch.
 func TestDeletionRequestsCreateFromOwnerMarkErrors(t *testing.T) {
+	withoutVersionBlocks(t)
 	for _, tc := range []struct {
 		name  string
 		block func(*testing.T, *sqliteStore)
@@ -6242,6 +6267,7 @@ func TestObjectWritesListSinceRejectsNonPositiveLimit(t *testing.T) {
 // would have stamped is gone, so there is nothing left for a scan of the write
 // log to report — removals are derived from a row's absence, not from a version.
 func TestObjectWriteVersionDrawFailureAborts(t *testing.T) {
+	withoutVersionBlocks(t)
 	ctx := context.Background()
 	store := newRawStore(t)
 	_, err := store.db.ExecContext(ctx, `DROP TABLE resource_version_seq`)
@@ -6298,13 +6324,13 @@ func TestCascadeGivesEachChildItsOwnVersionOutOfOneDraw(t *testing.T) {
 		children = append(children, child)
 	}
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 	got, err := store.DeletionRequests().CreateFromOwner(ctx, owner)
 	require.NoError(t, err)
 	require.Len(t, got.Children, len(children))
 
-	assert.Equal(t, before+int64(len(children)), seqValue(t, store),
+	assert.Equal(t, before+int64(len(children)), handedOut(store),
 		"one draw of N, not N draws and not one value shared")
 
 	// The version on each child's row, and the version its log entry claims.
@@ -6337,7 +6363,7 @@ func TestCascadeNumbersChildrenAcrossMarkChunks(t *testing.T) {
 		require.NoError(t, addEdge(ctx, store, mk(), owner, beehive.RelationOwnedBy))
 	}
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 	got, err := store.DeletionRequests().CreateFromOwner(ctx, owner)
 	require.NoError(t, err)
@@ -6367,7 +6393,7 @@ func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
 	_, err := store.DeletionRequests().Create(ctx, testGK, pending)
 	require.NoError(t, err)
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 
 	var marked map[storeapi.ObjectID]bool
@@ -6378,7 +6404,7 @@ func TestMarkManyForDeletionSkipsAPendingRowAndLeavesAGap(t *testing.T) {
 
 	assert.False(t, marked[pending], "the IS NULL guard, not the caller's read, decides")
 	assert.True(t, marked[live])
-	assert.Equal(t, before+2, seqValue(t, store), "both candidates drew; only one stamped")
+	assert.Equal(t, before+2, handedOut(store), "both candidates drew; only one stamped")
 
 	w := probe.expectWrite()
 	assert.Equal(t, live, w.ID)
@@ -6402,7 +6428,7 @@ func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
 		pending = append(pending, id)
 	}
 
-	before := seqValue(t, store)
+	before := handedOut(store)
 	probe := newWriteProbe(t, store)
 
 	var marked map[storeapi.ObjectID]bool
@@ -6413,7 +6439,7 @@ func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
 	}))
 
 	assert.Empty(t, marked, "the guard rejected every candidate")
-	assert.Equal(t, before+2, seqValue(t, store), "the range was drawn before the guard ran")
+	assert.Equal(t, before+2, handedOut(store), "the range was drawn before the guard ran")
 	assert.Empty(t, probe.writes(), "nothing stamped, nothing logged")
 }
 
@@ -6422,12 +6448,12 @@ func TestMarkManyForDeletionLogsNothingWhenEveryRowIsGuarded(t *testing.T) {
 func TestMarkManyForDeletionDrawsNothingForNoCandidates(t *testing.T) {
 	store := newRawStore(t)
 	ctx := context.Background()
-	before := seqValue(t, store)
+	before := handedOut(store)
 
 	marked, err := store.markManyForDeletion(ctx, nil)
 	require.NoError(t, err)
 	assert.Empty(t, marked)
-	assert.Equal(t, before, seqValue(t, store))
+	assert.Equal(t, before, handedOut(store))
 }
 
 // The cascade's own listing failure. Reached directly because the exported wrapper
@@ -7878,11 +7904,11 @@ func TestObjectsDeleteDrawsAResourceVersion(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
-	before := seqValue(t, store.(*sqliteStore))
+	before := handedOut(store.(*sqliteStore))
 
 	require.NoError(t, store.Objects().Delete(ctx, obj.ID))
 
-	assert.Greater(t, seqValue(t, store.(*sqliteStore)), before)
+	assert.Greater(t, handedOut(store.(*sqliteStore)), before)
 }
 
 // The delete entry carries the object as it was, conditions included. Nothing
@@ -8492,6 +8518,7 @@ func TestReadImagesSurfacesADBError(t *testing.T) {
 // Collection needs a version for its log entry, so a store that cannot draw one
 // fails the delete rather than removing the row unrecorded.
 func TestObjectsDeleteFailsWithoutAVersionToDraw(t *testing.T) {
+	withoutVersionBlocks(t)
 	store := newRawStore(t)
 	ctx := context.Background()
 	obj := newRefObject(t, store)
@@ -8633,8 +8660,33 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 	status := regexp.MustCompile(`\bstatus\b`)
 	writesObjects := regexp.MustCompile(`(?is)(INSERT\s+INTO\s+objects|UPDATE\s+objects)`)
 
+	sites := sqlSites(t, func(sql string) bool {
+		return writesObjects.MatchString(sql) && status.MatchString(sql)
+	})
+	assert.ElementsMatch(t, []string{"objectsCreate", "UpdateStatus"}, sites,
+		"objects.status is written by the create (as NULL) and UpdateStatus, and nowhere else")
+}
+
+// sqlSites names every function in this package holding a string literal that
+// match accepts. Blind to a statement built by concatenation and to SQL outside
+// this package.
+func sqlSites(t *testing.T, match func(sql string) bool) []string {
+	t.Helper()
 	var sites []string
-	require.NoError(t, filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+	require.NoError(t, inspectPackage(t, func(fn string, n ast.Node) {
+		lit, ok := n.(*ast.BasicLit)
+		if ok && lit.Kind == token.STRING && match(lit.Value) {
+			sites = append(sites, fn)
+		}
+	}))
+	return sites
+}
+
+// inspectPackage walks this package's non-test files, calling visit with the name
+// of the enclosing function for every node.
+func inspectPackage(t *testing.T, visit func(fn string, n ast.Node)) error {
+	t.Helper()
+	return filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
@@ -8647,25 +8699,14 @@ func TestObjectStatusIsWrittenInOnePlace(t *testing.T) {
 		}
 		var fn string
 		ast.Inspect(file, func(n ast.Node) bool {
-			switch node := n.(type) {
-			case *ast.FuncDecl:
-				fn = node.Name.Name
-			case *ast.BasicLit:
-				if node.Kind != token.STRING {
-					return true
-				}
-				sql := node.Value
-				if writesObjects.MatchString(sql) && status.MatchString(sql) {
-					sites = append(sites, fn)
-				}
+			if decl, ok := n.(*ast.FuncDecl); ok {
+				fn = decl.Name.Name
 			}
+			visit(fn, n)
 			return true
 		})
 		return nil
-	}))
-
-	assert.ElementsMatch(t, []string{"objectsCreate", "UpdateStatus"}, sites,
-		"objects.status is written by the create (as NULL) and UpdateStatus, and nowhere else")
+	})
 }
 
 // The changed report is what the layer above gates its wake on, so it tracks the
