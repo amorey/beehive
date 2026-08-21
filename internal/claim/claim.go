@@ -18,32 +18,48 @@ package claim
 
 import "sync"
 
+// Held is what Take hands back, and what Drop releases. Its zero value holds
+// nothing, so a holder that never claimed needs no flag of its own.
+type Held struct {
+	key string
+	// tok distinguishes this claim from a later one on the same key. Never zero
+	// for a real claim.
+	tok uint64
+}
+
 // Set is a set of held keys. The zero value is ready to use, and a Set is safe
 // for concurrent use.
 type Set struct {
-	mu sync.Mutex
-	m  map[string]struct{}
+	mu   sync.Mutex
+	m    map[string]uint64
+	next uint64
 }
 
 // Take claims k, reporting false if it is already held.
-func (s *Set) Take(k string) bool {
+func (s *Set) Take(k string) (Held, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, held := s.m[k]; held {
-		return false
+		return Held{}, false
 	}
 	if s.m == nil {
-		s.m = make(map[string]struct{})
+		s.m = make(map[string]uint64)
 	}
-	s.m[k] = struct{}{}
-	return true
+	s.next++
+	s.m[k] = s.next
+	return Held{key: k, tok: s.next}, true
 }
 
-// Drop releases k. Owed exactly once per successful Take: a second Drop would
-// release whatever took k in between, so a holder that may release twice
-// records its own claim and checks that record first.
-func (s *Set) Drop(k string) {
+// Drop releases h, and does nothing if h is not the claim now held. Callers owe
+// no bookkeeping for that: a second Drop, or one racing a Take that already
+// re-claimed the key, cannot release the claim it finds.
+func (s *Set) Drop(h Held) {
+	if h.tok == 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.m, k)
+	if s.m[h.key] == h.tok {
+		delete(s.m, h.key)
+	}
 }

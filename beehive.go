@@ -176,9 +176,9 @@ type Beehive struct {
 	tailers map[GroupKind]*objectTailer
 
 	state beehiveState
-	// claim is the key this Beehive holds in beehiveClaims, empty when it holds
-	// none.
-	claim  string
+	// claim is what this Beehive holds in beehiveClaims; its zero value holds
+	// nothing.
+	claim  claim.Held
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -468,31 +468,24 @@ var beehiveClaims claim.Set
 // claimStore reserves bh.store's database for bh.
 func (bh *Beehive) claimStore() error {
 	id := bh.store.Identity()
-	// Refused rather than claimed: "" names no database, so two unrelated
-	// stores would collide on it — and it is what an unclaimed bh.claim is.
+	// "" names no database, so two unrelated stores would collide on it.
 	if id == "" {
 		return fmt.Errorf("beehive: store %T reports no identity", bh.store)
 	}
-	if !beehiveClaims.Take(id) {
+	held, ok := beehiveClaims.Take(id)
+	if !ok {
 		return ErrStoreInUse
 	}
-	bh.claim = id
+	bh.claim = held
 	return nil
 }
 
-// releaseStore drops the key claimStore took. Held rather than re-derived:
-// Identity is contracted to be stable, but a Store that broke that would leak
-// its own claim and evict whoever holds the key it now reports. An empty claim
-// is a Beehive that never started, which must evict nobody.
-//
-// Needs no lock of its own: claimStore writes bh.claim under bh.mu, and stop's
-// state switch lets one caller past, so two goroutines are never both here.
+// releaseStore drops what claimStore took. Holding the claim rather than
+// re-deriving the key is what makes this safe when Identity is not: a Store
+// that changed its answer would otherwise evict whoever holds the key it now
+// reports.
 func (bh *Beehive) releaseStore() {
-	if bh.claim == "" {
-		return
-	}
 	beehiveClaims.Drop(bh.claim)
-	bh.claim = ""
 }
 
 // New creates a control plane backed by store s. Register controllers on the

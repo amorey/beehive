@@ -25,19 +25,52 @@ import (
 func TestTakeHoldsOneKeyAtATime(t *testing.T) {
 	var s Set
 
-	require.True(t, s.Take("a"), "the zero value is ready to use")
-	assert.False(t, s.Take("a"))
-	assert.True(t, s.Take("b"), "a second key is unaffected")
+	a, ok := s.Take("a")
+	require.True(t, ok, "the zero value is ready to use")
+	_, ok = s.Take("a")
+	assert.False(t, ok)
+	_, ok = s.Take("b")
+	assert.True(t, ok, "a second key is unaffected")
 
-	s.Drop("a")
-	assert.True(t, s.Take("a"), "the drop released it")
+	s.Drop(a)
+	_, ok = s.Take("a")
+	assert.True(t, ok, "the drop released it")
 }
 
-// Dropping a key nobody took is a no-op rather than a panic.
-func TestDropIsSafeWithoutATake(t *testing.T) {
+// The zero Held is what a holder that never claimed carries, so dropping it
+// must release nothing.
+func TestDropIgnoresTheZeroHeld(t *testing.T) {
 	var s Set
-	s.Drop("a")
-	assert.True(t, s.Take("a"))
+	held, ok := s.Take("a")
+	require.True(t, ok)
+
+	s.Drop(Held{})
+	_, ok = s.Take("a")
+	assert.False(t, ok, "the zero Held released someone else's claim")
+
+	s.Drop(held)
+	_, ok = s.Take("a")
+	assert.True(t, ok)
+}
+
+// A stale Held names a claim that has since ended, which is what frees every
+// holder from tracking whether its own release already ran.
+func TestDropIgnoresAStaleHeld(t *testing.T) {
+	var s Set
+	first, ok := s.Take("a")
+	require.True(t, ok)
+	s.Drop(first)
+
+	second, ok := s.Take("a")
+	require.True(t, ok)
+
+	s.Drop(first)
+	_, ok = s.Take("a")
+	assert.False(t, ok, "a stale Held evicted the claim that replaced it")
+
+	s.Drop(second)
+	_, ok = s.Take("a")
+	assert.True(t, ok)
 }
 
 func TestTakeIsSafeForConcurrentUse(t *testing.T) {
@@ -47,7 +80,7 @@ func TestTakeIsSafeForConcurrentUse(t *testing.T) {
 
 	for range 8 {
 		taken.Go(func() {
-			if s.Take("a") {
+			if _, ok := s.Take("a"); ok {
 				wins <- struct{}{}
 			}
 		})
