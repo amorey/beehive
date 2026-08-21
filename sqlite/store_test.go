@@ -9600,12 +9600,13 @@ func TestBothObjectListingsReadTheSameRow(t *testing.T) {
 // hot read from being silently unprepared: add one with its SQL inline and it
 // shows up here.
 func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
-	anySQL := regexp.MustCompile(`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)`)
+	anySQL := regexp.MustCompile(
+		`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|PRAGMA\s|SAVEPOINT|ROLLBACK TO|RELEASE)`)
 
 	var inFunctions []string
 	for _, fn := range sqlLiteralSites(t, anySQL.MatchString) {
 		// The *SQL builders hold the text of prepared statements.
-		if strings.HasSuffix(fn, "SQL") {
+		if strings.HasSuffix(fn, "SQL") || unpreparable[fn] != "" {
 			continue
 		}
 		inFunctions = append(inFunctions, fn)
@@ -9613,6 +9614,20 @@ func TestOnlyRenderedSQLLivesInAFunction(t *testing.T) {
 
 	assert.ElementsMatch(t, renderedSQLSites, unique(inFunctions),
 		"SQL inside a function must be rendered from a runtime count; everything else is a field")
+}
+
+// unpreparable is the functions holding constant statements SQLite will not let
+// us prepare, each with the reason. An exemption without one is how these went
+// unnoticed until they were found by hand.
+var unpreparable = map[string]string{
+	"pageCounters": "constant, but page_count and freelist_count must run on the " +
+		"connection that vacuums between them, or released stops being a difference " +
+		"of two reads on one snapshot",
+	"freePagesRelease": "PRAGMA incremental_vacuum(N) interpolates its budget: " +
+		"SQLite takes no bound parameter in a pragma argument, and the ? form fails " +
+		"at prepare, not at execution",
+	"txState.nested": "a savepoint name is not a parameter either, and the names " +
+		"are monotonic and unbounded, so there is no statement per name to prepare",
 }
 
 // renderedSQLSites is the functions still holding SQL whose text varies with
@@ -9985,4 +10000,21 @@ func TestTheConditionUpsertCarriesNonASCIIText(t *testing.T) {
 	require.Len(t, got.Conditions, 1)
 	assert.Equal(t, "Pret", got.Conditions[0].Type)
 	assert.Equal(t, "demarre \u2192\u2713", got.Conditions[0].Message)
+}
+
+// Every exemption must still be earning it. A stale entry is how the hole this
+// check closes was left open: the exempt list is only as good as the last time
+// somebody proved each line still fires.
+func TestEveryUnpreparableExemptionIsLive(t *testing.T) {
+	anySQL := regexp.MustCompile(
+		`(?is)\b(SELECT\s|INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM|PRAGMA\s|SAVEPOINT|ROLLBACK TO|RELEASE)`)
+
+	found := map[string]bool{}
+	for _, fn := range sqlLiteralSites(t, anySQL.MatchString) {
+		found[fn] = true
+	}
+	for fn, why := range unpreparable {
+		assert.True(t, found[fn], "%s is exempt but holds no statement: %s", fn, why)
+		assert.NotEmpty(t, why, "%s is exempt without a reason", fn)
+	}
 }
