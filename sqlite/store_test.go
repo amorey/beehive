@@ -9960,3 +9960,32 @@ func TestTheBatchedWriteLogAppendRecordsEveryWrite(t *testing.T) {
 		seen[w.ResourceVersion] = true
 	}
 }
+
+// conn's two pool routes, neither of which any caller takes today: every write
+// left that goes through it runs inside Within. Both are contract, not accident —
+// the second is what an AfterCommit hook's detached ctx relies on, and without it
+// a write issued there would fail with sql.ErrTxDone instead of committing
+// standalone.
+func TestConnFallsBackToThePoolWithoutALiveTransaction(t *testing.T) {
+	store := newRawStore(t)
+	ctx := context.Background()
+
+	c, err := store.conn(ctx)
+	require.NoError(t, err)
+	pool, ok := c.(*sql.DB)
+	require.True(t, ok, "no transaction: the pool")
+	assert.Same(t, store.db, pool)
+
+	// A ctx that outlives its transaction, which is what a hook is handed.
+	var expired context.Context
+	require.NoError(t, store.Within(ctx, func(ctx context.Context) error {
+		expired = ctx
+		return nil
+	}))
+
+	c, err = store.conn(expired)
+	require.NoError(t, err)
+	pool, ok = c.(*sql.DB)
+	require.True(t, ok, "closed transaction: the pool, not a handle that is done")
+	assert.Same(t, store.db, pool)
+}
