@@ -21,6 +21,8 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/amorey/beehive/internal/sqlitemigrate"
@@ -30,14 +32,57 @@ import (
 //go:embed migrations
 var migrations embed.FS
 
-// Open opens (or creates) a Beehive SQLite database at path,
-// running any pending schema migrations before returning.
-func Open(path string) (*sqliteStore, error) {
-	return open(sqlitemigrate.OpenPool(path, 1))
+// ErrInvalidOption reports an option value that has no meaning. Local to this
+// package: the store must not import the control plane.
+var ErrInvalidOption = errors.New("beehive/sqlite: option value is invalid")
+
+// defaultReadConnections is a guess: one connection already keeps reads out of
+// the writers' queue, and more helps only readers that genuinely overlap.
+const defaultReadConnections = 4
+
+// Option configures a store at Open. Deliberately not beehive's option type:
+// the embedder builds the store and hands it to beehive.New, so beehive's
+// option machinery never sees one.
+type Option func(*openOptions)
+
+type openOptions struct{ readConns int }
+
+// WithReadConnections sets how many connections serve reads. This bounds read
+// concurrency, not total connections — the writer is always one. Below 1 is
+// ErrInvalidOption.
+//
+// Ignored by OpenMemory, which cannot open its database twice.
+func WithReadConnections(n int) Option {
+	return func(o *openOptions) { o.readConns = n }
+}
+
+// Open opens (or creates) a Beehive SQLite database at path, running any
+// pending schema migrations before returning. Reads that are not inside a
+// transaction run on their own pool; see WithReadConnections.
+func Open(path string, opts ...Option) (*sqliteStore, error) {
+	o := openOptions{readConns: defaultReadConnections}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.readConns < 1 {
+		return nil, fmt.Errorf("%w: read connections must be at least 1, got %d", ErrInvalidOption, o.readConns)
+	}
+	s, err := open(sqlitemigrate.OpenPool(path, 1))
+	if err != nil {
+		return nil, err
+	}
+	// After open: migrations run on the writer, and a reader opened first would
+	// hold a schema that does not exist yet.
+	s.readDB = sqlitemigrate.OpenReadPool(path, o.readConns)
+	return s, nil
 }
 
 // OpenMemory opens a Beehive SQLite database in memory. Intended for testing;
 // data is lost when the store is closed.
+//
+// No read pool: file::memory: is per-connection, so a second pool would be a
+// different and empty database. Reads run on the writer, and the split is
+// covered by on-disk tests alone.
 //
 // auto_vacuum matches OpenPool: it cannot change after the first table exists,
 // so a test database on another mode would silently skip ReclaimSpace.
@@ -56,6 +101,8 @@ func open(db *sql.DB) (*sqliteStore, error) {
 	}
 	return &sqliteStore{
 		db: db,
+		// Aliased until a caller opens a read pool, so read never branches.
+		readDB: db,
 		// Truncated to ms to match condition timestamps: a sub-ms processStart would
 		// wrongly flag a condition written in the process's first millisecond.
 		processStart: fromMillis(toMillis(time.Now().UTC())),

@@ -96,6 +96,10 @@ const (
 type sqliteStore struct {
 	db *sql.DB
 
+	// readDB serves reads that are not inside a transaction. Aliased to db where
+	// the database cannot be opened twice (see OpenMemory).
+	readDB *sql.DB
+
 	// txCount counts transactions begun; a nested Within (savepoint) does not add.
 	// Test-only, to assert a fast path answered without BEGIN IMMEDIATE.
 	txCount atomic.Int64
@@ -108,7 +112,13 @@ type sqliteStore struct {
 // Close closes the database. Idempotent; the store owns no goroutines, so there
 // is nothing else to tear down.
 func (s *sqliteStore) Close() error {
-	return s.db.Close()
+	// Readers first: they hold snapshots the writer's checkpoint waits on. The
+	// writer closes whatever happened above it, so a failed reader cannot leak it.
+	var readErr error
+	if s.readDB != s.db {
+		readErr = s.readDB.Close()
+	}
+	return errors.Join(readErr, s.db.Close())
 }
 
 // Drain floor: release only past both an absolute size and a share of the file.
@@ -472,15 +482,53 @@ type dbtx interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// roDBTX is dbtx without ExecContext, and read returns it so a write issued the
+// ordinary way does not compile onto the reader. A runtime check could not
+// stand in: inside a transaction read hands back that transaction, where a
+// write would commit on the writer and look correct.
+//
+// It is not airtight. A DELETE or UPDATE with RETURNING is issued through
+// QueryContext, which this interface keeps — deleteWriteLogRows is the one such
+// caller, and its comment is what holds it on conn. Adding a second means
+// reading that, not leaning on the type.
+type roDBTX interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // conn returns the ambient transaction if ctx carries a live one, else the pool.
 // A closed txState degrades to the pool — the ctx outlives its transaction, so a
 // write issued on it commits standalone rather than failing with sql.ErrTxDone.
 // Hooks should use the detached ctx AfterCommit hands them.
 func (s *sqliteStore) conn(ctx context.Context) dbtx {
-	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
-		return fr.st.tx
+	if st := liveTx(ctx); st != nil {
+		return st.tx
 	}
 	return s.db
+}
+
+// read returns the connection a read-only statement runs on: the ambient
+// transaction while it is live, else the read pool.
+//
+// Returning the transaction is the whole safety property, not an optimisation.
+// A read issued inside a transaction on any other connection sees the database
+// as of before that transaction's own uncommitted writes — and unlike today's
+// deadlock, that failure is silent.
+func (s *sqliteStore) read(ctx context.Context) roDBTX {
+	if st := liveTx(ctx); st != nil {
+		return st.tx
+	}
+	return s.readDB
+}
+
+// liveTx returns the ctx's transaction frame while it is still open. A ctx
+// outlives its transaction, so a closed frame reads as none: a statement issued
+// on it commits standalone rather than failing with sql.ErrTxDone.
+func liveTx(ctx context.Context) *txState {
+	if fr, ok := txFrom(ctx); ok && !fr.st.isClosed() {
+		return fr.st
+	}
+	return nil
 }
 
 // Within runs fn inside a single transaction. A nested Within joins the outer
@@ -749,7 +797,7 @@ func (s *sqliteStore) selectScoped(
 		q = `SELECT "group", kind, ` + cols + ` FROM objects WHERE id = ?`
 	}
 	var group, kind string
-	err := s.conn(ctx).QueryRowContext(ctx, q, id).
+	err := s.read(ctx).QueryRowContext(ctx, q, id).
 		Scan(append([]any{&group, &kind}, dest...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storeapi.ErrNotFound // bare, like scanObject's
@@ -784,7 +832,7 @@ func (s *sqliteStore) probeObjectScoped(ctx context.Context, gk storeapi.GroupKi
 // nil.
 func (s *sqliteStore) checkObjectExists(ctx context.Context, id storeapi.ObjectID) error {
 	var one int
-	err := s.conn(ctx).QueryRowContext(ctx, `SELECT 1 FROM objects WHERE id = ?`, id).Scan(&one)
+	err := s.read(ctx).QueryRowContext(ctx, `SELECT 1 FROM objects WHERE id = ?`, id).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storeapi.ErrNotFound // bare, like scanObject's
 	}
@@ -798,7 +846,7 @@ func (s *sqliteStore) checkObjectScoped(ctx context.Context, gk storeapi.GroupKi
 
 // getObjectRow reads the objects row without assembling conditions.
 func (s *sqliteStore) getObjectRow(ctx context.Context, id storeapi.ObjectID) (*storeapi.RawObject, error) {
-	row := s.conn(ctx).QueryRowContext(ctx,
+	row := s.read(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE id = ?`, id)
 	return scanObject(row)
 }
@@ -829,7 +877,7 @@ func (s sqliteObjects) Get(ctx context.Context, id storeapi.ObjectID) (*storeapi
 // subqueries, riding the row read rather than adding round trips.
 func (s sqliteObjects) GetForReconcile(ctx context.Context, id storeapi.ObjectID) (storeapi.ReconcileLoad, error) {
 	var load storeapi.ReconcileLoad
-	row := s.conn(ctx).QueryRowContext(ctx, `
+	row := s.read(ctx).QueryRowContext(ctx, `
 		SELECT `+objectColumns+`,
 		       (SELECT value FROM resource_version_seq WHERE id = 1),
 		       EXISTS (SELECT 1 FROM edges
@@ -861,7 +909,7 @@ func (s sqliteObjects) GetMetaByName(ctx context.Context, gk storeapi.GroupKind,
 // getObjectRowByName is getObjectRow keyed by name within gk. No ErrWrongKind:
 // the kind is in the WHERE.
 func (s *sqliteStore) getObjectRowByName(ctx context.Context, gk storeapi.GroupKind, name string) (*storeapi.RawObject, error) {
-	row := s.conn(ctx).QueryRowContext(ctx,
+	row := s.read(ctx).QueryRowContext(ctx,
 		`SELECT `+objectColumns+` FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
 		gk.Group, gk.Kind, name)
 	return scanObject(row)
@@ -895,12 +943,12 @@ func (s sqliteObjects) ListByIncomingEdge(ctx context.Context, gk storeapi.Group
 // ordered by id, conditions attached. tail is a fixed internal fragment, never
 // user input; only its bound arguments come from the caller.
 func (s *sqliteStore) listObjectsWhere(ctx context.Context, tail string, args ...any) ([]*storeapi.RawObject, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT `+objectColumns+` FROM objects o `+tail+` ORDER BY o.id`, args...)
 	if err != nil {
 		return nil, err
 	}
-	// scanObjects closes rows, freeing the single connection for the conditions query.
+	// scanObjects closes rows, releasing their connection before the conditions query.
 	out, err := scanObjects(rows)
 	if err != nil {
 		return nil, err
@@ -940,7 +988,8 @@ func (s *sqliteStore) conditionsByIDs(ctx context.Context, ids []storeapi.Object
 }
 
 // conditionsByIDsChunk runs one chunk, merging rows into out; it closes its
-// result set so the next chunk can run on the single connection.
+// result set so the next chunk reuses that connection rather than taking
+// another from the read pool.
 func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, out map[storeapi.ObjectID][]storeapi.Condition) error {
 	args := make([]any, len(ids))
 	placeholders := make([]string, len(ids))
@@ -948,7 +997,7 @@ func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.O
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT `+conditionColumns+` FROM conditions
 		 WHERE object_id IN (`+strings.Join(placeholders, ",")+`)
 		 ORDER BY object_id, type`, args...)
@@ -969,7 +1018,7 @@ func (s *sqliteStore) conditionsByIDsChunk(ctx context.Context, ids []storeapi.O
 }
 
 func (s sqliteObjects) ListUnsettledIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
 		 WHERE "group" = ? AND kind = ?
 		   AND (observed_generation IS NULL OR observed_generation < generation)
@@ -986,7 +1035,7 @@ func (s sqliteDeletionRequests) List(ctx context.Context) ([]storeapi.ObjectRef,
 	// rides along for routing. idx_objects_deleting covers exactly this column
 	// list and order — keep them in step, or the plan silently gains a row fetch
 	// or a temp B-tree.
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT id, "group", kind FROM objects
 		 WHERE deletion_requested_at IS NOT NULL ORDER BY id`)
 	if err != nil {
@@ -997,7 +1046,7 @@ func (s sqliteDeletionRequests) List(ctx context.Context) ([]storeapi.ObjectRef,
 
 func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
 	// Matches the partial index idx_objects_reconcile_owed WHERE reconcile_owed != 0.
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT id FROM objects
 		 WHERE "group" = ? AND kind = ? AND reconcile_owed != 0
 		 ORDER BY id`,
@@ -1012,7 +1061,7 @@ func (s sqliteReconcileOwed) ListIDs(ctx context.Context, gk storeapi.GroupKind)
 // storeapi.Store). One row, always present: the migration seeds it.
 func (s *sqliteStore) GetLatestResourceVersion(ctx context.Context) (int64, error) {
 	var rv int64
-	err := s.conn(ctx).QueryRowContext(ctx,
+	err := s.read(ctx).QueryRowContext(ctx,
 		`SELECT value FROM resource_version_seq WHERE id = 1`).Scan(&rv)
 	return rv, err
 }
@@ -1112,7 +1161,7 @@ func (s sqliteDependencies) ListStaleSince(ctx context.Context, kinds []storeapi
 	args = append(args, after.TargetVersion, after.TargetID, after.DependentID, through)
 	args = append(args, kindArgs...)
 	args = append(args, limit)
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT t.resource_version, t.id, e.from_id, d."group", d.kind
 		  FROM objects t
 		  CROSS JOIN edges e ON e.to_id = t.id AND e.relation = 'depends_on'
@@ -1166,7 +1215,7 @@ func (s sqliteDependencies) WatermarkSet(ctx context.Context, id storeapi.Object
 }
 
 func (s sqliteObjects) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]storeapi.ObjectID, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT id FROM objects WHERE "group" = ? AND kind = ? ORDER BY id`,
 		gk.Group, gk.Kind)
 	if err != nil {
@@ -1186,7 +1235,7 @@ func (s sqliteObjects) ListIDs(ctx context.Context, gk storeapi.GroupKind) ([]st
 // that compares them needs both at one instant.
 func (s sqliteObjectWrites) MaxVersionAll(ctx context.Context) (int64, int64, error) {
 	var at, trimmed int64
-	err := s.conn(ctx).QueryRowContext(ctx,
+	err := s.read(ctx).QueryRowContext(ctx,
 		`SELECT coalesce((SELECT MAX(resource_version) FROM object_writes), 0), `+writeLogHorizonAll).
 		Scan(&at, &trimmed)
 	return at, trimmed, err
@@ -1206,7 +1255,7 @@ func (s sqliteObjectWrites) ListSinceAll(ctx context.Context, afterRV int64, lim
 		// Would reach SQLite as "LIMIT -1" (unbounded) or panic in make below.
 		return nil, 0, nil
 	}
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT `+writeLogColumns+`, `+writeLogHorizonAll+`
 		  FROM object_writes
 		 WHERE resource_version > ? ORDER BY resource_version LIMIT ?`,
@@ -1249,7 +1298,7 @@ func scanWriteLog(rows *sql.Rows, limit int) ([]storeapi.ObjectWrite, int64, err
 // a trailing column, which every row repeats. One function, so a broken read is
 // one error rather than a query branch and a scan branch that cannot both happen.
 func (s *sqliteStore) writeLogPage(ctx context.Context, gk storeapi.GroupKind, afterRV int64, limit int) ([]storeapi.ObjectWrite, int64, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT `+writeLogColumns+`,
 		       coalesce((SELECT trimmed_through FROM object_writes_horizon
 		                  WHERE "group" = ? AND kind = ?), 0)
@@ -1296,7 +1345,7 @@ func (s *sqliteStore) attachImages(ctx context.Context, page []storeapi.ObjectWr
 
 // readImages decodes the row images stored against the given versions.
 func (s *sqliteStore) readImages(ctx context.Context, versions []any) (map[int64]*storeapi.RawObject, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT resource_version, final FROM object_writes
 		  WHERE resource_version IN (`+placeholders(len(versions))+`)`, versions...)
 	if err != nil {
@@ -1555,7 +1604,7 @@ const conditionColumns = `object_id, type, status, reason, message, liveness,
 
 // loadConditions returns id's conditions, ordered by type for a stable view.
 func (s *sqliteStore) loadConditions(ctx context.Context, id storeapi.ObjectID) ([]storeapi.Condition, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT `+conditionColumns+` FROM conditions WHERE object_id = ? ORDER BY type`, id)
 	if err != nil {
 		return nil, err
@@ -1661,7 +1710,7 @@ func (s *sqliteStore) loadForConditionSet(
 }
 
 // loadForConditionSetChunk runs one chunk, merging rows into out; it closes its
-// result set so the next chunk can run on the single connection.
+// result set so the next chunk can run on the transaction's connection.
 func (s *sqliteStore) loadForConditionSetChunk(
 	ctx context.Context,
 	gk storeapi.GroupKind,
@@ -1674,7 +1723,7 @@ func (s *sqliteStore) loadForConditionSetChunk(
 		args = append(args, cond.Type)
 	}
 	args = append(args, id)
-	rows, err := s.conn(ctx).QueryContext(ctx, conditionSetLoad(len(conds)), args...)
+	rows, err := s.read(ctx).QueryContext(ctx, conditionSetLoad(len(conds)), args...)
 	if err != nil {
 		return err
 	}
@@ -1889,7 +1938,7 @@ func scanEventInto(sc scanner, e *storeapi.Event, extra ...any) error {
 // step could name an older run latest — and Events().Add would extend a run the log
 // has moved past. idx_events_latest serves this order.
 func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, category string) (*storeapi.Event, error) {
-	row := s.conn(ctx).QueryRowContext(ctx,
+	row := s.read(ctx).QueryRowContext(ctx,
 		`SELECT `+eventColumns+` FROM events WHERE object_id = ? AND category = ?
 		 ORDER BY id DESC LIMIT 1`, id, category)
 	e, err := scanEvent(row)
@@ -1906,7 +1955,7 @@ func (s *sqliteStore) latestEventRun(ctx context.Context, id storeapi.ObjectID, 
 // ok=false on an empty timeline. Events().Add needs only the key; decoding columns
 // it would discard would let a decode fault mask the write.
 func (s *sqliteStore) latestEventKey(ctx context.Context, id storeapi.ObjectID, category string) (evID storeapi.EventID, typ, reason string, ok bool, err error) {
-	row := s.conn(ctx).QueryRowContext(ctx,
+	row := s.read(ctx).QueryRowContext(ctx,
 		`SELECT id, type, reason FROM events WHERE object_id = ? AND category = ?
 		 ORDER BY id DESC LIMIT 1`, id, category)
 	err = row.Scan(&evID, &typ, &reason)
@@ -1997,7 +2046,7 @@ func (s sqliteEvents) List(ctx context.Context, id storeapi.ObjectID, q storeapi
 		query += " LIMIT ?"
 		args = append(args, q.Limit)
 	}
-	rows, err := s.conn(ctx).QueryContext(ctx, query, args...)
+	rows, err := s.read(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2068,7 +2117,7 @@ func (s sqliteEvents) ListSince(
 func (s *sqliteStore) eventPage(
 	ctx context.Context, id storeapi.ObjectID, category *string, afterRV int64, limit int,
 ) ([]storeapi.Event, int64, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT `+eventColumns+`,
 		       coalesce((SELECT MAX(trimmed_through) FROM events_horizon
 		                  WHERE object_id = ?1 AND (?2 IS NULL OR category = ?2)), 0)
@@ -2100,7 +2149,7 @@ func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, ca
 		where, args = where+` AND category = ?`, append(args, *category)
 	}
 	var rv sql.NullInt64
-	err := s.conn(ctx).QueryRowContext(ctx,
+	err := s.read(ctx).QueryRowContext(ctx,
 		`SELECT MAX(trimmed_through) FROM events_horizon WHERE `+where, args...).Scan(&rv)
 	return rv.Int64, err
 }
@@ -2111,7 +2160,7 @@ func (s *sqliteStore) eventHorizon(ctx context.Context, id storeapi.ObjectID, ca
 // (TestEventsMaxVersionUsesCoveringIndex pins the plan).
 func (s sqliteEvents) MaxVersion(ctx context.Context, id storeapi.ObjectID) (int64, error) {
 	var rv sql.NullInt64
-	err := s.conn(ctx).QueryRowContext(ctx,
+	err := s.read(ctx).QueryRowContext(ctx,
 		`SELECT MAX(resource_version) FROM events WHERE object_id = ?`, id).Scan(&rv)
 	return rv.Int64, err
 }
@@ -2170,7 +2219,7 @@ type timeline struct {
 // overCapTimelines reads the candidates in full: the trims that follow run on the
 // same connection, so the cursor must be closed before they start.
 func (s *sqliteStore) overCapTimelines(ctx context.Context, perTimeline, capBudget int) ([]timeline, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, eventCapCandidates, perTimeline, capBudget)
+	rows, err := s.read(ctx).QueryContext(ctx, eventCapCandidates, perTimeline, capBudget)
 	if err != nil {
 		return nil, err
 	}
@@ -2398,7 +2447,7 @@ func (s *sqliteStore) markManyForDeletionChunk(
 // of a full row read.
 func (s *sqliteStore) probeDeletionByName(ctx context.Context, gk storeapi.GroupKind, name string) (bool, error) {
 	var deletionAt sql.NullInt64
-	err := s.conn(ctx).QueryRowContext(ctx,
+	err := s.read(ctx).QueryRowContext(ctx,
 		`SELECT deletion_requested_at FROM objects WHERE "group" = ? AND kind = ? AND name = ?`,
 		gk.Group, gk.Kind, name).Scan(&deletionAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2468,7 +2517,7 @@ func (s *sqliteStore) unblockedTargetsChunk(ctx context.Context, fromIDs []store
 		args = append(args, id)
 	}
 	args = append(args, string(storeapi.RelationDependsOn))
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id IN (`+placeholders(len(fromIDs))+`) AND r.relation = ?
@@ -2515,7 +2564,7 @@ func (s sqliteDeletionRequests) CreateFromOwner(ctx context.Context, ownerID sto
 }
 
 func (s *sqliteStore) deletionRequestsCreateFromOwner(ctx context.Context, ownerID storeapi.ObjectID) (storeapi.DeletionCascadeResult, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind, o.deletion_requested_at
 		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?`+edgeOrderByReferrer, ownerID, string(storeapi.RelationOwnedBy))
@@ -2635,7 +2684,7 @@ func (s sqliteEdges) Add(ctx context.Context, fromID, toID storeapi.ObjectID, re
 		// endpoint yields no row — clean ErrNotFound over an FK violation.
 		var to storeapi.GroupKind
 		var toDeletedAt *int64
-		err := s.conn(ctx).QueryRowContext(ctx, `
+		err := s.read(ctx).QueryRowContext(ctx, `
 			SELECT t."group", t.kind, t.deletion_requested_at
 			FROM objects f, objects t WHERE f.id = ? AND t.id = ?`,
 			fromID, toID).Scan(&to.Group, &to.Kind, &toDeletedAt)
@@ -2735,7 +2784,7 @@ func (s sqliteEdges) Delete(ctx context.Context, fromID, toID storeapi.ObjectID,
 	// it cannot be turned off.
 	var to storeapi.GroupKind
 	var unblocked int
-	err = s.conn(ctx).QueryRowContext(ctx, `
+	err = s.read(ctx).QueryRowContext(ctx, `
 		SELECT t."group", t.kind,
 		       t.deletion_requested_at IS NOT NULL AND f.deletion_requested_at IS NULL
 		FROM objects t, objects f WHERE t.id = ? AND f.id = ?`,
@@ -2755,7 +2804,7 @@ func (s sqliteEdges) Delete(ctx context.Context, fromID, toID storeapi.ObjectID,
 // Edges().ListIncoming returns the objects pointing at toID through relation, joining edges
 // to objects so each carries the GroupKind needed to route a requeue.
 func (s sqliteEdges) ListIncoming(ctx context.Context, toID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.from_id
 		WHERE r.to_id = ? AND r.relation = ?`+edgeOrderByReferrer, toID, string(relation))
@@ -2792,7 +2841,8 @@ func (s *sqliteStore) edgesByIDs(ctx context.Context, ids []storeapi.ObjectID, r
 }
 
 // edgesByIDsChunk runs one chunk, merging rows into out; it closes its result
-// set so the next chunk can run on the single connection.
+// set so the next chunk reuses that connection rather than taking another from
+// the read pool.
 func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.ObjectID, relation storeapi.Relation, routeCol, joinCol string, out map[storeapi.ObjectID][]storeapi.ObjectRef) error {
 	args := make([]any, 0, len(ids)+1)
 	placeholders := make([]string, len(ids))
@@ -2801,7 +2851,7 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 		args = append(args, id)
 	}
 	args = append(args, string(relation))
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT r.`+routeCol+`, o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.`+joinCol+`
 		WHERE r.`+routeCol+` IN (`+strings.Join(placeholders, ",")+`) AND r.relation = ?
@@ -2823,7 +2873,7 @@ func (s *sqliteStore) edgesByIDsChunk(ctx context.Context, ids []storeapi.Object
 // ListOutgoing returns the distinct objects fromID points at (any
 // relation); DISTINCT collapses an object reached through several relations.
 func (s sqliteEdges) ListOutgoing(ctx context.Context, fromID storeapi.ObjectID) ([]storeapi.ObjectRef, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT DISTINCT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id = ?`+edgeOrderByTarget, fromID)
@@ -2836,7 +2886,7 @@ func (s sqliteEdges) ListOutgoing(ctx context.Context, fromID storeapi.ObjectID)
 // Edges().ListOutgoingByRelation returns the objects fromID points at through relation. No
 // DISTINCT needed: (from_id, to_id, relation) is unique.
 func (s sqliteEdges) ListOutgoingByRelation(ctx context.Context, fromID storeapi.ObjectID, relation storeapi.Relation) ([]storeapi.ObjectRef, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx, `
+	rows, err := s.read(ctx).QueryContext(ctx, `
 		SELECT o.id, o."group", o.kind
 		FROM edges r JOIN objects o ON o.id = r.to_id
 		WHERE r.from_id = ? AND r.relation = ?`+edgeOrderByTarget, fromID, string(relation))
@@ -2906,7 +2956,7 @@ func (s sqliteEdges) DeleteFinalizingDependsOn(ctx context.Context, toID storeap
 // counts: the foreground cascade waits for physical removal.
 func (s sqliteEdges) HasIncoming(ctx context.Context, id storeapi.ObjectID) (bool, error) {
 	var exists int
-	err := s.conn(ctx).QueryRowContext(ctx, `
+	err := s.read(ctx).QueryRowContext(ctx, `
 		SELECT EXISTS(
 			SELECT 1 FROM edges r
 			WHERE r.to_id = ?
@@ -2923,7 +2973,7 @@ func (s sqliteEdges) HasIncoming(ctx context.Context, id storeapi.ObjectID) (boo
 // missing row is ok=false: absence is the ordinary first-run state, not a fault.
 func (s sqliteDriverCursors) Get(ctx context.Context, name string) (int64, bool, error) {
 	var cursor int64
-	err := s.conn(ctx).QueryRowContext(ctx,
+	err := s.read(ctx).QueryRowContext(ctx,
 		`SELECT cursor FROM driver_cursors WHERE name = ?`, name).Scan(&cursor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, nil
@@ -3096,7 +3146,7 @@ func (s sqliteObjectWrites) ListSince(ctx context.Context, gk storeapi.GroupKind
 // trimmed, which is 0 rather than an error.
 func (s *sqliteStore) trimmedThrough(ctx context.Context, gk storeapi.GroupKind) (int64, error) {
 	var trimmed int64
-	err := s.conn(ctx).QueryRowContext(ctx, `
+	err := s.read(ctx).QueryRowContext(ctx, `
 		SELECT trimmed_through FROM object_writes_horizon
 		 WHERE "group" = ? AND kind = ?`, gk.Group, gk.Kind).Scan(&trimmed)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3114,7 +3164,7 @@ func (s sqliteObjectWrites) MaxVersion(ctx context.Context, gk storeapi.GroupKin
 	// One statement, not two: this is a watch's entire quiet-tick budget, and
 	// both halves are covering-index seeks that fold for free.
 	var at int64
-	err := s.conn(ctx).QueryRowContext(ctx, `
+	err := s.read(ctx).QueryRowContext(ctx, `
 		SELECT max(
 			coalesce((SELECT MAX(resource_version) FROM object_writes
 			           WHERE "group" = ? AND kind = ?), 0),
@@ -3172,7 +3222,7 @@ func (s sqliteObjectWrites) Sweep(ctx context.Context, perKind int, maxAge time.
 // only step of the count trim that is not a seek — kinds number in the handful
 // where entries number in the millions, so it is the right axis to iterate.
 func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, error) {
-	rows, err := s.conn(ctx).QueryContext(ctx,
+	rows, err := s.read(ctx).QueryContext(ctx,
 		`SELECT DISTINCT "group", kind FROM object_writes`)
 	if err != nil {
 		return nil, err
@@ -3190,8 +3240,9 @@ func (s *sqliteStore) writeLogKinds(ctx context.Context) ([]storeapi.GroupKind, 
 
 // deleteWriteLogRows deletes the entries matching where and reports the highest
 // version removed per kind, with the total. Closes its rows before returning, so
-// the horizon writes that follow get the single connection back.
+// the horizon writes that follow get the transaction's connection back.
 func (s *sqliteStore) deleteWriteLogRows(ctx context.Context, where string, args ...any) (map[storeapi.GroupKind]int64, int, error) {
+	// conn, not read: a DELETE ... RETURNING is a write however it is issued.
 	rows, err := s.conn(ctx).QueryContext(ctx,
 		`DELETE FROM object_writes WHERE `+where+`
 		 RETURNING "group", kind, resource_version`, args...)

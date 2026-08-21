@@ -303,3 +303,47 @@ func TestApplyQuerySchemaVersionError(t *testing.T) {
 	_, err = Apply(ctx, db, fsWith(t, map[string]string{}), "migrations")
 	require.Error(t, err)
 }
+
+// seededPath returns a path to a database holding one table with one row.
+func seededPath(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "r.db")
+	db := OpenPool(path, 1)
+	defer db.Close()
+	_, err := db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)`)
+	require.NoError(t, err)
+	_, err = db.Exec(`INSERT INTO t VALUES (1, 'a')`)
+	require.NoError(t, err)
+	return path
+}
+
+func TestOpenReadPoolReads(t *testing.T) {
+	db := OpenReadPool(seededPath(t), 2)
+	defer db.Close()
+
+	var v string
+	require.NoError(t, db.QueryRow(`SELECT v FROM t WHERE id = 1`).Scan(&v))
+	require.Equal(t, "a", v)
+}
+
+func TestOpenReadPoolRefusesWrites(t *testing.T) {
+	db := OpenReadPool(seededPath(t), 2)
+	defer db.Close()
+
+	_, err := db.Exec(`INSERT INTO t VALUES (2, 'b')`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "readonly", "want a write refusal, not a lock timeout")
+}
+
+// The reader must not inherit _txlock=immediate: BEGIN IMMEDIATE takes a write
+// lock, which query_only refuses, so every transaction on it would fail.
+func TestOpenReadPoolBeginsDeferred(t *testing.T) {
+	db := OpenReadPool(seededPath(t), 2)
+	defer db.Close()
+
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{})
+	require.NoError(t, err, "a plain BEGIN must work on the reader")
+	var v string
+	require.NoError(t, tx.QueryRow(`SELECT v FROM t WHERE id = 1`).Scan(&v))
+	require.NoError(t, tx.Commit())
+}

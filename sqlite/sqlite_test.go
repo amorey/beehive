@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/amorey/beehive/internal/sqlitemigrate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -101,4 +102,64 @@ func tableExists(t *testing.T, db *sql.DB, name string) bool {
 	}
 	require.NoError(t, err)
 	return true
+}
+
+func TestOpenSizesTheReadPool(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+		want int
+	}{
+		{"default", nil, defaultReadConnections},
+		{"explicit", []Option{WithReadConnections(2)}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := Open(filepath.Join(t.TempDir(), "b.db"), tc.opts...)
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, store.Close()) })
+			assert.Equal(t, tc.want, store.readDB.Stats().MaxOpenConnections)
+		})
+	}
+
+	for _, n := range []int{0, -1} {
+		_, err := Open(filepath.Join(t.TempDir(), "bad.db"), WithReadConnections(n))
+		assert.ErrorIs(t, err, ErrInvalidOption, "n = %d", n)
+	}
+}
+
+// file::memory: is per-connection, so a second pool would be a different and
+// empty database. Reads run on the writer instead, and the option is a no-op.
+func TestOpenMemoryAliasesTheReadPool(t *testing.T) {
+	store, err := OpenMemory()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, store.Close()) })
+	assert.Same(t, store.db, store.readDB)
+}
+
+func TestCloseClosesBothPools(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "b.db"))
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	assert.Error(t, store.readDB.Ping(), "the read pool should be closed too")
+	assert.NoError(t, store.Close(), "Close is idempotent")
+}
+
+// A failed migration is reported rather than half-opened, and no read pool is
+// built behind it — the reader opens only after the writer has migrated.
+func TestOpenReportsAMigrationFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "newer.db")
+	db := sqlitemigrate.OpenPool(path, 1)
+	_, err := db.Exec(`CREATE TABLE schema_migrations (
+		version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`)
+	require.NoError(t, err)
+	// A version this binary does not have: Apply refuses to downgrade.
+	_, err = db.Exec(`INSERT INTO schema_migrations VALUES (9999, 'from a newer binary', 0)`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	store, err := Open(path)
+	require.Error(t, err)
+	assert.Nil(t, store)
+	assert.Contains(t, err.Error(), "newer than binary supports")
 }
