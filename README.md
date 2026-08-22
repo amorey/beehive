@@ -410,6 +410,7 @@ type Client[Spec, Status any] interface {
     // Creating: the name is positional, because there is no id yet.
     Create(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], error)
     GetOrCreate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
+    CreateOrUpdate(ctx context.Context, name string, spec Spec, opts ...Option) (*Object[Spec, Status], bool, error)
 
     // Id-keyed: acts on one incarnation, or returns ErrNotFound.
     Update(ctx context.Context, id ObjectID, spec Spec) (*Object[Spec, Status], error)
