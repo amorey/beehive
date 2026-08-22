@@ -3311,7 +3311,7 @@ func TestWatchResumeGivesUpWithTheCaller(t *testing.T) {
 // place, so A's re-write keeps A's original queue position while carrying the
 // newer version, which is the one way the drain sees them out of order.
 func TestDrainPendingIsAscendingByResourceVersion(t *testing.T) {
-	hub := conflate.New[ObjectID](mergeRawChange)
+	hub := conflate.New[ObjectID](conflate.WithDefaultMerge(mergeRawChange))
 	defer hub.Close()
 	rx := hub.Receiver()
 	defer rx.Close()

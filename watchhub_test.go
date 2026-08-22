@@ -24,8 +24,8 @@ import (
 )
 
 // The zero hub is inert rather than fatal: a Beehive built field by field has
-// one, and reconcile paths publish through it. watch is the exception, since a
-// receiver has to be tied to a hub.
+// one, and reconcile paths publish through it. Registering is the exception,
+// since a receiver has to be tied to a hub.
 func TestZeroWatchHubIsInert(t *testing.T) {
 	var h watchHub[GroupKind, struct{}]
 
@@ -33,7 +33,15 @@ func TestZeroWatchHubIsInert(t *testing.T) {
 	assert.NotPanics(t, h.Close)
 	assert.NotPanics(t, h.Close, "and again")
 
-	rx, ok := h.watch(clientTestGK, struct{}{})
+	rx, ok := h.watch(clientTestGK)
+	assert.False(t, ok)
+	assert.Nil(t, rx)
+
+	rx, ok = h.watchFrom(clientTestGK, struct{}{})
+	assert.False(t, ok)
+	assert.Nil(t, rx)
+
+	rx, ok = h.watchAcross()
 	assert.False(t, ok)
 	assert.Nil(t, rx)
 }
@@ -43,7 +51,7 @@ func TestZeroWatchHubIsInert(t *testing.T) {
 // first — and only the sender close is safe against a concurrent send.
 func TestWatchHubCloseDrainsTheLastValue(t *testing.T) {
 	h := watchHub[GroupKind, int]{hub: watch.New[GroupKind, int]()}
-	rx, ok := h.watch(clientTestGK, 0)
+	rx, ok := h.watch(clientTestGK)
 	require.True(t, ok)
 	defer rx.Close()
 
