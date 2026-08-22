@@ -53,7 +53,7 @@ func (h watchHub[K, V]) watch(k K, initial V) (*watch.Receiver[K, V], bool) {
 	if h.hub == nil {
 		return nil, false
 	}
-	return h.hub.Watch(k, initial), true
+	return h.hub.Watch(k, h.hub.WithBaseline(initial)), true
 }
 
 // watchAcross registers a receiver for every key. One slot like any other
@@ -63,7 +63,7 @@ func (h watchHub[K, V]) watchAcross(initial V) (*watch.Receiver[K, V], bool) {
 	if h.hub == nil {
 		return nil, false
 	}
-	return h.hub.WatchAcross(initial), true
+	return h.hub.WatchAcross(h.hub.WithBaseline(initial)), true
 }
 
 // Close ends the sender; see the type's doc for why it is never the hub.

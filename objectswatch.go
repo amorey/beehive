@@ -443,7 +443,7 @@ func newObjectTailer(ctx context.Context, bh *Beehive, gk GroupKind) (*objectTai
 	t := &objectTailer{
 		bh:         bh,
 		gk:         gk,
-		hub:        conflate.New[ObjectID](mergeRawChange),
+		hub:        conflate.New[ObjectID](conflate.WithDefaultMerge(mergeRawChange)),
 		kindWrites: written,
 		floor:      bh.watchFloor(),
 		retry:      bh.watchBackoff(),
