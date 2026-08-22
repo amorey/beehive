@@ -236,7 +236,7 @@ func newKindWriteHub() kindWriteHub { return kindWriteHub{newSignalHub[GroupKind
 // its cursor is store-wide, and an edge can point at a kind no per-kind watch
 // would name.
 func (h kindWriteHub) WatchAcross() (*watch.Receiver[GroupKind, struct{}], bool) {
-	return h.watchAcross(struct{}{})
+	return h.watchAcross()
 }
 
 // tailerFor returns the kind's tailer with a subscriber lease held on it,

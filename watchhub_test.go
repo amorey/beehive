@@ -33,7 +33,7 @@ func TestZeroWatchHubIsInert(t *testing.T) {
 	assert.NotPanics(t, h.Close)
 	assert.NotPanics(t, h.Close, "and again")
 
-	rx, ok := h.watch(clientTestGK, struct{}{})
+	rx, ok := h.watch(clientTestGK)
 	assert.False(t, ok)
 	assert.Nil(t, rx)
 }
@@ -43,7 +43,7 @@ func TestZeroWatchHubIsInert(t *testing.T) {
 // first — and only the sender close is safe against a concurrent send.
 func TestWatchHubCloseDrainsTheLastValue(t *testing.T) {
 	h := watchHub[GroupKind, int]{hub: watch.New[GroupKind, int]()}
-	rx, ok := h.watch(clientTestGK, 0)
+	rx, ok := h.watch(clientTestGK)
 	require.True(t, ok)
 	defer rx.Close()
 

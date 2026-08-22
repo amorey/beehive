@@ -45,25 +45,24 @@ func (h watchHub[K, V]) send(k K, v V) error {
 	return h.hub.Sender().Send(k, v)
 }
 
-// watch registers a receiver for k, seeded with initial. ok is false on the
-// zero hub: unlike send and Close this cannot no-op, since a receiver has to be
-// tied to a hub, so the caller turns it into an error rather than a nil
-// dereference.
-func (h watchHub[K, V]) watch(k K, initial V) (*watch.Receiver[K, V], bool) {
+// watch registers a receiver for k. ok is false on the zero hub: unlike send
+// and Close this cannot no-op, since a receiver has to be tied to a hub, so the
+// caller turns it into an error rather than a nil dereference.
+func (h watchHub[K, V]) watch(k K, opts ...watch.WatchOption[K, V]) (*watch.Receiver[K, V], bool) {
 	if h.hub == nil {
 		return nil, false
 	}
-	return h.hub.Watch(k, h.hub.WithBaseline(initial)), true
+	return h.hub.Watch(k, opts...), true
 }
 
 // watchAcross registers a receiver for every key. One slot like any other
 // receiver, so a burst across keys collapses to one value. Zero hub as in
 // watch.
-func (h watchHub[K, V]) watchAcross(initial V) (*watch.Receiver[K, V], bool) {
+func (h watchHub[K, V]) watchAcross(opts ...watch.WatchOption[K, V]) (*watch.Receiver[K, V], bool) {
 	if h.hub == nil {
 		return nil, false
 	}
-	return h.hub.WatchAcross(h.hub.WithBaseline(initial)), true
+	return h.hub.WatchAcross(opts...), true
 }
 
 // Close ends the sender; see the type's doc for why it is never the hub.
@@ -88,8 +87,8 @@ func newSignalHub[K comparable]() signalHub[K] {
 
 func (h signalHub[K]) Send(k K) error { return h.send(k, struct{}{}) }
 
-// Watch registers a receiver for k. Registration is the baseline and the bus
-// never delivers it back, so a receiver reads only writes that follow it.
+// Watch registers a receiver for k. A receiver reads only sends that follow it,
+// and carries no baseline: there is no value to compare and no Accept to compare it.
 func (h signalHub[K]) Watch(k K) (*watch.Receiver[K, struct{}], bool) {
-	return h.watch(k, struct{}{})
+	return h.watch(k)
 }
