@@ -48,21 +48,31 @@ func (h watchHub[K, V]) send(k K, v V) error {
 // watch registers a receiver for k. ok is false on the zero hub: unlike send
 // and Close this cannot no-op, since a receiver has to be tied to a hub, so the
 // caller turns it into an error rather than a nil dereference.
-func (h watchHub[K, V]) watch(k K, opts ...watch.WatchOption[K, V]) (*watch.Receiver[K, V], bool) {
+func (h watchHub[K, V]) watch(k K) (*watch.Receiver[K, V], bool) {
 	if h.hub == nil {
 		return nil, false
 	}
-	return h.hub.Watch(k, opts...), true
+	return h.hub.Watch(k), true
+}
+
+// watchFrom is watch, seeding the receiver with the value the caller just read.
+// Only a hub with an Accept has any use for it: the baseline is what the first
+// Accept compares against, and the bus never delivers it back.
+func (h watchHub[K, V]) watchFrom(k K, baseline V) (*watch.Receiver[K, V], bool) {
+	if h.hub == nil {
+		return nil, false
+	}
+	return h.hub.Watch(k, h.hub.WithBaseline(baseline)), true
 }
 
 // watchAcross registers a receiver for every key. One slot like any other
 // receiver, so a burst across keys collapses to one value. Zero hub as in
 // watch.
-func (h watchHub[K, V]) watchAcross(opts ...watch.WatchOption[K, V]) (*watch.Receiver[K, V], bool) {
+func (h watchHub[K, V]) watchAcross() (*watch.Receiver[K, V], bool) {
 	if h.hub == nil {
 		return nil, false
 	}
-	return h.hub.WatchAcross(opts...), true
+	return h.hub.WatchAcross(), true
 }
 
 // Close ends the sender; see the type's doc for why it is never the hub.

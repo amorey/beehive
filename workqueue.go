@@ -543,7 +543,7 @@ func (h scheduleHub) Send(id ObjectID, s gaugeValue) error { return h.send(id, s
 // The queue always builds its hub, so the zero-hub case watchHub reports cannot
 // arise here and scheduleBus need not carry it.
 func (h scheduleHub) Watch(id ObjectID, initial gaugeValue) *watch.Receiver[ObjectID, gaugeValue] {
-	rx, _ := h.watch(id, h.hub.WithBaseline(initial))
+	rx, _ := h.watchFrom(id, initial)
 	return rx
 }
 
