@@ -32,6 +32,7 @@ owed one.
 go build ./...
 go vet ./...
 staticcheck -checks=all ./...   # CI runs this; -checks=all flags unused unexported code
+govulncheck ./...               # CI runs this; needs network for the vuln database
 go run ./examples/greeting/main.go   # the end-to-end smoke target
 go run ./examples/events/main.go     # Events API demo: a connection-health panel
 go run ./examples/lowpower/main.go   # every public cadence at minutes; pushes carry it
