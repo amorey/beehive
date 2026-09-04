@@ -482,7 +482,7 @@ func TestConditionsOnlyControllerSettlesByReturningSettled(t *testing.T) {
 	bh := newTestBeehive(t, store)
 
 	reconciled := make(chan struct{}, 4)
-	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 		if err := cc.SetCondition(ctx, Condition{Type: "Synced", Status: ConditionFalse, Reason: "Paused"}); err != nil {
 			return Fail(err)
 		}
@@ -892,7 +892,7 @@ type redeclareController struct {
 	first, hot *signal
 }
 
-func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
+func (c *redeclareController) Reconcile(ctx context.Context, cc ControllerClient[tStatus], obj *Object[tSpec, tStatus]) Result {
 	if obj.ID == c.target {
 		return Settled()
 	}
@@ -1338,7 +1338,7 @@ func TestObservedGenerationStampWakesTheKindsWatches(t *testing.T) {
 	bh := newTestBeehive(t, newClientTestStore(t), fast(WithWatchFloorInterval(time.Hour))...)
 
 	var settle atomic.Bool
-	ctrl := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) ReconcileResult {
+	ctrl := &funcController{fn: func(context.Context, ControllerClient[cStatus], *Object[cSpec, cStatus]) Result {
 		if settle.Load() {
 			return Settled()
 		}
@@ -1377,7 +1377,7 @@ func TestPassClientStopsWorkingWhenReconcileReturns(t *testing.T) {
 		passes   int
 	)
 	ran := make(chan struct{}, 4)
-	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 		passes++
 		if passes == 1 {
 			// Only the first pass's client is captured, so the test reads it
@@ -1457,7 +1457,7 @@ func TestPassClientIsSafeAgainstAConcurrentCaller(t *testing.T) {
 		lateErr atomic.Value
 	)
 	ran := make(chan struct{}, 4)
-	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+	inner := &funcController{fn: func(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

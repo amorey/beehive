@@ -1603,7 +1603,7 @@ func TestTheWakerSeedReachesTheDatabase(t *testing.T) {
 // invisible to it.
 type settlingCapture struct{ ch chan ObjectID }
 
-func (c *settlingCapture) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+func (c *settlingCapture) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 	if err := cc.UpdateStatus(ctx, cStatus{}); err != nil {
 		return Fail(err)
 	}

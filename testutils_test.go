@@ -1290,7 +1290,7 @@ type noopController[Spec, Status any] struct{}
 
 // Unsettled, and far enough out that nothing re-dispatches inside a test: a
 // Settled pass would stamp the generation, a real write these tests do not expect.
-func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) ReconcileResult {
+func (noopController[Spec, Status]) Reconcile(_ context.Context, _ ControllerClient[Status], _ *Object[Spec, Status]) Result {
 	return Unsettled().RequeueAfter(time.Hour)
 }
 
@@ -1551,7 +1551,7 @@ type reconcileCapture struct {
 	ch chan *Object[tSpec, tStatus]
 }
 
-func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) ReconcileResult {
+func (c *reconcileCapture) Reconcile(_ context.Context, _ ControllerClient[tStatus], obj *Object[tSpec, tStatus]) Result {
 	c.ch <- obj
 	return Settled()
 }
@@ -2031,7 +2031,7 @@ func watchFixtureWith(t *testing.T, opts ...Option) (*pollProbeStore, *Beehive, 
 
 // reconcilePass splits the failure back out of the result, the shape most
 // reconcile tests assert on.
-func reconcilePass(a controllerAdapter, ctx context.Context, id ObjectID) (ReconcileResult, bool, error) {
+func reconcilePass(a controllerAdapter, ctx context.Context, id ObjectID) (Result, bool, error) {
 	result, gone := a.reconcile(ctx, id)
 	return result, gone, result.err
 }

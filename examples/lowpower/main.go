@@ -53,7 +53,7 @@ type PanelStatus struct{ Connected bool }
 // PanelController connects a panel to its source, once.
 type PanelController struct{}
 
-func (c *PanelController) Reconcile(ctx context.Context, client beehive.ControllerClient[PanelStatus], obj *beehive.Object[PanelSpec, PanelStatus]) beehive.ReconcileResult {
+func (c *PanelController) Reconcile(ctx context.Context, client beehive.ControllerClient[PanelStatus], obj *beehive.Object[PanelSpec, PanelStatus]) beehive.Result {
 	if obj.DeletionRequestedAt != nil || (obj.Status != nil && obj.Status.Connected) {
 		return beehive.Settled()
 	}

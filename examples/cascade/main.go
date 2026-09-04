@@ -67,7 +67,7 @@ type ClusterCacheStatus struct{ Entries int }
 // caches that use it — then closes it and clears the finalizer.
 type ClusterController struct{}
 
-func (c *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
+func (c *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.Result {
 	if obj.DeletionRequestedAt != nil {
 		// Hold the connection open while any cache still has a live claim on us.
 		// HasIncomingEdges ignores caches that are themselves finalizing, so this clears
@@ -100,7 +100,7 @@ func (c *ClusterController) Reconcile(ctx context.Context, client beehive.Contro
 // clears its finalizer so GC can remove the row.
 type ClusterCacheController struct{}
 
-func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) beehive.ReconcileResult {
+func (c *ClusterCacheController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterCacheStatus], obj *beehive.Object[ClusterCacheSpec, ClusterCacheStatus]) beehive.Result {
 	if obj.DeletionRequestedAt != nil {
 		fmt.Printf("ClusterCache %d: flushed local cache; releasing finalizer\n", obj.ID)
 		if err := client.DeleteFinalizer(ctx, cacheFlushFinalizer); err != nil {

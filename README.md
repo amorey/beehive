@@ -40,7 +40,7 @@ type ClusterStatus struct {
 
 type ClusterController struct{}
 
-func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
+func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.Result {
   // Handle deletion: object is finalizing when DeletionRequestedAt is set.
   // Remove any external resources, then clear the finalizer to allow the row to be deleted.
   if obj.DeletionRequestedAt != nil {
@@ -333,17 +333,17 @@ func (o *Object[Spec, Status]) Events() ([]Event, error)
 
 Once loaded, an empty slice — or `ok == false` from `Owner` — means there really are none. `ErrNotLoaded` means you forgot to ask: fetch the relation eagerly with a `Load*()` option, or lazily through the `Client`/`ControllerClient` methods below.
 
-### ReconcileResult
+### Result
 
 What `Reconcile` returns. No exported fields; three constructors build every value, and `RequeueAfter` schedules the next pass.
 
 ```go
-func Settled() ReconcileResult                                    // observed this generation; beehive records it
-func Unsettled() ReconcileResult                                  // real work done, not caught up yet
-func Fail(err error) ReconcileResult                              // the pass failed; backoff ladder
+func Settled() Result       // observed this generation; beehive records it
+func Unsettled() Result     // real work done, not caught up yet
+func Fail(err error) Result // the pass failed; backoff ladder
 
-func (ReconcileResult) RequeueAfter(d time.Duration) ReconcileResult // schedule the next pass
-func (ReconcileResult) Err() error                                  // the failure, or nil
+func (Result) RequeueAfter(d time.Duration) Result // schedule the next pass
+func (Result) Err() error                          // the failure, or nil
 ```
 
 | Return | Records `ObservedGeneration` | Requeue |
@@ -360,7 +360,7 @@ A bare `Unsettled()` schedules its own return because nothing else would: the ow
 
 `RequeueAfter` is ignored on a `Fail`, which takes the backoff ladder.
 
-`ReconcileResult{}` and `Fail(nil)` fail the pass with `ErrInvalidResult`. Neither can settle anything, and `Err()` reports the sentinel for both.
+`Result{}` and `Fail(nil)` fail the pass with `ErrInvalidResult`. Neither can settle anything, and `Err()` reports the sentinel for both.
 
 ### Schedule
 
@@ -571,7 +571,7 @@ type ProjectController struct {
 // Ensure the Cluster this Project owns exists, without ever mutating it. The
 // options apply only if this call creates the row — a pre-existing row is
 // returned exactly as it is (see the caveat below).
-func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.ControllerClient[ProjectStatus], obj *beehive.Object[ProjectSpec, ProjectStatus]) beehive.ReconcileResult {
+func (p *ProjectController) Reconcile(ctx context.Context, cc beehive.ControllerClient[ProjectStatus], obj *beehive.Object[ProjectSpec, ProjectStatus]) beehive.Result {
     cluster, created, err := p.clusters.GetOrCreate(ctx, "prod-cluster", ClusterSpec{...},
         beehive.WithOwner(obj.ID), beehive.WithFinalizers("kstack.sh/cluster"))
     if err != nil {
@@ -782,7 +782,7 @@ A pass that settles a *new* generation therefore costs two write-log entries whe
 
 ```go
 type Controller[Spec, Status any] interface {
-    Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) ReconcileResult
+    Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) Result
 }
 ```
 

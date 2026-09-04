@@ -291,7 +291,7 @@ func TestTriggerDispatchesAfterStart(t *testing.T) {
 	bh := newTestBeehive(t, store, parked()...)
 
 	passes := make(chan ObjectID, 4)
-	ctl := &funcController{fn: func(_ context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+	ctl := &funcController{fn: func(_ context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 		passes <- obj.ID
 		return Settled()
 	}}

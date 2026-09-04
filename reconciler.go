@@ -40,7 +40,7 @@ type controllerAdapter interface {
 	// queued for it rather than dispatching an ErrNotFound. The result is
 	// normalized, and on a branch with no controller behind it carries only a
 	// scheduling decision — the handshake is written in here, not by the worker.
-	reconcile(ctx context.Context, id ObjectID) (result ReconcileResult, gone bool)
+	reconcile(ctx context.Context, id ObjectID) (result Result, gone bool)
 }
 
 // typedController adapts a generic Controller[Spec, Status] to the non-generic
@@ -81,7 +81,7 @@ func (t *typedController[Spec, Status]) log() *slog.Logger {
 // transaction: each ControllerClient write commits on its own; a controller
 // that needs atomicity uses ControllerClient.Within. GC runs afterwards, in its
 // own transaction.
-func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (ReconcileResult, bool) {
+func (t *typedController[Spec, Status]) reconcile(ctx context.Context, id ObjectID) (Result, bool) {
 	log := t.log().With("id", id)
 
 	load, err := t.bh.store.Objects().GetForReconcile(ctx, id)
@@ -264,7 +264,7 @@ func (r *reconciler) enqueueAll(ctx context.Context) {
 
 // scheduleNext arms the pass after this one. Every branch schedules something,
 // or the cadence chain breaks. Never called for a collected object.
-func (r *reconciler) scheduleNext(id ObjectID, result ReconcileResult) {
+func (r *reconciler) scheduleNext(id ObjectID, result Result) {
 	switch {
 	case !result.succeeded():
 		if errors.Is(result.err, ErrInvalidResult) {

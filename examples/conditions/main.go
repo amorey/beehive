@@ -69,7 +69,7 @@ type ServerController struct {
 	online map[beehive.ObjectID]int // replicas this process has brought online
 }
 
-func (c *ServerController) Reconcile(ctx context.Context, client beehive.ControllerClient[ServerStatus], obj *beehive.Object[ServerSpec, ServerStatus]) beehive.ReconcileResult {
+func (c *ServerController) Reconcile(ctx context.Context, client beehive.ControllerClient[ServerStatus], obj *beehive.Object[ServerSpec, ServerStatus]) beehive.Result {
 	want := obj.Spec.Replicas
 
 	// Bring one more replica online this pass, modeling a pool that warms up

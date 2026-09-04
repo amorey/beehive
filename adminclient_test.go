@@ -67,7 +67,7 @@ func (tcStatusV2Migrator) ConvertStatus(_ int, _ json.RawMessage) (json.RawMessa
 
 type tcStubController struct{}
 
-func (tcStubController) Reconcile(context.Context, ControllerClient[tcStatus], *Object[tcSpec, tcStatus]) ReconcileResult {
+func (tcStubController) Reconcile(context.Context, ControllerClient[tcStatus], *Object[tcSpec, tcStatus]) Result {
 	return Settled()
 }
 

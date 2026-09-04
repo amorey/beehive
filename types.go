@@ -242,16 +242,15 @@ func (o *Object[Spec, Status]) Events() ([]Event, error) {
 	return o.events, nil
 }
 
-// ErrInvalidResult is what an unusable ReconcileResult — the zero value, or
-// Fail(nil) — fails the pass with. It settles nothing and takes the backoff
-// ladder.
-var ErrInvalidResult = errors.New("beehive: unusable ReconcileResult")
+// ErrInvalidResult is what an unusable Result — the zero value, or Fail(nil) —
+// fails the pass with. It settles nothing and takes the backoff ladder.
+var ErrInvalidResult = errors.New("beehive: unusable Result")
 
 // ErrReconcileReturned is returned by every method of the ControllerClient
 // Reconcile was passed, once it has returned.
 var ErrReconcileReturned = errors.New("beehive: the ControllerClient passed to Reconcile is no longer usable")
 
-// Zero names no kind, which is what makes the zero ReconcileResult detectable.
+// Zero names no kind, which is what makes the zero Result detectable.
 type resultKind uint8
 
 const (
@@ -261,9 +260,9 @@ const (
 	kindFail
 )
 
-// ReconcileResult is what Reconcile returns. Build it with Settled, Unsettled
-// or Fail; the zero value fails the pass with ErrInvalidResult.
-type ReconcileResult struct {
+// Result is what Reconcile returns. Build it with Settled, Unsettled or Fail;
+// the zero value fails the pass with ErrInvalidResult.
+type Result struct {
 	kind resultKind
 	// requeueSet separates a result with no opinion about scheduling from
 	// RequeueAfter(0), which are different schedules.
@@ -274,28 +273,28 @@ type ReconcileResult struct {
 
 // Settled reports that the pass observed the object's current generation, which
 // beehive records. It claims nothing about health. Schedules nothing of its own.
-func Settled() ReconcileResult {
-	return ReconcileResult{kind: kindSettled}
+func Settled() Result {
+	return Result{kind: kindSettled}
 }
 
 // Unsettled reports a successful pass over an object not caught up to its spec,
 // so no generation is recorded. Requeues at the work queue's per-object floor
 // unless RequeueAfter says otherwise.
-func Unsettled() ReconcileResult {
-	return ReconcileResult{kind: kindUnsettled}
+func Unsettled() Result {
+	return Result{kind: kindUnsettled}
 }
 
 // Fail reports a failed pass: settles nothing, takes the backoff ladder. A nil
 // err is itself a failure, reported as ErrInvalidResult.
-func Fail(err error) ReconcileResult {
-	return ReconcileResult{kind: kindFail, err: err}
+func Fail(err error) Result {
+	return Result{kind: kindFail, err: err}
 }
 
 // RequeueAfter schedules the object's next pass, overriding what the result
 // kind schedules on its own. Zero or less requeues as soon as the work queue's
 // per-object floor allows. Ignored on a failed result, which takes the backoff
 // ladder.
-func (r ReconcileResult) RequeueAfter(d time.Duration) ReconcileResult {
+func (r Result) RequeueAfter(d time.Duration) Result {
 	r.requeueSet = true
 	r.requeueAfter = d
 	return r
@@ -304,11 +303,11 @@ func (r ReconcileResult) RequeueAfter(d time.Duration) ReconcileResult {
 // Err returns the error a failed pass carries, or nil for a successful one. The
 // zero value and Fail(nil) report ErrInvalidResult, the failure beehive records
 // for them.
-func (r ReconcileResult) Err() error { return r.normalize().err }
+func (r Result) Err() error { return r.normalize().err }
 
 // Must run before any gate reads the result: an un-normalized zero satisfies no
 // positive gate and is not a failure either.
-func (r ReconcileResult) normalize() ReconcileResult {
+func (r Result) normalize() Result {
 	if r.kind == kindInvalid {
 		return Fail(fmt.Errorf("%w: the zero value", ErrInvalidResult))
 	}
@@ -318,15 +317,15 @@ func (r ReconcileResult) normalize() ReconcileResult {
 	return r
 }
 
-func (r ReconcileResult) settles() bool { return r.kind == kindSettled }
+func (r Result) settles() bool { return r.kind == kindSettled }
 
 // Names the kinds it admits, so a new kind must be added here deliberately.
-func (r ReconcileResult) succeeded() bool {
+func (r Result) succeeded() bool {
 	return r.kind == kindSettled || r.kind == kindUnsettled
 }
 
 // Successful, but recorded no generation.
-func (r ReconcileResult) unsettled() bool { return r.kind == kindUnsettled }
+func (r Result) unsettled() bool { return r.kind == kindUnsettled }
 
 // Schedule reports when an object is next due to reconcile. A struct so fields
 // can be added without a breaking change.
