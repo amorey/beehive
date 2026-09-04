@@ -32,7 +32,7 @@ var ErrWrongKind = storeapi.ErrWrongKind
 // status-write surface for this controller's kind. Build the return with
 // Settled, Unsettled or Fail.
 type Controller[Spec, Status any] interface {
-	Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) ReconcileResult
+	Reconcile(ctx context.Context, client ControllerClient[Status], obj *Object[Spec, Status]) Result
 }
 
 // ControllerClient is the write surface a controller uses to report observed

@@ -30,7 +30,7 @@ controller could return a schedule beehive silently ignored.
 
 ## Decision
 
-`Reconcile` returns one `ReconcileResult`, and beehive writes the handshake.
+`Reconcile` returns one `Result`, and beehive writes the handshake.
 
 - `Settled()` — the pass observed the object's current generation, which beehive
   records. Not a claim of health, and no status write required.
@@ -43,7 +43,7 @@ The discriminant's zero names no kind, so the zero value is detectable;
 `normalize` folds it and `Fail(nil)` into `Fail(ErrInvalidResult)` before
 anything reads the result. Every gate then tests **positively** for the kinds it
 admits — a negative gate is what makes the zero dangerous, since
-`ReconcileResult{}` is not a `Fail` and `!isFail` would admit it and stamp a
+`Result{}` is not a `Fail` and `!isFail` would admit it and stamp a
 generation no pass observed.
 
 `UpdateStatus` loses the argument on both surfaces and
@@ -90,7 +90,7 @@ So the delay moved to `RequeueAfter(d)`, and an explicit zero means the same
 thing on both kinds — dispatch as soon as the floor allows. `requeueSet` is what
 separates that zero from a result with no opinion; the two are different
 schedules, so the state is not derivable from the duration alone. `RequeueAfter`
-never changes the kind, so `ReconcileResult{}.RequeueAfter(d)` is still the
+never changes the kind, so `Result{}.RequeueAfter(d)` is still the
 detectable zero value.
 
 **A bare `Unsettled()` schedules its own return**, at the owed pass's interval.
@@ -116,7 +116,7 @@ the ladder owns the retry.
 
 ### Err, and why there is no Unwrap
 
-`ReconcileResult.err` was unreachable outside the package, so a failure
+`Result.err` was unreachable outside the package, so a failure
 assertion downstream degraded to equality against the `Fail` the controller
 built — which pins the wrapping text into the test — and `errors.Is` on a
 sentinel was impossible for a controller wrapping another.
@@ -126,7 +126,7 @@ sentinel was impossible for a controller wrapping another.
 
 **No `Unwrap`.** `errors.Is`/`errors.As` take an `error` and consult `Unwrap`
 only while walking a chain they were handed, so one here is unreachable unless
-`ReconcileResult` implements `error` — which would make `Settled()` a non-nil
+`Result` implements `error` — which would make `Settled()` a non-nil
 `error`. The assertion is `require.ErrorIs(t, res.Err(), sentinel)`.
 
 There is no `String` and no exported discriminant. Equality against `Settled()`

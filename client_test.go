@@ -3593,7 +3593,7 @@ type respecController struct {
 	first, hot *signal
 }
 
-func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+func (c *respecController) Reconcile(ctx context.Context, _ ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 	if c.calls.Add(1) >= hotLoopCalls {
 		c.hot.fire()
 	}

@@ -34,7 +34,7 @@ type finalizerClearingController struct {
 	finalizer string // empty => never clears anything
 }
 
-func (c *finalizerClearingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+func (c *finalizerClearingController) Reconcile(ctx context.Context, client ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 	if obj.DeletionRequestedAt == nil || c.finalizer == "" {
 		return Settled()
 	}
@@ -57,7 +57,7 @@ type hasIncomingEdgesGatingController struct {
 	finalizer string
 }
 
-func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+func (c *hasIncomingEdgesGatingController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 	if obj.DeletionRequestedAt == nil {
 		return Settled()
 	}
@@ -1059,7 +1059,7 @@ type depReleaseController struct {
 	targetID ObjectID
 }
 
-func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) ReconcileResult {
+func (c *depReleaseController) Reconcile(ctx context.Context, cc ControllerClient[cStatus], obj *Object[cSpec, cStatus]) Result {
 	c.mu.Lock()
 	reader, depID, targetID := c.reader, c.depID, c.targetID
 	c.mu.Unlock()

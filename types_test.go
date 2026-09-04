@@ -165,7 +165,7 @@ func TestEventDetail(t *testing.T) {
 
 // The three constructors round-trip their kind and payload, and each reports
 // the scheduling and handshake decisions the reconcile loop reads off them.
-func TestReconcileResultConstructors(t *testing.T) {
+func TestResultConstructors(t *testing.T) {
 	t.Run("Settled settles and schedules nothing of its own", func(t *testing.T) {
 		r := Settled().normalize()
 		assert.Equal(t, kindSettled, r.kind)
@@ -190,7 +190,7 @@ func TestReconcileResultConstructors(t *testing.T) {
 
 // RequeueAfter sets the delay without touching the kind, and its zero is a
 // schedule of its own rather than the absence of one.
-func TestReconcileResultRequeueAfter(t *testing.T) {
+func TestResultRequeueAfter(t *testing.T) {
 	t.Run("it carries the delay and keeps the kind", func(t *testing.T) {
 		r := Settled().RequeueAfter(time.Minute)
 		assert.Equal(t, kindSettled, r.kind)
@@ -204,7 +204,7 @@ func TestReconcileResultRequeueAfter(t *testing.T) {
 	})
 
 	t.Run("it does not make the zero value usable", func(t *testing.T) {
-		r := ReconcileResult{}.RequeueAfter(time.Minute).normalize()
+		r := Result{}.RequeueAfter(time.Minute).normalize()
 		assert.Equal(t, kindFail, r.kind)
 		assert.ErrorIs(t, r.err, ErrInvalidResult)
 	})
@@ -212,7 +212,7 @@ func TestReconcileResultRequeueAfter(t *testing.T) {
 
 // Err is the only way a caller outside the package reads a failed pass, so it
 // answers for the unusable results too rather than reporting their nil.
-func TestReconcileResultErrReportsTheFailure(t *testing.T) {
+func TestResultErrReportsTheFailure(t *testing.T) {
 	t.Run("a success carries no error", func(t *testing.T) {
 		assert.NoError(t, Settled().Err())
 		assert.NoError(t, Unsettled().Err())
@@ -225,7 +225,7 @@ func TestReconcileResultErrReportsTheFailure(t *testing.T) {
 	})
 
 	t.Run("the unusable results report ErrInvalidResult", func(t *testing.T) {
-		assert.ErrorIs(t, ReconcileResult{}.Err(), ErrInvalidResult)
+		assert.ErrorIs(t, Result{}.Err(), ErrInvalidResult)
 		assert.ErrorIs(t, Fail(nil).Err(), ErrInvalidResult)
 	})
 }
@@ -233,9 +233,9 @@ func TestReconcileResultErrReportsTheFailure(t *testing.T) {
 // The zero value names no kind, so normalize turns it into a failure rather
 // than letting it reach a gate that would read it as a success and stamp a
 // generation no pass observed. Fail(nil) is the same mistake spelled out.
-func TestReconcileResultNormalizeRejectsUnusableValues(t *testing.T) {
+func TestResultNormalizeRejectsUnusableValues(t *testing.T) {
 	t.Run("the zero value fails", func(t *testing.T) {
-		r := ReconcileResult{}.normalize()
+		r := Result{}.normalize()
 		assert.Equal(t, kindFail, r.kind)
 		assert.ErrorIs(t, r.err, ErrInvalidResult)
 	})
@@ -247,7 +247,7 @@ func TestReconcileResultNormalizeRejectsUnusableValues(t *testing.T) {
 	})
 
 	t.Run("normalize is idempotent", func(t *testing.T) {
-		once := ReconcileResult{}.normalize()
+		once := Result{}.normalize()
 		assert.Equal(t, once, once.normalize())
 	})
 }

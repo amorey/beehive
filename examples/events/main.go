@@ -76,7 +76,7 @@ type ProbeDetail struct {
 // reads its own status to tell whether it has already logged them.
 type ClusterController struct{}
 
-func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.ReconcileResult {
+func (cc *ClusterController) Reconcile(ctx context.Context, client beehive.ControllerClient[ClusterStatus], obj *beehive.Object[ClusterSpec, ClusterStatus]) beehive.Result {
 	if probed(obj) {
 		return beehive.Settled()
 	}
