@@ -638,7 +638,8 @@ Beehive is an embedded, Kubernetes-inspired control plane backed by a durable st
   [`.github/pull_request_template.md`](.github/pull_request_template.md)**: keep
   its sections (`Summary` for the why, `Key Changes` for the what, `Checklist`),
   and lead the title with the template's emoji for the change type — 🎣 bug fix,
-  🐋 new feature, 📜 documentation, ✨ general improvement.
+  🐋 new feature, 📜 documentation, ✨ general improvement. Titles must be natural
+  titles with first letter capitalized, not conventional commit headings.
 - **Stubs are explicit**: `panic("not implemented: <name>")`; stub options
   return `nil` and are marked `(stub: not yet wired up)`.
 - **Design rationale goes in an ADR**, not here. See
