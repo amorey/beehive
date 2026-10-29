@@ -174,7 +174,11 @@ func TestOpenReportsAMigrationFailure(t *testing.T) {
 	store, err := Open(path)
 	require.Error(t, err)
 	assert.Nil(t, store)
-	assert.Contains(t, err.Error(), "newer than binary supports")
+	var newer *NewerSchemaError
+	require.ErrorAs(t, err, &newer)
+	assert.Equal(t, 9999, newer.Recorded)
+	assert.Equal(t, 1, newer.Supported)
+	assert.Contains(t, err.Error(), "version 9999 is newer than binary supports (1)")
 }
 
 // A path that cannot be made absolute fails the open. Registering the raw path
