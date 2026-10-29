@@ -25,6 +25,7 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	_ "modernc.org/sqlite"
@@ -151,7 +152,11 @@ func TestApplyRejectsNewerThanBinary(t *testing.T) {
 	_, err = Apply(context.Background(), db, fsWith(t, map[string]string{
 		"0001_first.sql": `CREATE TABLE alpha (id INTEGER PRIMARY KEY);`,
 	}), "migrations")
-	require.Error(t, err)
+	var newer *NewerSchemaError
+	require.ErrorAs(t, err, &newer)
+	assert.Equal(t, 2, newer.Recorded)
+	assert.Equal(t, 1, newer.Supported)
+	assert.Contains(t, err.Error(), "version 2 is newer than binary supports (1)")
 }
 
 func TestApplyRejectsVersionGap(t *testing.T) {

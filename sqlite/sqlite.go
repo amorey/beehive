@@ -38,6 +38,18 @@ var migrations embed.FS
 // package: the store must not import the control plane.
 var ErrInvalidOption = errors.New("beehive/sqlite: option value is invalid")
 
+// NewerSchemaError reports a database written by a newer build: its recorded
+// schema version is above the newest this binary supports. Open refuses it
+// rather than downgrade. Match it with errors.As.
+type NewerSchemaError struct {
+	Recorded  int
+	Supported int
+}
+
+func (e *NewerSchemaError) Error() string {
+	return fmt.Sprintf("beehive/sqlite: database schema version %d is newer than binary supports (%d)", e.Recorded, e.Supported)
+}
+
 // memoryStores numbers the memory stores, since each file::memory: is its own
 // database and so cannot share an identity with another.
 var memoryStores atomic.Int64
@@ -73,7 +85,8 @@ func WithReadConnections(n int) Option {
 }
 
 // Open opens (or creates) a Beehive SQLite database at path, running any
-// pending schema migrations before returning. Reads that are not inside a
+// pending schema migrations before returning. A database written by a newer
+// build is *NewerSchemaError. Reads that are not inside a
 // transaction run on their own pool; see WithReadConnections.
 func Open(path string, opts ...Option) (*sqliteStore, error) {
 	o := openOptions{readConns: defaultReadConnections, abs: filepath.Abs}
@@ -135,6 +148,11 @@ func OpenMemory() (*sqliteStore, error) {
 func open(db *sql.DB, openRead func() *sql.DB) (*sqliteStore, error) {
 	if _, err := sqlitemigrate.Apply(context.Background(), db, migrations, "migrations"); err != nil {
 		db.Close()
+		// Re-typed because a caller cannot name the internal package's type.
+		var newer *sqlitemigrate.NewerSchemaError
+		if errors.As(err, &newer) {
+			return nil, &NewerSchemaError{Recorded: newer.Recorded, Supported: newer.Supported}
+		}
 		return nil, err
 	}
 	s := &sqliteStore{
