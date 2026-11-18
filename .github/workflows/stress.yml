@@ -123,7 +123,9 @@ jobs:
   report:
     name: Report failures
     needs: stress
-    if: failure()
+    # A job that times out or never gets a runner ends cancelled, which
+    # failure() does not count.
+    if: ${{ !cancelled() && needs.stress.result != 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       # Reads which stress jobs failed, including those that left no artifact,
@@ -164,12 +166,14 @@ jobs:
           }
 
           # Every stress job that did not pass, by the id in its name, with how
-          # it ended. A test step that never concluded means the runner was lost.
+          # it ended. A job with no runner never started; a test step that never
+          # concluded means the runner was lost.
           gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
             --jq '.jobs[] | select(.name | startswith("Go · Stress"))
                   | select(.conclusion != "success" and .conclusion != "skipped")
                   | [(.name | capture("\\((?<id>[^)]+)\\)$").id | gsub(", "; "-")),
-                     (if .conclusion == "cancelled" then "cancelled"
+                     (if (.runner_name // "") == "" then "unstarted"
+                      elif .conclusion == "cancelled" then "cancelled"
                       elif any(.steps[]; .name == "Run tests under stress" and .conclusion == null) then "lost"
                       else "failed" end)]
                   | @tsv' > failed-jobs.txt
@@ -203,6 +207,7 @@ jobs:
             report="stress/stress-$id/failures.json"
             if [ ! -f "$report" ]; then
               case $ended in
+                unstarted) why="never got a runner" ;;
                 cancelled) why="cancelled, likely at timeout-minutes" ;;
                 lost) why="the runner was lost mid-run" ;;
                 *) why="no test report" ;;
