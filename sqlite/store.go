@@ -748,8 +748,8 @@ func (s *sqliteStore) drawResourceVersions(ctx context.Context, n int) (int64, e
 
 // refillVersions waits no longer than this for the writer connection. Matches the
 // DSN's busy_timeout, which bounds the lock wait but not the pool wait. Expiring
-// costs one fallback draw. A var so tests can shrink it.
-var refillTimeout = 5 * time.Second
+// costs one fallback draw.
+const refillTimeout = 5 * time.Second
 
 // refillVersions reserves the next block. It must run where no transaction is
 // open: a reservation that rolls back leaves the allocator handing out versions
