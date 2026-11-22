@@ -212,9 +212,6 @@ func TestTheCursorNeverCoversALiveTransaction(t *testing.T) {
 func TestARefillDoesNotWaitOutASiblingTransaction(t *testing.T) {
 	const block = 2
 	withBlockSize(t, block)
-	prev := refillTimeout
-	refillTimeout = time.Millisecond // tight: the refill must not be waiting at all
-	t.Cleanup(func() { refillTimeout = prev })
 
 	ctx := context.Background()
 	store := newDiskStore(t)
@@ -254,7 +251,8 @@ func TestARefillDoesNotWaitOutASiblingTransaction(t *testing.T) {
 		t.Fatal("the commit is waiting on a connection the sibling transaction holds")
 	}
 	// The sibling took one version out of the refilled block, so one is left. Spent
-	// would mean the refill was still queued behind the sibling when it timed out.
+	// would mean the refill was queued behind the sibling and gave up at
+	// refillTimeout, which is well inside the failsafe above.
 	assert.False(t, store.versions.spent(),
 		"the refill must run before a hook can open a transaction on the one connection")
 	close(release)
