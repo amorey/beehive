@@ -3719,6 +3719,9 @@ func TestWatchRetryEndsWhenTheBeehiveStops(t *testing.T) {
 		name  string
 		store func(inner Store) *failAfterArmStore
 		opts  []WatchOption
+		// armFirst arms the store before the watch starts, for a read the stream
+		// goroutine makes as soon as WatchList returns.
+		armFirst bool
 		// drive produces the work the subscriber then fails to finish.
 		drive func(t *testing.T, ctx context.Context, c Client[cSpec, cStatus])
 	}{
@@ -3737,8 +3740,9 @@ func TestWatchRetryEndsWhenTheBeehiveStops(t *testing.T) {
 			store: func(inner Store) *failAfterArmStore {
 				return &failAfterArmStore{Store: inner, failWrites: true, tried: make(chan struct{})}
 			},
-			opts:  []WatchOption{WithResumeFrom(1)},
-			drive: func(*testing.T, context.Context, Client[cSpec, cStatus]) {},
+			opts:     []WatchOption{WithResumeFrom(1)},
+			armFirst: true,
+			drive:    func(*testing.T, context.Context, Client[cSpec, cStatus]) {},
 		},
 	}
 	for _, tc := range cases {
@@ -3751,6 +3755,7 @@ func TestWatchRetryEndsWhenTheBeehiveStops(t *testing.T) {
 			client := NewClient[cSpec, cStatus](bh, clientTestGK)
 			mustCreate(t, ctx, client, "w1", cSpec{})
 
+			store.armed.Store(tc.armFirst)
 			stream, err := client.WatchList(ctx, tc.opts...)
 			require.NoError(t, err)
 
