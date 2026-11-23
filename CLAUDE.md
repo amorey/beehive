@@ -53,12 +53,14 @@ without `-race`, at `-cpu` 1 and 4. Dispatch it by hand to change `count` or
 `cpu`. It does not run on a schedule in a fork.
 
 A red run means a concurrency bug and nothing else. The report job opens one
-`needs-triage` issue per failing test, or comments on the open one, and a
-`Stress run failed outside a test` issue for build failures, cancels and lost
-runners. Each issue lists a command per runner that reproduces the failure from
-the repo root, e.g. `go test -race -cpu 4 -shuffle=<seed> -count=3 .`: the seed
-orders the whole package, so run the whole package, on the runner's OS and arch
-where you can. `scripts/stress.go` turns the `go test -json` output into those
+`needs-triage` issue per failing test, or comments on the open one; one per
+package that failed outside a test (a build failure, a crash), with its output;
+and a `Stress run failed outside a test` issue for jobs that left no report —
+never got a runner, cancelled, timed out, lost the runner — quoting GitHub's
+annotation for why. Every entry links its job. Each test and package entry has
+a command that reproduces the failure from the repo root, e.g. `go test -race
+-cpu 4 -shuffle=<seed> -count=3 .`: the seed orders the whole package, so run
+the whole package, on the runner's OS and arch where you can. `scripts/stress.go` turns the `go test -json` output into those
 commands.
 
 ## Writing standards
