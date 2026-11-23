@@ -131,6 +131,8 @@ jobs:
       # Reads which stress jobs failed, including those that left no artifact,
       # and downloads the artifacts the others left.
       actions: read
+      # Reads the annotations that say why a job ended without a report.
+      checks: read
       issues: write
     steps:
       - name: Open or update issues
@@ -165,34 +167,41 @@ jobs:
             fi
           }
 
-          # Every stress job that did not pass, by the id in its name, with how
-          # it ended. A job with no runner never started; a test step that never
-          # concluded means the runner was lost.
+          # Every stress job that did not pass, by the id in its name: its job
+          # id, its page, how it ended, and the step that failed. A job with no
+          # runner never started, whatever its started_at says; a test step
+          # that never concluded means the runner was lost.
           gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
             --jq '.jobs[] | select(.name | startswith("Go · Stress"))
                   | select(.conclusion != "success" and .conclusion != "skipped")
                   | [(.name | capture("\\((?<id>[^)]+)\\)$").id | gsub(", "; "-")),
+                     .id, .html_url,
                      (if (.runner_name // "") == "" then "unstarted"
                       elif .conclusion == "cancelled" then "cancelled"
                       elif any(.steps[]; .name == "Run tests under stress" and .conclusion == null) then "lost"
-                      else "failed" end)]
+                      else "failed" end),
+                     (first(.steps[] | select(.conclusion == "failure") | .name) // "")]
                   | @tsv' > failed-jobs.txt
+          jq -Rn '[inputs | split("\t") | {key: .[0], value: .[2]}] | from_entries' \
+            failed-jobs.txt > jobs.json
 
           reports=(stress/*/failures.json)
           if [ ${#reports[@]} -gt 0 ]; then
             jq -s '[.[] | .runner as $r | .failures[] | . + {runner: $r}]' "${reports[@]}" > failures.json
+            jq -s '[.[] | .runner as $r | .outside[] | . + {runner: $r}]' "${reports[@]}" > outside.json
           else
             echo '[]' > failures.json
+            echo '[]' > outside.json
           fi
 
           # One issue per failing test, whatever -cpu values it failed under.
           jq -c 'group_by([.package, .test])[]' failures.json | while read -r group; do
             title=$(jq -r '"Stress: \(.[0].test) fails in \(.[0].package)"' <<<"$group")
-            jq -r --arg run "$RUN_URL" '
+            jq -r --arg run "$RUN_URL" --slurpfile jobs jobs.json '
               "The [nightly stress run](\($run)) found `\(.[0].test)` failing in `\(.[0].package)`.\n\n"
               + "Each command runs the whole package from the repo root, since the seed orders all of it.\n\n"
               + (sort_by(.runner, .cpu) | map(
-                  "- **\(.runner)**, `-cpu \(.cpu)`, seed `\(.seed)`"
+                  "- **\(.runner)** ([job](\($jobs[0][.runner] // $run))), `-cpu \(.cpu)`, seed `\(.seed)`"
                   + (if .timedOut then ", timed out" else "" end)
                   + "\n\n  ```sh\n  \(.command)\n  ```\n"
                 ) | join("\n"))
@@ -200,27 +209,73 @@ jobs:
             file_issue "$title" body.md
           done
 
-          # A failed job that names no failing test: setup, build, a package
-          # that failed outside a test, or a timeout the test binary missed.
+          # One issue per package that failed outside a test: a crash, a panic
+          # in TestMain, a build failure. Its output is untrusted text, so it
+          # sits in a fence longer than any run of backticks in it. Only the
+          # first five jobs' output is shown, to keep the body under GitHub's
+          # 65536 characters.
+          jq -c 'group_by(.package)[]' outside.json | while read -r group; do
+            title=$(jq -r '"Stress: \(.[0].package) fails outside a test"' <<<"$group")
+            jq -r --arg run "$RUN_URL" --slurpfile jobs jobs.json '
+              def fence: "`" * ([3, ([scan("`+") | length] | max // 0) + 1] | max);
+              "The [nightly stress run](\($run)) found `\(.[0].package)` failing outside a test.\n\n"
+              + "Each command runs the whole package from the repo root, since the seed orders all of it.\n\n"
+              + (sort_by(.runner, .cpu) | to_entries | map(.key as $i | .value |
+                  "### \(.runner), `-cpu \(.cpu)`\n\n"
+                  + "[Job](\($jobs[0][.runner] // $run))\n\n"
+                  + (if (.running | length) > 0
+                    then "Running when it failed: " + (.running | map("`\(.)`") | join(", ")) + "\n\n"
+                    else "" end)
+                  + "```sh\n\(.command)\n```\n"
+                  + (if $i >= 5 or .output == "" then ""
+                    else (.output | fence) as $f
+                      | "\n<details><summary>Output"
+                      + (if .omitted > 0 then ", \(.omitted) more lines in the artifact" else "" end)
+                      + "</summary>\n\n\($f)text\n\(.output)\($f)\n\n</details>\n"
+                    end)
+                ) | join("\n"))
+            ' <<<"$group" > body.md
+            file_issue "$title" body.md
+          done
+
+          # A failed job that names no failing test or package. GitHub's own
+          # annotations say why: who cancelled it, a timeout, a lost runner.
+          # They sit in code spans, so a cancelling user's @handle notifies no one.
           : > outside.md
-          while IFS=$'\t' read -r id ended; do
+          while IFS=$'\t' read -r id job url ended step; do
             report="stress/stress-$id/failures.json"
-            if [ ! -f "$report" ]; then
-              case $ended in
-                unstarted) why="never got a runner" ;;
-                cancelled) why="cancelled, likely at timeout-minutes" ;;
-                lost) why="the runner was lost mid-run" ;;
-                *) why="no test report" ;;
-              esac
-              if [ -f "stress/stress-$id/stress.json" ]; then
-                why="$why; its artifact holds the partial \`stress.json\`"
-              fi
-              echo "- **$id**: $why" >> outside.md
-            elif jq -e '(.outside | length) > 0 or (.failures | length) == 0' "$report" > /dev/null; then
-              jq -r --arg r "$id" '"- **\($r)**: " + (if (.outside | length) > 0
-                then "failed outside a test in " + (.outside | map("`\(.)`") | join(", "))
-                else "failed with no failing test" end)' "$report" >> outside.md
+            if [ -f "$report" ] && jq -e '(.outside | length) > 0 or (.failures | length) > 0' "$report" > /dev/null; then
+              continue
             fi
+            # shellcheck disable=SC2016 # the backticks are jq's
+            notes=$(gh api "repos/$GH_REPO/check-runs/$job/annotations" \
+              --jq '[.[] | select(.annotation_level == "failure") | .message | gsub("`"; "")]
+                    | unique | map("`\(.)`") | join(", ")') || notes=""
+            case $ended in
+              unstarted) why="never got a runner" ;;
+              cancelled)
+                if [[ $notes == *"exceeded the maximum execution time"* ]]; then
+                  why="hit timeout-minutes before go test's own -timeout fired"
+                else
+                  why="cancelled mid-run"
+                fi
+                ;;
+              lost) why="the runner was lost mid-run" ;;
+              *)
+                if [ -n "$step" ] && [ "$step" != "Run tests under stress" ]; then
+                  why="failed in the \`$step\` step"
+                else
+                  why="failed with no failing test or package"
+                fi
+                ;;
+            esac
+            if [ -n "$notes" ]; then
+              why="$why; GitHub: $notes"
+            fi
+            if [ -f "stress/stress-$id/stress.json" ]; then
+              why="$why; its artifact holds the partial \`stress.json\`"
+            fi
+            echo "- **$id** ([job]($url)): $why" >> outside.md
           done < failed-jobs.txt
           if [ -s outside.md ]; then
             { echo "The [nightly stress run]($RUN_URL) failed outside a test on:"; echo; cat outside.md; } > body.md
