@@ -74,6 +74,20 @@ jobs:
           GOMAXPROCS: ${{ matrix.gomaxprocs }}
         run: go test -race ./...
 
+  # The stress report script is build-ignored, so ./... skips it.
+  stress-script:
+    name: Stress script
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+      - name: Vet and test stress.go
+        run: |
+          go vet scripts/stress.go scripts/stress_test.go
+          go test scripts/stress.go scripts/stress_test.go
+
   coverage:
     name: Coverage (100%)
     runs-on: ubuntu-24.04
